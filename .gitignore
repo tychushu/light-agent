@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+
+# Local credentials, sessions and platform metadata
+.env
+.env.*
+credentials.env
+config.toml
+*.sqlite3
+*.sqlite3-*
+.DS_Store
+._*

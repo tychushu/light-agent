@@ -1,0 +1,1 @@
+"""Minimal native Termux agent."""

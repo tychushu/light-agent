@@ -1,0 +1,19 @@
+default_api = "local"
+base_url = "http://192.168.86.244:8085/v1"
+model = "Qwen3.8-27B-MTPLX-Speed"
+max_steps = 16
+max_output_chars = 20000
+approval_policy = "on-risk"
+timeout = 120.0
+
+[apis.local]
+base_url = "http://192.168.86.244:8085/v1"
+model = "Qwen3.8-27B-MTPLX-Speed"
+api_key_env = "TERMUX_AGENT_API_KEY"
+
+[apis.cloud]
+base_url = "https://agentrouter.org/v1"
+model = "deepseek-v4-flash"
+api_key_env = "AGENTROUTER_API_KEY"
+user_agent = "claude-cli/2.1.119 (external, cli)"
+timeout = 300.0
