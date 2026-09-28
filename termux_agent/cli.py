@@ -26,6 +26,27 @@ HELP = """/help           Show commands
 """
 
 
+def configure_readline():
+    """Enable terminal editing for input(); no global tty changes or history file."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return True
+    try:
+        import readline
+    except ImportError:
+        return False
+    if "libedit" in (readline.__doc__ or ""):
+        readline.parse_and_bind("bind -e")
+        for binding in (r'bind "^H" em-delete-prev-char', r'bind "^?" em-delete-prev-char',
+                        r'bind "^[[3~" ed-delete-next-char'):
+            readline.parse_and_bind(binding)
+    else:
+        readline.parse_and_bind("set editing-mode emacs")
+        for binding in (r'"\C-h": backward-delete-char', r'"\C-?": backward-delete-char',
+                        r'"\e[3~": delete-char'):
+            readline.parse_and_bind(binding)
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description="Minimal native Termux LLM agent")
     parser.add_argument("--config", help="TOML configuration path")
@@ -37,6 +58,8 @@ def main():
     parser.add_argument("--session", help="Resume saved session ID")
     parser.add_argument("--no-session", action="store_true", help="Keep this run in memory only")
     options = parser.parse_args()
+    if options.prompt is None and not configure_readline():
+        print("Warning: Python readline is unavailable; terminal key editing may not work.", file=sys.stderr)
     if options.session and (options.no_session or options.api or options.directory or options.agent or options.no_agent or options.config):
         parser.error("--session restores its saved scope; do not combine it with scope overrides")
     try:

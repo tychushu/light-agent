@@ -199,3 +199,12 @@ system: unrelated sessions are never loaded into prompts. Snapshots are limited 
 20 MiB per session. Deleting a session removes its database record, not a guaranteed
 secure erase. Uninstall leaves history intact; remove the database separately if
 no longer needed.
+
+## SSH terminal editing
+
+Interactive `ta` enables Python's built-in readline support. GNU readline uses
+Emacs-style editing with explicit bindings for Backspace (`Ctrl-H` and `DEL`) and
+forward Delete (`ESC [ 3 ~`), including SecureCRT sessions. Arrow navigation and
+UTF-8 character deletion are handled by readline. No global `stty` settings are
+changed and no separate input-history file is written. Restart an already-running
+`ta` after updating to load this fix.
