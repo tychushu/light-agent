@@ -4,6 +4,7 @@ import json
 import sys
 import os
 import sqlite3
+import shlex
 import subprocess
 import shutil
 import time
@@ -14,6 +15,7 @@ from .agent import Agent
 from .config import Config
 from .sessions import SessionStore, new_id, snapshot, restore
 from .skills import SkillRegistry
+from .api_profiles import ProfileStore
 
 HELP = """/help           Show commands
 /clear          Start fresh; keep previous session in history
@@ -21,7 +23,11 @@ HELP = """/help           Show commands
 /config         Show effective configuration, without credentials
 /debug          Toggle request usage and tool result diagnostics
 /debug-context  Show last request messages and tools, with key redacted
-/api [name]     List or switch API (new conversation)
+/api [name|number|next]  List or switch API (new conversation)
+/api add NAME URL MODEL [KEY_ENV] [local|cloud]  Add a profile
+/api default NAME   Use this profile on future launches
+/api show NAME      View profile without credentials
+/api remove NAME    Remove a profile added with /api add
 /agent [path|off|directory|reload]  Session instructions (new conversation)
 /skill list|info|load|unload|clear   Explicit Hermes Skill control
 /copy [text]   Copy text/last answer to Android clipboard
@@ -165,6 +171,7 @@ def main():
         parser.error(str(exc))
     debug = False
     registry = SkillRegistry()  # Lazy: no scan/read until /skill is requested.
+    profile_store = ProfileStore(config_path)
     tool_started = {}
     stream_wrote = False
 
@@ -240,9 +247,26 @@ def main():
                      "instructions": instructions, "instruction_path": instruction_path}
             revision = store.save(session_id, revision, snapshot(agent, scope))
 
+    def switch_api(name, persist=False):
+        nonlocal config, agent, session_id, revision
+        candidate = Config.load(config_path, name)
+        if name == config.api_profile:
+            if persist:
+                profile_store.set_default(name)
+            return False
+        save_current()
+        if persist:
+            profile_store.set_default(name)
+        replacement = build_agent(candidate, instructions)
+        agent.client.close()
+        config, agent = candidate, replacement
+        session_id, revision = new_id(), 0
+        return True
+
     def load_session(identifier):
         nonlocal agent, config, directory, config_path, session_file, disabled
         nonlocal instructions, instruction_path, session_id, revision
+        nonlocal registry, profile_store
         next_revision, payload = store.load(identifier)
         next_config, replacement, scope = restore(payload, build_agent)
         try:
@@ -257,6 +281,8 @@ def main():
         session_file, disabled = scope['session_file'], scope['disabled']
         instructions, instruction_path = scope['instructions'], scope['instruction_path']
         session_id, revision = identifier, next_revision
+        registry = SkillRegistry()
+        profile_store = ProfileStore(config_path)
 
     try:
         if options.session:
@@ -304,18 +330,77 @@ def main():
             elif prompt == "/debug-context":
                 display(agent.debug_context())
             elif prompt == "/api" or prompt.startswith("/api "):
-                name = prompt[4:].strip()
+                value = prompt[4:].strip()
                 try:
-                    if not name:
-                        display({"current": config.api_profile, "profiles": Config.profiles(config_path)})
+                    rows = profile_store.list()
+                    if not value or value == "list":
+                        display({"current": config.api_profile, "default": profile_store.get_default(),
+                                 "profiles": [{"number": i, **row} for i, row in enumerate(rows, 1)]})
+                    elif value.startswith("add "):
+                        parts = shlex.split(value[4:])
+                        flags = [part for part in parts if part.startswith("--")]
+                        positional = [part for part in parts if not part.startswith("--")]
+                        if not 3 <= len(positional) <= 5:
+                            raise ValueError("Use /api add NAME URL MODEL [KEY_ENV] [local|cloud]")
+                        name, base_url, model = positional[:3]
+                        extra = positional[3:]
+                        key_env = ""
+                        kind = "auto"
+                        if extra:
+                            if extra[0] in ("local", "cloud"):
+                                kind = extra[0]
+                            else:
+                                key_env = extra[0]
+                        if len(extra) == 2:
+                            kind = extra[1]
+                        stream = True
+                        timeout = None
+                        user_agent = None
+                        for flag in flags:
+                            if flag == "--no-stream":
+                                stream = False
+                            elif flag.startswith("--timeout="):
+                                timeout = float(flag.partition("=")[2])
+                            elif flag.startswith("--user-agent="):
+                                user_agent = flag.partition("=")[2]
+                            else:
+                                raise ValueError(f"Unknown API option: {flag}")
+                        path = profile_store.add(name, base_url, model, key_env, kind,
+                                                 stream, timeout, user_agent)
+                        display({"added": name, "path": str(path), "switch": f"/api {name}"})
+                    elif value.startswith("show "):
+                        name = value[5:].strip()
+                        matches = [row for row in rows if row["name"] == name]
+                        if name == "default":
+                            display(Config.load(config_path, name).public_dict())
+                        elif matches:
+                            display(matches[0])
+                        else:
+                            raise ValueError(f"Unknown API profile: {name}")
+                    elif value.startswith("remove "):
+                        name = value[7:].strip()
+                        if name == config.api_profile:
+                            raise ValueError("Switch to another API before removing the active profile")
+                        backup = profile_store.remove(name)
+                        display({"removed": name, "backup": str(backup)})
                     else:
-                        candidate = Config.load(config_path, name)
-                        save_current()
-                        replacement = build_agent(candidate, instructions)
-                        agent.client.close()
-                        config, agent = candidate, replacement
-                        session_id, revision = new_id(), 0
-                        display(f"API switched to {name}; new conversation and stats.")
+                        persist = value.startswith("default ")
+                        names = [row["name"] for row in rows]
+                        name = value[8:].strip() if persist else value.removeprefix("switch ").strip()
+                        if name in ("next", "prev"):
+                            if not names:
+                                raise ValueError("No named API profiles configured")
+                            index = names.index(config.api_profile) if config.api_profile in names else (
+                                -1 if name == "next" else 0)
+                            name = names[(index + (1 if name == "next" else -1)) % len(names)]
+                        elif name.isdigit():
+                            number = int(name)
+                            if not 1 <= number <= len(names):
+                                raise ValueError("API number is not in /api list")
+                            name = names[number - 1]
+                        switched = switch_api(name, persist)
+                        display({"api": name, "switched": switched,
+                                 "default": profile_store.get_default()})
                 except (ValueError, OSError, sqlite3.Error) as exc:
                     display(f"Error: {exc}")
             elif prompt == "/agent" or prompt.startswith("/agent "):

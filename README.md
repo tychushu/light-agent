@@ -250,3 +250,42 @@ Run the full tests on native Termux with:
 ```sh
 python -m unittest discover -s tests -v
 ```
+
+## Multiple local and cloud APIs
+
+Keep the existing `[apis.local]` and `[apis.cloud]` entries in `config.toml`.
+Additional profiles live in separate files under
+`~/.config/termux-agent/profiles/NAME.toml`. The directory is private (0700);
+files are 0600 and contain endpoint/model settings plus an **environment variable
+name**, never an API Key value. There is no limit of one local or cloud profile.
+
+Inside `ta`, `/api` or `/api list` shows numbered local and cloud profiles,
+the active profile, Key availability, and the startup default. Switch with
+`/api NAME`, `/api 2`, `/api next`, or `/api prev`; `ta --api NAME` selects at
+startup. A switch saves the prior session and starts a clean conversation for
+the selected API.
+
+```text
+/api add local-fast http://192.168.86.244:8086/v1 MODEL_ID LOCAL_FAST_API_KEY local
+/api add cloud-fast https://provider.example/v1 MODEL_ID CLOUD_FAST_API_KEY cloud
+/api cloud-fast
+/api default cloud-fast
+/api show cloud-fast
+/api remove cloud-fast
+```
+
+The add command accepts `--no-stream`, `--timeout=300`, and a quoted
+`--user-agent="client name"` when a provider needs those settings. Local or cloud
+can be omitted; private LAN addresses are classified as local. The optional
+Key name must be an environment variable such as `CLOUD_FAST_API_KEY`; export
+its value before starting `ta` or add it to the phone's private
+`~/.config/termux-agent/credentials.env`. Never paste a Key value into `/api add`.
+`/api default NAME` changes the startup choice and switches immediately.
+
+The two original inline profiles remain available. `/api remove` applies only
+to profiles added under `profiles/`, refuses the active profile, and keeps a
+hidden recovery copy. It does not remove credentials or old sessions.
+`/api show NAME` displays settings without credential values. You can also edit
+an added profile's TOML file to change its model, timeout, or stream setting;
+`/api NAME` reloads the file on selection. Existing `config.toml` syntax and
+saved sessions remain compatible.

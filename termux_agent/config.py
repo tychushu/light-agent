@@ -21,6 +21,7 @@ class Config:
     api_key: str = ""
     api_key_env: str = "TERMUX_AGENT_API_KEY"
     api_profile: str = "default"
+    api_kind: str = "local"
     user_agent: str = "termux-agent/0.1"
     stream: bool = True
 
@@ -40,10 +41,10 @@ class Config:
         valid = {"base_url", "model", "max_steps", "max_output_chars", "approval_policy", "timeout", "user_agent", "stream"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
-        profiles = raw.get("apis", {})
-        if not isinstance(profiles, dict):
-            raise ValueError("apis must be a TOML table")
-        selected = profile or raw.get("default_api", "default")
+        from .api_profiles import ProfileStore
+        store = ProfileStore(config_path)
+        profiles = store.entries(raw)
+        selected = profile if profile is not None else store.get_default(raw, profiles)
         if not isinstance(selected, str):
             raise ValueError("default_api must be a profile name")
         if selected != "default":
@@ -57,8 +58,10 @@ class Config:
                 if key in entry:
                     setattr(config, key, entry[key])
             config.api_key_env = entry.get("api_key_env", "")
+            config.api_kind = entry.get("kind", store.kind_for(config.base_url))
         else:
             config.api_key_env = raw.get("api_key_env", "TERMUX_AGENT_API_KEY")
+            config.api_kind = store.kind_for(config.base_url)
         config.api_profile = selected
         if not isinstance(config.api_key_env, str):
             raise ValueError("api_key_env must be an environment variable name")
@@ -68,14 +71,12 @@ class Config:
 
     @staticmethod
     def profiles(path=None):
-        source = Path(path) if path else Path.home() / ".config/termux-agent/config.toml"
-        raw = tomllib.loads(source.read_text()) if source.exists() else {}
-        profiles = raw.get("apis", {})
-        if not isinstance(profiles, dict):
-            raise ValueError("apis must be a TOML table")
-        return ["default", *profiles.keys()]
+        from .api_profiles import ProfileStore
+        return ["default", *ProfileStore(path).entries().keys()]
 
     def validate(self) -> None:
+        if self.api_kind not in ("local", "cloud"):
+            raise ValueError("api_kind must be local or cloud")
         if not isinstance(self.stream, bool):
             raise ValueError("stream must be a boolean")
         if not isinstance(self.user_agent, str) or not self.user_agent.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in self.user_agent):
