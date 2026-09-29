@@ -22,6 +22,7 @@ class Config:
     api_key_env: str = "TERMUX_AGENT_API_KEY"
     api_profile: str = "default"
     user_agent: str = "termux-agent/0.1"
+    stream: bool = True
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -36,7 +37,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "approval_policy", "timeout", "user_agent"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "approval_policy", "timeout", "user_agent", "stream"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         profiles = raw.get("apis", {})
@@ -52,7 +53,7 @@ class Config:
             for required in ("base_url", "model"):
                 if required not in entry:
                     raise ValueError(f"API profile requires {required}")
-            for key in ("base_url", "model", "timeout", "user_agent"):
+            for key in ("base_url", "model", "timeout", "user_agent", "stream"):
                 if key in entry:
                     setattr(config, key, entry[key])
             config.api_key_env = entry.get("api_key_env", "")
@@ -75,6 +76,8 @@ class Config:
         return ["default", *profiles.keys()]
 
     def validate(self) -> None:
+        if not isinstance(self.stream, bool):
+            raise ValueError("stream must be a boolean")
         if not isinstance(self.user_agent, str) or not self.user_agent.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in self.user_agent):
             raise ValueError("user_agent must be a single-line ASCII string")
         if not isinstance(self.base_url, str) or not self.base_url.startswith(("http://", "https://")):

@@ -4,12 +4,16 @@ import json
 import sys
 import os
 import sqlite3
+import subprocess
+import shutil
+import time
 from pathlib import Path
 from .instructions import load_instructions
 
 from .agent import Agent
 from .config import Config
 from .sessions import SessionStore, new_id, snapshot, restore
+from .skills import SkillRegistry
 
 HELP = """/help           Show commands
 /clear          Start fresh; keep previous session in history
@@ -19,6 +23,10 @@ HELP = """/help           Show commands
 /debug-context  Show last request messages and tools, with key redacted
 /api [name]     List or switch API (new conversation)
 /agent [path|off|directory|reload]  Session instructions (new conversation)
+/skill list|info|load|unload|clear   Explicit Hermes Skill control
+/copy [text]   Copy text/last answer to Android clipboard
+/paste         Show Android clipboard text
+!command       Run Shell directly (approval still applies)
 /sessions [N]   List saved sessions (default 50, max 500)
 /session        Show ID; new, load ID, rename NAME, delete ID, fork, save
 /history [N] [skip]  Show recent messages; skip to page backward
@@ -26,7 +34,11 @@ HELP = """/help           Show commands
 """
 
 
-def configure_readline():
+_readline = None
+_history_file = None
+
+
+def configure_readline(history_file=None):
     """Enable terminal editing for input(); no global tty changes or history file."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True
@@ -34,6 +46,18 @@ def configure_readline():
         import readline
     except ImportError:
         return False
+    global _readline, _history_file
+    _readline = readline
+    if history_file:
+        _history_file = Path(history_file)
+        _history_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        _history_file.parent.chmod(0o700)
+        if _history_file.exists() and _history_file.stat().st_size <= 512 * 1024:
+            try:
+                readline.read_history_file(str(_history_file))
+            except (OSError, ValueError):
+                pass
+        readline.set_history_length(2000)
     if "libedit" in (readline.__doc__ or ""):
         readline.parse_and_bind("bind -e")
         for binding in (r'bind "^H" em-delete-prev-char', r'bind "^?" em-delete-prev-char',
@@ -47,6 +71,70 @@ def configure_readline():
     return True
 
 
+def save_readline_history():
+    if not _readline or not _history_file:
+        return
+    keys = {v for k, v in os.environ.items()
+            if any(part in k.upper() for part in ("API_KEY", "API_TOKEN", "_SECRET")) and len(v) >= 4}
+    values = []
+    for i in range(1, _readline.get_current_history_length() + 1):
+        item = _readline.get_history_item(i)
+        if item:
+            for key in keys:
+                item = item.replace(key, "[REDACTED]")
+            values.append(item)
+    temp = _history_file.with_name(_history_file.name + ".tmp")
+    try:
+        temp.touch(mode=0o600, exist_ok=True)
+        temp.chmod(0o600)
+        _readline.clear_history()
+        for item in values:
+            _readline.add_history(item)
+        _readline.write_history_file(str(temp))
+        temp.chmod(0o600)
+        os.replace(temp, _history_file)
+    except OSError:
+        temp.unlink(missing_ok=True)
+
+
+def _trim_readline(start):
+    if _readline:
+        while _readline.get_current_history_length() > start:
+            _readline.remove_history_item(start)
+
+
+def _continued(line):
+    slashes = len(line) - len(line.rstrip("\\"))
+    return slashes % 2 == 1
+
+
+def read_prompt(prompt="ta> "):
+    """Read ordinary or explicit triple-quote/backslash-continued input."""
+    start = _readline.get_current_history_length() if _readline else 0
+    first = input(prompt)
+    quoted = first == '"""'
+    if not quoted and not _continued(first):
+        return first
+    lines = [] if quoted else [first[:-1]]
+    try:
+        while True:
+            line = input("... ")
+            if quoted and line == '"""':
+                break
+            continued = _continued(line)
+            lines.append(line[:-1] if continued else line)
+            if not quoted and not continued:
+                break
+    except BaseException:
+        _trim_readline(start)
+        raise
+    _trim_readline(start)
+    result = "\n".join(lines)
+    if _readline:
+        _readline.add_history(result)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description="Minimal native Termux LLM agent")
     parser.add_argument("--config", help="TOML configuration path")
@@ -58,7 +146,8 @@ def main():
     parser.add_argument("--session", help="Resume saved session ID")
     parser.add_argument("--no-session", action="store_true", help="Keep this run in memory only")
     options = parser.parse_args()
-    if options.prompt is None and not configure_readline():
+    if options.prompt is None and not configure_readline(
+            Path.home() / ".local/share/termux-agent/repl_history"):
         print("Warning: Python readline is unavailable; terminal key editing may not work.", file=sys.stderr)
     if options.session and (options.no_session or options.api or options.directory or options.agent or options.no_agent or options.config):
         parser.error("--session restores its saved scope; do not combine it with scope overrides")
@@ -75,6 +164,9 @@ def main():
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))
     debug = False
+    registry = SkillRegistry()  # Lazy: no scan/read until /skill is requested.
+    tool_started = {}
+    stream_wrote = False
 
     def redact(text):
         return text.replace(config.api_key, "[REDACTED]") if config.api_key else text
@@ -98,12 +190,43 @@ def main():
     def event(kind, payload):
         if debug or kind == "tool_start":
             display({kind: payload})
+        if kind == "tool_start":
+            tool_started[payload.get("name")] = time.monotonic()
+        elif kind == "tool_result":
+            elapsed = time.monotonic() - tool_started.pop(payload.get("name"), time.monotonic())
+            if elapsed >= 10 and shutil.which("termux-vibrate"):
+                try:
+                    subprocess.Popen(["termux-vibrate", "-d", "100"], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                except OSError:
+                    pass
+
+    def stream_output(kind, value):
+        nonlocal stream_wrote
+        if not stream_wrote and kind == "reasoning":
+            sys.stdout.write("[reasoning] ")
+        safe = "".join(c if c in "\n\t" or c.isprintable() else f"\\x{ord(c):02x}" for c in value)
+        sys.stdout.write(safe)
+        sys.stdout.flush()
+        stream_wrote = True
+
+    def show_answer(value):
+        nonlocal stream_wrote
+        streamed = getattr(agent.client, "streamed", False)
+        if stream_wrote:
+            print(flush=True)
+        failure = value.startswith(("LLM 请求失败", "LLM 请求已中断", "已达到最大模型请求"))
+        if value and (not streamed or not getattr(agent.client, "streamed_text", False) or failure):
+            display(value)
+        stream_wrote = False
 
     def build_agent(next_config, text):
         kwargs = {"approve": approve, "event": event}
         if text:
             kwargs["instructions"] = text
-        return Agent(next_config, **kwargs)
+        built = Agent(next_config, **kwargs)
+        built.client.on_stream = stream_output
+        return built
 
     agent = build_agent(config, instructions)
     store = None if options.no_session else SessionStore()
@@ -139,14 +262,14 @@ def main():
         if options.session:
             load_session(options.session)
         if options.prompt is not None:
-            display(agent.run(options.prompt))
+            show_answer(agent.run(options.prompt))
             save_current()
             return
         display("Termux Agent — /help for commands")
         display({"api": config.api_profile, "directory": str(directory), "agent_file": instruction_path, "session": session_id if store else "in-memory"})
         while True:
             try:
-                prompt = input("ta> ").strip()
+                prompt = read_prompt("ta> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -219,6 +342,93 @@ def main():
                     display({"agent_file": source, "chars": len(text), "new_conversation": True})
                 except (ValueError, OSError, sqlite3.Error) as exc:
                     display(f"Error: {exc}")
+            elif prompt == "/skill" or prompt.startswith("/skill "):
+                try:
+                    parts = prompt.split(maxsplit=2)
+                    action = parts[1] if len(parts) > 1 else "list"
+                    name = parts[2] if len(parts) > 2 else ""
+                    if action == "list":
+                        active = agent.get_active_skills()
+                        display([{"name": skill.name, "active": skill.name in active,
+                                  "description": skill.description} for skill in registry.list_skills()])
+                    elif action == "info" and name:
+                        skill = registry.find(name)
+                        display({"name": skill.name, "description": skill.description, "path": str(skill.path),
+                                 "active": name in agent.active_skills})
+                    elif action == "load" and name:
+                        skill, body = registry.load(name)
+                        previous = agent.get_active_skills()
+                        agent.load_skill(skill.name, body)
+                        try:
+                            save_current(force=True)
+                        except Exception:
+                            agent.clear_skills()
+                            for active_name, content in previous.items():
+                                agent.load_skill(active_name, content)
+                            raise
+                        display(f"Loaded {skill.name} into this session.")
+                    elif action in ("unload", "clear"):
+                        if action == "unload" and not name:
+                            raise ValueError("Use /skill unload NAME")
+                        previous = agent.get_active_skills()
+                        if action == "clear":
+                            agent.clear_skills()
+                        else:
+                            agent.unload_skill(name)
+                        try:
+                            save_current(force=True)
+                        except Exception:
+                            agent.clear_skills()
+                            for active_name, content in previous.items():
+                                agent.load_skill(active_name, content)
+                            raise
+                        display("Active skills cleared." if action == "clear" else f"Unloaded {name}.")
+                    else:
+                        display("Use /skill list|info NAME|load NAME|unload NAME|clear")
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    display(f"Error: {exc}")
+            elif prompt.startswith("/copy"):
+                try:
+                    text = prompt[5:].lstrip()
+                    if not text:
+                        text = next((m.get("content") for m in reversed(agent.messages)
+                                     if m.get("role") == "assistant" and m.get("content")), "")
+                    command = shutil.which("termux-clipboard-set")
+                    if not command:
+                        raise RuntimeError("termux-clipboard-set is unavailable; install Termux:API")
+                    result = subprocess.run([command], input=text, text=True, capture_output=True, timeout=10)
+                    if result.returncode:
+                        raise RuntimeError(result.stderr.strip() or "clipboard write failed")
+                    display("Copied to Android clipboard." if text else "Nothing to copy.")
+                except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+                    display(f"Error: {exc}")
+            elif prompt == "/paste":
+                command = shutil.which("termux-clipboard-get")
+                if not command:
+                    display("termux-clipboard-get is unavailable; install Termux:API")
+                    continue
+                try:
+                    result = subprocess.run([command], text=True, capture_output=True, timeout=10, check=True)
+                    if len(result.stdout) > config.max_output_chars:
+                        display(result.stdout[:config.max_output_chars] + "\n[TRUNCATED]")
+                    else:
+                        display(result.stdout)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    display(f"Clipboard read failed: {exc}")
+            elif prompt.startswith("!"):
+                command = prompt[1:].strip()
+                if command:
+                    if agent._approved("shell", {"command": command}):
+                        from .tools import execute
+                        agent._direct_shell_count += 1
+                        result = execute("shell", {"command": command, "cwd": str(directory)}, config.max_output_chars)
+                        display(result)
+                        try:
+                            save_current()
+                        except (ValueError, OSError, sqlite3.Error) as exc:
+                            display(f"Session save failed: {exc}")
+                    else:
+                        display("Shell command denied or approval unavailable.")
             elif prompt == "/sessions" or prompt.startswith("/sessions "):
                 try:
                     limit = int(prompt[9:].strip() or 50)
@@ -291,11 +501,17 @@ def main():
                 display("Unknown command; use /help.")
             else:
                 try:
-                    display(agent.run(prompt))
+                    show_answer(agent.run(prompt))
                     save_current()
                 except KeyboardInterrupt:
+                    if stream_wrote:
+                        print(flush=True)
+                        stream_wrote = False
                     display("Interrupted.")
                 except Exception as exc:
+                    if stream_wrote:
+                        print(flush=True)
+                        stream_wrote = False
                     display(f"Error: {exc}")
     except Exception as exc:
         display(f"Error: {exc}")
@@ -306,6 +522,7 @@ def main():
         except (ValueError, OSError, sqlite3.Error) as exc:
             display(f"Session save failed: {exc}; this turn was not saved.")
         agent.client.close()
+        save_readline_history()
         if store:
             store.close()
 

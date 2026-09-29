@@ -18,6 +18,29 @@ except ImportError:
 
 
 class ToolTests(unittest.TestCase):
+    def test_line_windows_are_inclusive_bounded_and_default_to_first_50(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "lines"
+            path.write_text("".join(f"row {i}\n" for i in range(1, 102)))
+            result = tools.execute("read_file", {"path": str(path), "start_line": 10, "end_line": 12})
+            self.assertEqual(result["content"], "10: row 10\n11: row 11\n12: row 12\n")
+            self.assertEqual(result["next_line"], 13)
+            default = tools.execute("read_file", {"path": str(path)})
+            self.assertIn("50: row 50", default["content"])
+            self.assertNotIn("51: row 51", default["content"])
+            self.assertFalse(default["truncated"])
+
+    def test_line_windows_truncate_huge_lines_and_reject_mixed_offsets(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "huge"
+            path.write_text("A" * 100000 + "\nlast\n")
+            result = tools.execute("read_file", {"path": str(path), "start_line": 1, "end_line": 2},
+                                   max_output_chars=300)
+            self.assertLessEqual(len(result["content"]), 300)
+            self.assertIn("[LINE TRUNCATED]", result["content"])
+            self.assertIn("next_line", result)
+            self.assertIn("error", tools.execute("read_file", {"path": str(path), "start_line": 1, "offset": 0}))
+
     def test_file_round_trip_and_edit_mismatch_preserves_file(self):
         with tempfile.TemporaryDirectory() as td:
             path = str(Path(td) / "note.txt")
@@ -29,7 +52,14 @@ class ToolTests(unittest.TestCase):
             self.assertIn("error", result)
             self.assertEqual(Path(path).read_text(), before)
             read = tools.execute("read_file", {"path": path})
-            self.assertEqual(read["content"], "ONE two ONE")
+            self.assertEqual(read["content"], "1: ONE two ONE")
+
+    def test_write_file_creates_nested_parent_directories(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "new" / "nested" / "file.txt"
+            result = tools.execute("write_file", {"path": str(path), "content": "hello"})
+            self.assertEqual(result["bytes_written"], 5)
+            self.assertEqual(path.read_text(), "hello")
 
     def test_shell_waits_after_output_pipes_close(self):
         with tempfile.TemporaryDirectory() as td:
@@ -44,8 +74,8 @@ class ToolTests(unittest.TestCase):
             path.write_text("HEAD" + "x" * 10000 + "TAIL")
             result = tools.execute("read_file", {"path": str(path)}, max_output_chars=200)
             self.assertTrue(result["truncated"])
-            self.assertTrue(result["content"].startswith("HEAD"))
-            self.assertTrue(result["content"].endswith("TAIL"))
+            self.assertTrue(result["content"].startswith("1: HEAD"))
+            self.assertIn("TAIL", result["content"])
             self.assertLessEqual(len(result["content"]), 200)
 
     def test_read_error_is_a_tool_result(self):
@@ -106,7 +136,7 @@ class ClientTests(unittest.TestCase):
             return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}],
                                              "usage": {"prompt_tokens": 11, "completion_tokens": 2, "total_tokens": 13}})
 
-        cfg = Config(api_key="secret-test-key")
+        cfg = Config(api_key="secret-test-key", stream=False)
         http = httpx.Client(transport=httpx.MockTransport(respond))
         client = Client(cfg, http_client=http)
         result = client.chat([{"role": "user", "content": "hello"}], [])
@@ -121,7 +151,7 @@ class ClientTests(unittest.TestCase):
         def bad_status(request):
             return httpx.Response(401, text="secret-test-key echoed")
 
-        cfg = Config(api_key="secret-test-key")
+        cfg = Config(api_key="secret-test-key", stream=False)
         http = httpx.Client(transport=httpx.MockTransport(bad_status))
         with self.assertRaises(ClientError) as caught:
             Client(cfg, http_client=http).chat([], [])
@@ -134,7 +164,7 @@ class ClientTests(unittest.TestCase):
 
         http = httpx.Client(transport=httpx.MockTransport(malformed))
         with self.assertRaises(ClientError):
-            Client(Config(), http_client=http).chat([], [])
+            Client(Config(stream=False), http_client=http).chat([], [])
         http.close()
 
 

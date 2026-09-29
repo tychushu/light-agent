@@ -7,7 +7,7 @@ from unittest.mock import patch
 import httpx
 from termux_agent.config import Config
 from termux_agent.agent import Agent
-from termux_agent.client import Client
+from termux_agent.client import Client, ClientError
 from termux_agent.instructions import load_instructions
 
 
@@ -18,6 +18,7 @@ class ProfilesTests(unittest.TestCase):
             p.write_text('''[apis.cloud]
 base_url = "https://api.example.com/v1"
 model = "cloud-model"
+stream = false
 api_key_env = "TEST_CLOUD_KEY"
 ''')
             with patch.dict(os.environ, {'TEST_CLOUD_KEY': 'cloud-secret', 'TERMUX_AGENT_API_KEY': 'local-secret'}):
@@ -102,8 +103,75 @@ class RouterTests(unittest.TestCase):
                 self.assertEqual(body['messages'][3]['tool_call_id'], 'one')
                 msg = {'role': 'assistant', 'content': 'done', 'reasoning_content': 'final reasoning'}
             return httpx.Response(200, json={'choices': [{'message': msg}]})
-        config = Config(user_agent='claude-cli/2.1.119 (external, cli)')
+        config = Config(user_agent='claude-cli/2.1.119 (external, cli)', stream=False)
         with httpx.Client(transport=httpx.MockTransport(reply)) as http:
             a = Agent(config, client=Client(config, http))
             self.assertEqual(a.run('test'), 'done')
             self.assertEqual(a.messages[-1]['reasoning_content'], 'final reasoning')
+
+class StreamingTests(unittest.TestCase):
+    def test_sse_content_reasoning_tool_fragments_null_heartbeats_and_usage(self):
+        events = []
+        frames = [
+            {'choices': [{'delta': {'reasoning_content': 'think'}}]},
+            None,
+            {'choices': [{'delta': {'content': 'Hi'}}]},
+            {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': 'call_', 'type': 'function',
+                                                    'function': {'name': 'read_', 'arguments': '{"path":'}}]}}]},
+            {'choices': [{'delta': {'tool_calls': [{'index': 0, 'id': '1', 'function': {'name': 'file', 'arguments': '"x"}'}}]}}]},
+            {'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]},
+            {'choices': [], 'usage': {'prompt_tokens': 12, 'completion_tokens': 4, 'total_tokens': 16}},
+        ]
+        body = b''.join((b'data: ' + json.dumps(item).encode() + b'\r\n\r\n') for item in frames)
+        def respond(request):
+            self.assertTrue(json.loads(request.content)['stream'])
+            return httpx.Response(200, content=body, headers={'content-type': 'text/event-stream'})
+        cfg = Config(stream=True)
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            client = Client(cfg, http_client=http, sleeper=lambda _: None)
+            client.on_stream = lambda kind, text: events.append((kind, text))
+            answer = client.chat([], [])
+        self.assertEqual(answer['content'], 'Hi')
+        self.assertEqual(answer['reasoning_content'], 'think')
+        self.assertEqual(answer['tool_calls'][0]['id'], 'call_1')
+        self.assertEqual(answer['tool_calls'][0]['function'], {'name': 'read_file', 'arguments': '{"path":"x"}'})
+        self.assertEqual(client.last_usage['total_tokens'], 16)
+        self.assertEqual(events, [('reasoning', 'think'), ('content', 'Hi')])
+
+    def test_transient_status_retries_twice_with_exponential_backoff(self):
+        statuses, sleeps = iter([503, 504, 200]), []
+        def respond(request):
+            status = next(statuses)
+            if status == 200:
+                return httpx.Response(200, json={'choices': [{'message': {'content': 'ok'}}]})
+            return httpx.Response(status)
+        config = Config(stream=False)
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            client = Client(config, http_client=http, sleeper=sleeps.append)
+            self.assertEqual(client.chat([], [])['content'], 'ok')
+        self.assertEqual(sleeps, [0.25, 0.5])
+
+    def test_connect_error_retries_twice_but_does_not_retry_read_error(self):
+        attempts, sleeps = [], []
+        def connect_error(request):
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise httpx.ConnectError('offline', request=request)
+            return httpx.Response(200, json={'choices': [{'message': {'content': 'ok'}}]})
+        config = Config(stream=False)
+        with httpx.Client(transport=httpx.MockTransport(connect_error)) as http:
+            client = Client(config, http_client=http, sleeper=sleeps.append)
+            self.assertEqual(client.chat([], [])['content'], 'ok')
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(sleeps, [0.25, 0.5])
+
+        class BrokenStream(httpx.SyncByteStream):
+            def __iter__(self):
+                yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+                raise httpx.ReadError('connection dropped')
+        attempts.clear()
+        with httpx.Client(transport=httpx.MockTransport(lambda req: (attempts.append(1) or httpx.Response(200, stream=BrokenStream())))) as http:
+            client = Client(Config(stream=True), http_client=http, sleeper=sleeps.append)
+            with self.assertRaises(ClientError):
+                client.chat([], [])
+        self.assertEqual(len(attempts), 1)

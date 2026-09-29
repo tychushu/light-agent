@@ -10,7 +10,7 @@ import uuid
 from .config import Config
 
 COUNTERS = ('_total_calls', '_tool_calls_total', '_usage_history',
-            '_request_history_chars', '_conversation_count')
+            '_request_history_chars', '_conversation_count', '_direct_shell_count')
 
 
 def new_id():
@@ -46,8 +46,8 @@ def validate_messages(messages):
 
 def snapshot(agent, scope):
     validate_messages(agent.messages)
-    value = {'version': 1, 'config': agent.config.public_dict(), 'scope': scope,
-             'messages': agent.messages, 'counters': {k: getattr(agent, k) for k in COUNTERS}}
+    value = {'version': 2, 'config': agent.config.public_dict(), 'scope': scope,
+             'messages': agent.messages, 'active_skills': agent.get_active_skills(), 'counters': {k: getattr(agent, k) for k in COUNTERS}}
     keys = {v for k, v in os.environ.items() if k.endswith('_API_KEY') and v}
     if agent.config.api_key:
         keys.add(agent.config.api_key)
@@ -65,7 +65,7 @@ def snapshot(agent, scope):
 
 
 def restore(payload, build_agent):
-    if payload.get('version') != 1:
+    if payload.get('version') not in (1, 2):
         raise ValueError('Unsupported session version')
     validate_messages(payload['messages'])
     scope, saved = payload['scope'], payload['config']
@@ -82,6 +82,8 @@ def restore(payload, build_agent):
         elif not isinstance(value, int) or value < 0:
             raise ValueError('Invalid session statistics')
     agent = build_agent(config, scope['instructions'])
+    for name, content in payload.get('active_skills', {}).items():
+        agent.load_skill(name, content)
     agent.messages = payload['messages']
     agent.system = agent.messages[0]['content']
     for key in COUNTERS:

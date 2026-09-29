@@ -15,7 +15,7 @@ from typing import Any
 
 TOOLS = [
     {"type": "function", "function": {"name": "shell", "description": "Run a non-interactive Termux shell command.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "cwd": {"type": "string"}, "timeout": {"type": "number"}}, "required": ["command"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "read_file", "description": "Read a bounded section of a text file; offset is a byte offset.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1}}, "required": ["path"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read a bounded text window by line number or byte offset.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1}}, "required": ["path"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "write_file", "description": "Create or replace a UTF-8 text file atomically.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text only when the expected match count agrees.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "expected_replacements": {"type": "integer", "minimum": 1}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}}},
 ]
@@ -53,8 +53,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
     if len(data) > MAX_FILE_BYTES:
         raise ValueError(f"file content exceeds {MAX_FILE_BYTES} byte limit")
     parent = path.parent
-    if not parent.is_dir():
-        raise FileNotFoundError(f"parent directory does not exist: {parent}")
+    parent.mkdir(parents=True, exist_ok=True)
     mode = path.stat().st_mode & 0o7777 if path.exists() else None
     fd, temp_name = tempfile.mkstemp(prefix="." + path.name + ".", dir=str(parent))
     try:
@@ -176,6 +175,9 @@ def _shell(args: dict, cap: int) -> dict:
 
 def _read_file(args: dict, cap: int) -> dict:
     path = Path(args["path"])
+    if ("start_line" in args or "end_line" in args or
+            ("offset" not in args and "limit" not in args)):
+        return _read_lines(path, args, cap)
     offset = int(args.get("offset", 0))
     requested = args.get("limit")
     limit = int(requested) if requested is not None else None
@@ -203,6 +205,55 @@ def _read_file(args: dict, cap: int) -> dict:
     next_offset = selected_end if not truncated else offset + len(head)
     return {"content": value, "offset": offset, "bytes_read": bytes_read,
             "truncated": truncated, "next_offset": next_offset}
+
+
+def _read_lines(path: Path, args: dict, cap: int) -> dict:
+    if "offset" in args or "limit" in args:
+        raise ValueError("Use line numbers or byte offset/limit, not both")
+    start = int(args.get("start_line", 1))
+    end = int(args.get("end_line", start + 49))
+    if start < 1 or end < start or end - start >= 5000:
+        raise ValueError("line range must be ordered and no wider than 5000 lines")
+    out, used, line_no, last_line, truncated = [], 0, 0, 0, False
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        while line_no < start - 1:
+            chunk = f.readline(8192)
+            if not chunk:
+                break
+            if chunk.endswith("\n"):
+                line_no += 1
+        while line_no < end:
+            chunk = f.readline(cap + 1)
+            if not chunk:
+                break
+            line_no += 1
+            too_long = len(chunk) > cap
+            prefix = f"{line_no}: "
+            if too_long:
+                marker = " [LINE TRUNCATED]"
+                available = max(0, cap - used - len(prefix) - len(marker) - 1)
+                head_size = available // 2
+                tail_size = available - head_size
+                head = chunk[:head_size]
+                tail = chunk[-tail_size:] if tail_size else ""
+                rest = chunk
+                while rest and not rest.endswith("\n"):
+                    rest = f.readline(8192)
+                    tail = (tail + rest)[-tail_size:] if tail_size else ""
+                chunk = head.rstrip("\n") + marker + tail.rstrip("\r\n") + "\n"
+                truncated = True
+            row = prefix + chunk
+            if len(row) > cap - used:
+                truncated = True
+                break
+            out.append(row)
+            used += len(row)
+            last_line = line_no
+    value = "".join(out)
+    if truncated and len(value) + len("[TRUNCATED]") <= cap:
+        value += "[TRUNCATED]"
+    return {"content": value, "start_line": start, "end_line": last_line or None,
+            "truncated": truncated, "next_line": last_line + 1 if last_line else start}
 
 
 def _write_file(args: dict) -> dict:

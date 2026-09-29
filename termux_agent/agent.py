@@ -22,13 +22,45 @@ class Agent:
         self.approve = approve
         self.event = event
         self.client = client or Client(config)
-        self.system = SYSTEM + ("\n\n" + instructions if instructions else "")
+        self.base_system = SYSTEM + ("\n\n" + instructions if instructions else "")
+        self.active_skills: dict[str, str] = {}
+        self.system = self.base_system
+        self._direct_shell_count = 0
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self.system}]
         self._total_calls = 0
         self._tool_calls_total = 0
         self._usage_history: list[dict[str, Any] | None] = []
         self._request_history_chars: list[int] = []
         self._conversation_count = 0
+
+    def _sync_skills(self) -> None:
+        self.system = self.base_system
+        for name, content in self.active_skills.items():
+            self.system += f"\n\n<!-- SKILL_START: {name} -->\n{content}\n<!-- SKILL_END: {name} -->"
+        if self.messages:
+            self.messages[0]["content"] = self.system
+
+    def load_skill(self, name: str, content: str) -> None:
+        from .skills import validate_skill_name, MAX_SKILL_CHARS, MAX_ACTIVE_SKILL_CHARS
+        validate_skill_name(name)
+        if len(content) > MAX_SKILL_CHARS:
+            raise ValueError(f"Skill exceeds {MAX_SKILL_CHARS} characters")
+        total = sum(len(v) for k, v in self.active_skills.items() if k != name) + len(content)
+        if total > MAX_ACTIVE_SKILL_CHARS:
+            raise ValueError(f"Active skills exceed {MAX_ACTIVE_SKILL_CHARS} characters")
+        self.active_skills[name] = content
+        self._sync_skills()
+
+    def unload_skill(self, name: str) -> None:
+        self.active_skills.pop(name, None)
+        self._sync_skills()
+
+    def clear_skills(self) -> None:
+        self.active_skills.clear()
+        self._sync_skills()
+
+    def get_active_skills(self) -> dict[str, str]:
+        return dict(self.active_skills)
 
     def _emit(self, kind: str, payload: dict[str, Any]) -> None:
         if self.event:
@@ -184,6 +216,7 @@ class Agent:
             missing[field] = len(self._usage_history) - len(observed)
         last_usage = self._usage_history[-1] if self._usage_history else None
         return {"api_calls_total": self._total_calls, "tool_calls_total": self._tool_calls_total,
+                "direct_shell_commands": self._direct_shell_count, "active_skills": list(self.active_skills),
                 "usage_totals": totals, "last_request_usage": last_usage,
                 "usage_history": list(self._usage_history), "usage_missing_requests": missing,
                 "conversation_count": self._conversation_count,

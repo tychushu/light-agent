@@ -42,7 +42,7 @@ timeout = 120.0 # HTTP request timeout; shell defaults to 30 seconds
 
 `ta --config path.toml` selects another config. `ta --prompt '执行 uname -a'` runs
 one turn. REPL commands: `/help`, `/clear`, `/stats`, `/config`, `/debug`,
-`/debug-context`, `/exit`. `/clear` starts a fresh session, preserving the previous conversation in local history.
+`/debug-context`, `/skill list|info|load|unload|clear`, `/copy`, `/paste`, `/exit`. `/clear` starts a fresh session, preserving the previous conversation in local history.
 Stats include each request’s usage and character counts. Token totals may be partial when `usage_missing_requests` is nonzero. Stats use server-provided token counts; no tokenizer or estimated tokens are used.
 Debug context is the last request body (messages include the system prompt), with
 the configured API key redacted. It can still contain private file/tool content.
@@ -51,8 +51,8 @@ the configured API key redacted. It can still contain private file/tool content.
 
 - `shell(command, cwd?, timeout?)`: Termux bash, noninteractive stdin, bounded
   stdout/stderr, process-group timeout. Reuses existing git/grep/curl/patch/etc.
-- `read_file(path, offset?, limit?)`: bounded UTF-8 read, byte offsets/limits.
-- `write_file(path, content)`: atomic write in an existing parent directory.
+- `read_file(path, start_line?, end_line?)`: first 50 UTF-8 text lines by default; explicit line ranges are one-based/inclusive, and `offset?`/`limit?` remain available for byte windows.
+- `write_file(path, content)`: creates parent directories and writes atomically.
 - `edit_file(path, old_text, new_text, expected_replacements=1)`: exact match count
   required; no diff engine. Use `patch` or `git apply` through shell when needed.
 
@@ -65,7 +65,7 @@ verification is model behavior, not a mandatory filesystem policy.
 
 No services, Android settings, root configuration or startup scripts are changed.
 Completed turns are saved locally unless `--no-session` is used. Failed calls become tool results so the model
-can recover. API requests are not automatically retried.
+can recover. SSE token/reasoning/tool-call deltas stream interactively. HTTP 502/503/504 and connect failures retry at most twice; partial streams are never replayed.
 
 ## Test / uninstall
 
@@ -142,7 +142,7 @@ The phone defaults to `local` (Qwen3.8-27B-MTPLX-Speed at the existing LAN API).
 `https://agentrouter.org/v1`. Its profile sets
 `user_agent = "claude-cli/2.1.119 (external, cli)"` and a 300-second HTTP timeout.
 Assistant `reasoning_content` is preserved verbatim for subsequent requests,
-including tool rounds. Requests are non-streaming; SSE parsing is not used.
+including tool rounds. Streaming is enabled by default for OpenAI-compatible profiles; set `stream = false` for non-stream endpoints.
 
 `ta --api local` and `ta --api cloud` also work directly. Private credentials
 are intentionally absent from this source package. The phone launcher injects
@@ -208,3 +208,45 @@ forward Delete (`ESC [ 3 ~`), including SecureCRT sessions. Arrow navigation and
 UTF-8 character deletion are handled by readline. No global `stty` settings are
 changed and no separate input-history file is written. Restart an already-running
 `ta` after updating to load this fix.
+
+
+## Additional mobile and skill workflows
+
+OpenAI-compatible API profiles stream Server-Sent Events by default. Content and
+reasoning deltas display as they arrive; split tool-call names and JSON arguments
+are reassembled before entering the agent loop. `data: null`, empty choices and
+`[DONE]` frames are ignored. Transient HTTP 502/503/504 or connect failures retry
+at 250 ms then 500 ms; no retry replays a partially received response.
+Set `stream = false` in TOML for providers without SSE support. Usage is reported
+when the stream ends with a usage frame. Configure a larger profile timeout for
+long reasoning.
+
+`read_file(path, start_line=1, end_line=50)` reads inclusive, one-based line ranges
+within the normal output cap. Long individual lines are clipped safely. Byte
+`offset`/`limit` reads remain available and cannot be mixed with line ranges.
+`write_file` creates parent directories before its atomic replace.
+
+Hermes skills load only after `/skill list`, `/skill info NAME`, or `/skill load NAME`;
+startup does not scan the library. Sources are `~/.hermes/skills/`, `./skills/`,
+and `~/.config/termux-agent/skills/`, in that order. Duplicate names use the first
+source. Loaded instruction bodies have explicit start/end markers and bounded size.
+`/skill unload NAME` and `/skill clear` remove injected text; session snapshots retain
+currently active skills. One skill is capped at 48,000 characters and all active
+skills together at 128,000. Skill files are user-selected instructions, so inspect
+trusted skills before loading them.
+
+`"""` on a line begins a multi-line input terminated by a matching `"""` line.
+A final backslash continues onto the next input line. GNU readline history is saved
+at `~/.local/share/termux-agent/repl_history`, mode 0600, limited to 2000 entries;
+known API keys are redacted. Use `!command` to run shell directly without LLM tokens;
+the same approval rules apply. A shell tool taking at least ten seconds triggers a
+short `termux-vibrate` notification when Termux:API is installed. `/copy [text]`
+copies explicit text or the last assistant answer; `/paste` displays the Android
+clipboard contents, bounded by the configured output limit. These clipboard actions
+use the installed `termux-clipboard-set/get` commands.
+
+Run the full tests on native Termux with:
+
+```sh
+python -m unittest discover -s tests -v
+```
