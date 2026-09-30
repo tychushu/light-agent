@@ -1,5 +1,6 @@
 import tempfile
 import os
+import io
 import unittest
 from pathlib import Path
 
@@ -65,19 +66,19 @@ class SkillTests(unittest.TestCase):
             root=Path(td)/'skills'/'demo';root.mkdir(parents=True)
             (root/'SKILL.md').write_text('---\nname: demo\ndescription: test skill\n---\nSKILL_SENTINEL')
             registry=SkillRegistry([Path(td)/'skills'])
-            outputs=[]
+            rendered=""
             original=Path.cwd()
             prompts=['/skill list','/skill info demo','/skill load demo','/debug-context',
                      '/skill unload demo','/debug-context','/exit']
             try:
                 with patch.object(cli.sys,'argv',['ta','--no-session','--no-agent','--directory',td]), \
                      patch.object(cli,'Config') as config_class, patch.object(cli,'SkillRegistry',return_value=registry), \
-                     patch('builtins.input',side_effect=prompts), patch('builtins.print',side_effect=lambda *a,**k:outputs.append(' '.join(map(str,a)))):
+                     patch('builtins.input',side_effect=prompts), patch('sys.stdout',new_callable=io.StringIO) as output:
                     config_class.load.return_value=Config(stream=False)
                     cli.main()
+                    rendered=output.getvalue()
             finally:
                 os.chdir(original)
-            rendered='\n'.join(outputs)
             self.assertIn('test skill',rendered)
             self.assertIn('SKILL_SENTINEL',rendered)
             self.assertIn('Loaded demo',rendered)
