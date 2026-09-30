@@ -289,3 +289,37 @@ hidden recovery copy. It does not remove credentials or old sessions.
 an added profile's TOML file to change its model, timeout, or stream setting;
 `/api NAME` reloads the file on selection. Existing `config.toml` syntax and
 saved sessions remain compatible.
+
+## Terminal completion and conversation columns
+
+In an interactive SSH/Termux terminal, the prompt is the left conversation
+column (`You │`). Assistant text, reasoning, tool activity, and informational
+messages use their own labels beside a wrapping content column. Chinese text
+uses terminal cell widths for wrapping. When the terminal is narrower than
+52 columns, messages use a compact stacked label such as `Agent:`. Streaming
+continues to print as chunks arrive, and `ta --prompt` without a TTY keeps
+plain output for scripts. This remains a line-oriented REPL, not a full-screen UI.
+
+Press Tab to cycle slash commands. Completion also offers `/api` profile names,
+`/session load` and `delete` IDs, and local Markdown files for `/agent`.
+`/skill load` and `info` offer Hermes Skill names only when that particular
+argument is being completed. Startup and ordinary chat input do not scan Skills.
+Use `/help` to see all commands. Readline history and Backspace/Delete bindings
+continue to work in SecureCRT.
+
+## Tab completion and conversation columns
+
+In an interactive terminal, each turn uses a role column and a wrapping content
+column. For example, `You │`, `Agent │`, `Think │`, and `Tool │` identify the
+source of each line. The layout follows the terminal width and switches to a
+compact `Agent:` style below 52 columns. Streaming text remains live; there is
+no full-screen interface or redraw loop. Piped `ta --prompt` output stays plain
+text, with reasoning and answer on separate lines.
+
+Press Tab to cycle command matches. After `/api`, it also completes profile
+names; `/session load` and `/session delete` complete saved IDs; `/agent`
+completes Markdown files in the current directory; and `/skill load` or
+`/skill info` completes installed Skill names. Completion only reads the Skill
+library when that Skill argument is being completed. Ordinary text and `!shell`
+input do not trigger command completion. The startup hint and `/help` list the
+available commands.

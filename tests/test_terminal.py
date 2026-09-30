@@ -1,22 +1,30 @@
 """Exercise real terminal input bytes, not mocked Python input()."""
 import json
+import fcntl
+import io
 import os
 import pty
 import re
 import select
 import signal
 import sys
+import struct
 import tempfile
+import termios
 import time
 import unittest
 
 
 class TerminalTests(unittest.TestCase):
-    def exchange(self, code, exchanges):
+    def exchange(self, code, exchanges, setup=None, columns=80):
         test_home = tempfile.mkdtemp(prefix="ta-terminal-home-")
+        if setup:
+            setup(test_home)
         previous_home = os.environ.get("HOME")
         os.environ["HOME"] = test_home
         pid, fd = pty.fork()
+        if pid:
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
         if pid == 0:
             os.environ['TERM'] = 'xterm-256color'
             os.environ['INPUTRC'] = '/dev/null'
@@ -80,9 +88,10 @@ class TerminalTests(unittest.TestCase):
     def test_real_cli_edits_commands_without_sending_them_to_model(self):
         code = ('import sys; from termux_agent.cli import main; '
                 'sys.argv=["ta","--no-session","--no-agent"]; main()')
-        text = self.exchange(code, [(b'ta> ', b'/helpx\x08\n'),
-                                   (b'ta> ', b'!printf BANG_DIRECT\n'),
-                                   (b'ta> ', b'/exitX\x1b[D\x1b[3~\n')])
+        prompt = "You     │ ".encode()
+        text = self.exchange(code, [(prompt, b'/helpx\x08\n'),
+                                   (prompt, b'!printf BANG_DIRECT\n'),
+                                   (prompt, b'/exitX\x1b[D\x1b[3~\n')])
         self.assertIn('Show commands', text)
         self.assertIn('BANG_DIRECT', text)
         self.assertNotIn('Unknown command', text)
@@ -109,3 +118,65 @@ class TerminalTests(unittest.TestCase):
         text = self.exchange(code, [])
         self.assertIn('RESULT=0o600:ask [REDACTED]', text)
         self.assertNotIn('termux-secret-123', text)
+
+    def test_tab_completes_slash_command_and_api_profile(self):
+        from pathlib import Path
+        def setup(home):
+            path = Path(home) / ".config/termux-agent/config.toml"
+            path.parent.mkdir(parents=True)
+            path.write_text('default_api="local"\n[apis.local]\nbase_url="http://127.0.0.1:8085/v1"\nmodel="a"\n[apis.cloud]\nbase_url="https://example.com/v1"\nmodel="b"\n')
+        code = ('import sys; from termux_agent.cli import main; '
+                'sys.argv=["ta","--no-session","--no-agent"]; main()')
+        prompt = "You     │ ".encode()
+        text = self.exchange(code, [(prompt, b'/hel\t\n'),
+                                   (prompt, b'/api cl\t\n'),
+                                   (prompt, b'/exi\t\n')], setup=setup)
+        self.assertIn('Show commands', text)
+        self.assertIn('cloud', text)
+        self.assertNotIn('Unknown command', text)
+
+    def test_columns_wrap_chinese_and_keep_stream_roles_separate(self):
+        from termux_agent.terminal_ui import Columns, _cells
+        for width in (32, 60):
+            out = io.StringIO()
+            ui = Columns(out, enabled=True, width=lambda: width)
+            ui.message("You", "中文内容" * 12)
+            ui.feed("Think", "原因")
+            ui.feed("Agent", "结果" * 16)
+            ui.message("Tool", '{"name":"shell"}')
+            text = out.getvalue()
+            self.assertIn("Think", text)
+            self.assertIn("Agent", text)
+            self.assertIn("Tool", text)
+            for line in text.splitlines():
+                self.assertLessEqual(sum(_cells(c) for c in line), width)
+
+    def test_piped_stream_keeps_reasoning_and_answer_separate(self):
+        from termux_agent.terminal_ui import Columns
+        out = io.StringIO()
+        ui = Columns(out, enabled=False)
+        ui.feed("Think", "thought")
+        ui.feed("Agent", "answer")
+        ui.finish()
+        self.assertEqual(out.getvalue(), "[reasoning] thought\nanswer\n")
+
+    def test_completion_is_lazy_and_only_for_slash_commands(self):
+        from termux_agent.terminal_ui import Completer
+        class Input:
+            def get_line_buffer(self): return ""
+            def get_begidx(self): return 0
+        calls = []
+        completer = Completer(Input(), lambda: ["local", "cloud"],
+                              lambda: (calls.append("skill") or ["termux-native-deploy"]),
+                              lambda: ["loaded"], lambda: ["abcd1234abcd"],
+                              lambda: __import__("pathlib").Path.cwd())
+        self.assertEqual(completer.matches("/sk", 0, "/sk"), ["/skill"])
+        self.assertEqual(completer.matches("hello", 0, "hello"), [])
+        self.assertIn("load", completer.matches("/skill ", 7, ""))
+        self.assertEqual(calls, [])
+        self.assertEqual(completer.matches("/skill load ter", 12, "ter"),
+                         ["termux-native-deploy"])
+        self.assertEqual(calls, ["skill"])
+        self.assertEqual(completer.matches("/api cl", 5, "cl"), ["cloud"])
+        self.assertEqual(completer.matches("/session load ab", 14, "ab"),
+                         ["abcd1234abcd"])

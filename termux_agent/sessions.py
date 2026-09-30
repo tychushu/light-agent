@@ -143,6 +143,10 @@ class SessionStore:
                            'directory': payload['scope']['directory'], 'messages': len(payload['messages'])})
         return result
 
+    def ids(self, limit=100):
+        return [row[0] for row in self.db.execute(
+            'SELECT id FROM sessions ORDER BY updated DESC LIMIT ?', (limit,))]
+
     def rename(self, identifier, title):
         self.check_id(identifier)
         if not title.strip() or len(title) > 120:

@@ -16,8 +16,10 @@ from .config import Config
 from .sessions import SessionStore, new_id, snapshot, restore
 from .skills import SkillRegistry
 from .api_profiles import ProfileStore
+from .terminal_ui import Columns, Completer
 
 HELP = """/help           Show commands
+Tab             Complete command, API, session and Skill names
 /clear          Start fresh; keep previous session in history
 /stats          Server token usage and context sizes
 /config         Show effective configuration, without credentials
@@ -114,7 +116,7 @@ def _continued(line):
     return slashes % 2 == 1
 
 
-def read_prompt(prompt="ta> "):
+def read_prompt(prompt="ta> ", continuation="... "):
     """Read ordinary or explicit triple-quote/backslash-continued input."""
     start = _readline.get_current_history_length() if _readline else 0
     first = input(prompt)
@@ -124,7 +126,7 @@ def read_prompt(prompt="ta> "):
     lines = [] if quoted else [first[:-1]]
     try:
         while True:
-            line = input("... ")
+            line = input(continuation)
             if quoted and line == '"""':
                 break
             continued = _continued(line)
@@ -174,18 +176,19 @@ def main():
     profile_store = ProfileStore(config_path)
     tool_started = {}
     stream_wrote = False
+    formatter = Columns(sys.stdout, enabled=sys.stdout.isatty() and options.prompt is None)
 
     def redact(text):
         return text.replace(config.api_key, "[REDACTED]") if config.api_key else text
 
-    def display(value):
+    def display(value, role="Info"):
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
         # Do not let model/tool text inject terminal control sequences.
         text = ''.join(c if c in '\n\t' or c.isprintable() else f'\\x{ord(c):02x}' for c in text)
-        print(redact(text), flush=True)
+        formatter.message(role, redact(text))
 
     def approve(name, args):
-        display({"approval_required": name, "arguments": args})
+        display({"approval_required": name, "arguments": args}, "Approve")
         if not sys.stdin.isatty():
             display("Denied: approval requires an interactive terminal.")
             return False
@@ -196,7 +199,7 @@ def main():
 
     def event(kind, payload):
         if debug or kind == "tool_start":
-            display({kind: payload})
+            display({kind: payload}, "Tool")
         if kind == "tool_start":
             tool_started[payload.get("name")] = time.monotonic()
         elif kind == "tool_result":
@@ -210,21 +213,18 @@ def main():
 
     def stream_output(kind, value):
         nonlocal stream_wrote
-        if not stream_wrote and kind == "reasoning":
-            sys.stdout.write("[reasoning] ")
         safe = "".join(c if c in "\n\t" or c.isprintable() else f"\\x{ord(c):02x}" for c in value)
-        sys.stdout.write(safe)
-        sys.stdout.flush()
+        formatter.feed("Think" if kind == "reasoning" else "Agent", redact(safe))
         stream_wrote = True
 
     def show_answer(value):
         nonlocal stream_wrote
         streamed = getattr(agent.client, "streamed", False)
         if stream_wrote:
-            print(flush=True)
+            formatter.finish()
         failure = value.startswith(("LLM 请求失败", "LLM 请求已中断", "已达到最大模型请求"))
         if value and (not streamed or not getattr(agent.client, "streamed_text", False) or failure):
-            display(value)
+            display(value, "Agent")
         stream_wrote = False
 
     def build_agent(next_config, text):
@@ -238,6 +238,23 @@ def main():
     agent = build_agent(config, instructions)
     store = None if options.no_session else SessionStore()
     session_id, revision = new_id(), 0
+
+    if _readline:
+        completer = Completer(
+            _readline,
+            profiles=lambda: [row["name"] for row in profile_store.list()],
+            skills=lambda: [skill.name for skill in registry.list_skills()],
+            active_skills=lambda: list(agent.active_skills),
+            session_ids=lambda: store.ids() if store else [],
+            directory=lambda: directory,
+        )
+        _readline.set_completer_delims(" \t\n")
+        _readline.set_completer(completer)
+        if "libedit" in (_readline.__doc__ or ""):
+            _readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            _readline.parse_and_bind("set show-all-if-ambiguous off")
+            _readline.parse_and_bind("tab: menu-complete")
 
     def save_current(force=False):
         nonlocal revision
@@ -293,9 +310,11 @@ def main():
             return
         display("Termux Agent — /help for commands")
         display({"api": config.api_profile, "directory": str(directory), "agent_file": instruction_path, "session": session_id if store else "in-memory"})
+        if formatter.enabled:
+            display("Tab 补全 / 命令；/help 查看全部命令。")
         while True:
             try:
-                prompt = read_prompt("ta> ").strip()
+                prompt = read_prompt(formatter.prompt(), formatter.continuation()).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
@@ -507,7 +526,7 @@ def main():
                         from .tools import execute
                         agent._direct_shell_count += 1
                         result = execute("shell", {"command": command, "cwd": str(directory)}, config.max_output_chars)
-                        display(result)
+                        display(result, "Shell")
                         try:
                             save_current()
                         except (ValueError, OSError, sqlite3.Error) as exc:
@@ -533,7 +552,9 @@ def main():
                     for message in history[max(0, end-count):end]:
                         visible = {k: v for k, v in message.items() if k != "reasoning_content"}
                         rendered = json.dumps(visible, ensure_ascii=False)
-                        display(rendered[:4000] + (" [TRUNCATED]" if len(rendered) > 4000 else ""))
+                        role = {"user": "You", "assistant": "Agent", "tool": "Tool"}.get(
+                            message.get("role"), "Info")
+                        display(rendered[:4000] + (" [TRUNCATED]" if len(rendered) > 4000 else ""), role)
                 except ValueError as exc:
                     display(f"Error: {exc}")
             elif prompt == "/session" or prompt.startswith("/session "):
@@ -590,12 +611,12 @@ def main():
                     save_current()
                 except KeyboardInterrupt:
                     if stream_wrote:
-                        print(flush=True)
+                        formatter.finish()
                         stream_wrote = False
                     display("Interrupted.")
                 except Exception as exc:
                     if stream_wrote:
-                        print(flush=True)
+                        formatter.finish()
                         stream_wrote = False
                     display(f"Error: {exc}")
     except Exception as exc:
