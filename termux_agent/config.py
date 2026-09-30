@@ -16,6 +16,7 @@ class Config:
     model: str = "Qwen3.8-27B-MTPLX-Speed"
     max_steps: int = 16
     max_output_chars: int = 20_000
+    max_input_file_chars: int = 64_000
     approval_policy: str = "on-risk"
     timeout: float = 120.0
     api_key: str = ""
@@ -38,7 +39,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "approval_policy", "timeout", "user_agent", "stream"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "user_agent", "stream"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -75,6 +76,9 @@ class Config:
         return ["default", *ProfileStore(path).entries().keys()]
 
     def validate(self) -> None:
+        if (not isinstance(self.max_input_file_chars, int) or
+                isinstance(self.max_input_file_chars, bool) or not 1 <= self.max_input_file_chars <= 1_000_000):
+            raise ValueError("max_input_file_chars must be between 1 and 1000000")
         if self.api_kind not in ("local", "cloud"):
             raise ValueError("api_kind must be local or cloud")
         if not isinstance(self.stream, bool):

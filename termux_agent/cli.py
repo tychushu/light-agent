@@ -16,10 +16,12 @@ from .config import Config
 from .sessions import SessionStore, new_id, snapshot, restore
 from .skills import SkillRegistry
 from .api_profiles import ProfileStore
-from .terminal_ui import Columns, Completer
+from .terminal_ui import Columns, Completer, COMMANDS
+from .local_input import load_text_submission, path_value
 
 HELP = """/help           Show commands
 Tab             Complete command, API, session and Skill names
+~/path or /path  Tab completes local files; Enter submits UTF-8 text
 /clear          Start fresh; keep previous session in history
 /stats          Server token usage and context sizes
 /config         Show effective configuration, without credentials
@@ -264,6 +266,29 @@ def main():
                      "instructions": instructions, "instruction_path": instruction_path}
             revision = store.save(session_id, revision, snapshot(agent, scope))
 
+    def submit_input(value):
+        nonlocal stream_wrote
+        try:
+            submission = load_text_submission(value, COMMANDS, config.max_input_file_chars)
+            if submission is not None:
+                display({"file": str(submission.path), "chars": len(submission.text),
+                         "api": config.api_profile})
+                value = submission.text
+            show_answer(agent.run(value))
+            save_current()
+            return True
+        except KeyboardInterrupt:
+            if stream_wrote:
+                formatter.finish()
+                stream_wrote = False
+            display("Interrupted.")
+        except Exception as exc:
+            if stream_wrote:
+                formatter.finish()
+                stream_wrote = False
+            display(f"Error: {exc}")
+        return False
+
     def switch_api(name, persist=False):
         nonlocal config, agent, session_id, revision
         candidate = Config.load(config_path, name)
@@ -305,13 +330,13 @@ def main():
         if options.session:
             load_session(options.session)
         if options.prompt is not None:
-            show_answer(agent.run(options.prompt))
-            save_current()
+            if not submit_input(options.prompt):
+                raise SystemExit(1)
             return
         display("Termux Agent — /help for commands")
         display({"api": config.api_profile, "directory": str(directory), "agent_file": instruction_path, "session": session_id if store else "in-memory"})
         if formatter.enabled:
-            display("Tab 补全 / 命令；/help 查看全部命令。")
+            display("Tab 补全命令和 ~/本地路径；文件路径回车提交文本。")
         while True:
             try:
                 prompt = read_prompt(formatter.prompt(), formatter.continuation()).strip()
@@ -319,6 +344,14 @@ def main():
                 print()
                 break
             if not prompt:
+                continue
+            try:
+                local_path = path_value(prompt, COMMANDS)
+            except ValueError as exc:
+                display(f"Error: {exc}")
+                continue
+            if local_path is not None:
+                submit_input(prompt)
                 continue
             if prompt == "/exit":
                 try:
@@ -606,19 +639,7 @@ def main():
             elif prompt.startswith("/"):
                 display("Unknown command; use /help.")
             else:
-                try:
-                    show_answer(agent.run(prompt))
-                    save_current()
-                except KeyboardInterrupt:
-                    if stream_wrote:
-                        formatter.finish()
-                        stream_wrote = False
-                    display("Interrupted.")
-                except Exception as exc:
-                    if stream_wrote:
-                        formatter.finish()
-                        stream_wrote = False
-                    display(f"Error: {exc}")
+                submit_input(prompt)
     except Exception as exc:
         display(f"Error: {exc}")
         raise SystemExit(1) from None

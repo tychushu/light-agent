@@ -323,3 +323,31 @@ completes Markdown files in the current directory; and `/skill load` or
 library when that Skill argument is being completed. Ordinary text and `!shell`
 input do not trigger command completion. The startup hint and `/help` list the
 available commands.
+
+## Submit local text by path
+
+Enter a path starting with `~`, `～`, or `/`, press Tab to complete directories
+and filenames, and press Enter to send that file's text as the current user
+message. For example:
+
+```text
+~/notes/prompt.md
+～/notes/prompt.md
+/storage/emulated/0/Documents/task.txt
+```
+
+Completion lists names only; files are read after submission. UTF-8 text (including
+a UTF-8 BOM) is supported. File contents are sent exactly, without a generated
+prompt or silent truncation; the terminal displays the resolved source path,
+character count, and active API. The normal session history stores the submitted
+text. This also works with `ta --prompt '~/notes/prompt.md'`.
+
+Known slash commands such as `/help` and `/api local` take precedence. Quotes can
+force a filename that conflicts with a command: `"/help"`. Filenames with spaces
+work directly or inside quotes. Enter one path at a time; ask a follow-up question
+in the next message if needed. Directories, devices, missing/non-readable files,
+binary data, and non-UTF-8 files produce a readable error before any API request.
+
+The default limit is 64,000 characters. Set the top-level
+`max_input_file_chars = 64000` in config.toml to adjust it (1–1,000,000). Oversized
+files are refused so partial contents are never mistaken for the complete text.

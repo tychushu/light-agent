@@ -20,6 +20,8 @@ class TerminalTests(unittest.TestCase):
         test_home = tempfile.mkdtemp(prefix="ta-terminal-home-")
         if setup:
             setup(test_home)
+        if callable(exchanges):
+            exchanges = exchanges(test_home)
         previous_home = os.environ.get("HOME")
         os.environ["HOME"] = test_home
         pid, fd = pty.fork()
@@ -134,6 +136,38 @@ class TerminalTests(unittest.TestCase):
         self.assertIn('Show commands', text)
         self.assertIn('cloud', text)
         self.assertNotIn('Unknown command', text)
+
+    def test_local_path_tab_completion_and_exact_text_submission(self):
+        from pathlib import Path
+        def setup(home):
+            root = Path(home)
+            (root / "docs").mkdir()
+            (root / "docs/note.txt").write_text("FILE_SENTINEL")
+            (root / "with space.txt").write_text("SPACE_SENTINEL")
+        code = '''import sys
+import termux_agent.agent as core
+from termux_agent.cli import main
+class FakeClient:
+    last_usage = None
+    last_request = None
+    def __init__(self, config): pass
+    def close(self): pass
+    def chat(self, messages, tools):
+        return {"content": "READ:" + messages[-1]["content"]}
+core.Client = FakeClient
+sys.argv = ["ta", "--no-session", "--no-agent"]
+main()
+'''
+        prompt = "You     │ ".encode()
+        def exchanges(home):
+            return [(prompt, b'~/do\tno\t\n'),
+                    (prompt, '～/with s\t\n'.encode()),
+                    (prompt, (home + '/docs/no\t\n').encode()),
+                    (prompt, b'/exi\t\n')]
+        text = self.exchange(code, exchanges, setup=setup)
+        self.assertEqual(text.count("READ:FILE_SENTINEL"), 2)
+        self.assertEqual(text.count("READ:SPACE_SENTINEL"), 1)
+        self.assertNotIn("No such file", text)
 
     def test_columns_wrap_chinese_and_keep_stream_roles_separate(self):
         from termux_agent.terminal_ui import Columns, _cells

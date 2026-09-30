@@ -138,7 +138,43 @@ class Completer:
                 if item.name.startswith(path.name) and
                 (item.is_dir() or item.suffix.lower() == ".md")]
 
+    def _paths(self, prefix):
+        quote = prefix[0] if prefix[:1] in ('"', "'") else ""
+        body = prefix[1:] if quote else prefix
+        if quote and body.endswith(quote):
+            body = body[:-1]
+        normalized = "~" + body[1:] if body.startswith("～") else body
+        try:
+            if normalized.startswith("~") and "/" not in normalized:
+                base, partial, display = Path(normalized).expanduser(), "", body + "/"
+            else:
+                expanded = Path(normalized).expanduser()
+                if body.endswith("/"):
+                    base, partial, display = expanded, "", body
+                else:
+                    base, partial = expanded.parent, expanded.name
+                    display = body.rpartition("/")[0] + "/"
+            options = []
+            for item in base.iterdir():
+                if not item.name.startswith(partial) or (item.name.startswith(".") and not partial.startswith(".")):
+                    continue
+                is_dir = item.is_dir()
+                options.append(quote + display + item.name + ("/" if is_dir else quote))
+            return options
+        except (OSError, RuntimeError, ValueError):
+            return []
+
     def matches(self, line, begin, prefix):
+        full_prefix = line[:begin] + prefix
+        quoted_path = (len(full_prefix) >= 2 and full_prefix[0] in (chr(34), chr(39)) and full_prefix[1] in ("/", "~", "～"))
+        root = line.split(maxsplit=1)[0] if line.split() else ""
+        path_mode = quoted_path or full_prefix.startswith(("~", "～")) or (
+            full_prefix.startswith("/") and root not in COMMANDS)
+        if path_mode:
+            options = self._paths(full_prefix)
+            if begin == 0 and not quoted_path and full_prefix.startswith("/"):
+                options += [name for name in COMMANDS if name.startswith(full_prefix)]
+            return sorted({name[begin:] for name in options if name.startswith(full_prefix)})
         if not line.startswith("/"):
             return []
         if begin == 0:
