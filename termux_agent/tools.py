@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import math
 import time
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -16,8 +17,8 @@ from typing import Any
 TOOLS = [
     {"type": "function", "function": {"name": "shell", "description": "Run a non-interactive Termux shell command.", "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "cwd": {"type": "string"}, "timeout": {"type": "number"}}, "required": ["command"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "read_file", "description": "Read a bounded text window by line number or byte offset.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "start_line": {"type": "integer", "minimum": 1}, "end_line": {"type": "integer", "minimum": 1}, "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1}}, "required": ["path"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "write_file", "description": "Create or replace a UTF-8 text file atomically.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
-    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text only when the expected match count agrees.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "expected_replacements": {"type": "integer", "minimum": 1}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write UTF-8 atomically; verified SHA-256 confirms the write without returning text.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
+    {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text only at the expected count; return verified SHA-256, not text.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "expected_replacements": {"type": "integer", "minimum": 1}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}}},
 ]
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
@@ -261,18 +262,40 @@ def _write_file(args: dict) -> dict:
     if not isinstance(content, str):
         raise ValueError("content must be a string")
     data = content.encode("utf-8")
-    _atomic_write(Path(args["path"]), data)
-    return {"path": args["path"], "bytes_written": len(data)}
+    path = Path(args["path"])
+    _atomic_write(path, data)
+    return {**_write_verification(path, data), "chars_written": len(content)}
+
+
+def _write_verification(path: Path, data: bytes) -> dict:
+    result = {"path": str(path), "bytes_written": len(data), "verified": False}
+    expected = hashlib.sha256(data).hexdigest()
+    try:
+        with path.open("rb") as stream:
+            if os.fstat(stream.fileno()).st_size != len(data):
+                result["error"] = "File size changed before hash verification"
+                return result
+            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+    except OSError as exc:
+        result["error"] = f"File was written but hash verification failed: {type(exc).__name__}"
+        return result
+    result["sha256"] = actual
+    result["verified"] = actual == expected
+    if actual != expected:
+        result["error"] = "File changed before hash verification; written content is not confirmed"
+    return result
 
 
 def _edit_file(args: dict) -> dict:
     path = Path(args["path"])
     old, new = args["old_text"], args["new_text"]
-    expected = int(args.get("expected_replacements", 1))
+    expected = args.get("expected_replacements", 1)
+    if not isinstance(old, str) or not isinstance(new, str):
+        raise ValueError("old_text and new_text must be strings")
     if not old:
         raise ValueError("old_text must not be empty")
-    if expected < 1:
-        raise ValueError("expected_replacements must be positive")
+    if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
+        raise ValueError("expected_replacements must be a positive integer")
     with path.open("rb") as f:
         data = f.read(MAX_EDIT_BYTES + 1)
     if len(data) > MAX_EDIT_BYTES:
@@ -282,8 +305,10 @@ def _edit_file(args: dict) -> dict:
     if count != expected:
         raise ValueError(f"expected {expected} exact match(es), found {count}; file unchanged")
     result = source.replace(old, new)
-    _atomic_write(path, result.encode("utf-8"))
-    return {"path": str(path), "replacements": count}
+    data = result.encode("utf-8")
+    _atomic_write(path, data)
+    return {**_write_verification(path, data), "replacements": count,
+            "chars_written": len(result)}
 
 
 def execute(name: str, args: dict, max_output_chars: int = 20000) -> dict:

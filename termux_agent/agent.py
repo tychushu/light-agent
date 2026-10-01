@@ -10,6 +10,7 @@ from .tools import TOOLS, execute
 
 from .approval import needs_approval
 from .instructions import load_system_prompt
+from .display_privacy import hide_write_payloads
 
 
 class Agent:
@@ -240,4 +241,5 @@ class Agent:
             if isinstance(value, list):
                 return [redact(v) for v in value]
             return value
-        return redact(request)
+        result = redact(request)
+        return hide_write_payloads(result) if self.config.silent_writes else result

@@ -9,13 +9,14 @@ import unicodedata
 COMMANDS = (
     "/help", "/clear", "/stats", "/config", "/debug", "/debug-context",
     "/api", "/agent", "/skill", "/copy", "/paste", "/sessions", "/session",
-    "/history", "/exit",
+    "/history", "/silent", "/exit",
 )
 SUBCOMMANDS = {
     "/api": ("list", "add", "switch", "show", "default", "remove", "next", "prev"),
     "/agent": ("directory", "reload", "off"),
     "/skill": ("list", "info", "load", "unload", "clear"),
     "/session": ("new", "fork", "load", "rename", "delete", "save"),
+    "/silent": ("on", "off"),
 }
 
 

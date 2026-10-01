@@ -5,6 +5,7 @@ max_steps = 16
 max_output_chars = 20000
 max_input_file_chars = 64000
 approval_policy = "on-risk"
+silent_writes = true
 timeout = 120.0
 stream = true # set false for APIs without SSE support
 

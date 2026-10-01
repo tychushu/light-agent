@@ -18,6 +18,8 @@ from .skills import SkillRegistry
 from .api_profiles import ProfileStore
 from .terminal_ui import Columns, Completer, COMMANDS
 from .local_input import load_text_submission, path_value
+from .display_privacy import WRITE_TOOLS, hide_write_payloads, safe_tool_arguments
+from .approval import reason as approval_reason
 
 HELP = """/help           Show commands
 Tab             Complete command, API, session and Skill names
@@ -27,6 +29,7 @@ Tab             Complete command, API, session and Skill names
 /config         Show effective configuration, without credentials
 /debug          Toggle request usage and tool result diagnostics
 /debug-context  Show last request messages and tools, with key redacted
+/silent [on|off]  Hide/show write and edit payloads in tool logs
 /api [name|number|next]  List or switch API (new conversation)
 /api add NAME URL MODEL [KEY_ENV] [local|cloud]  Add a profile
 /api default NAME   Use this profile on future launches
@@ -190,7 +193,9 @@ def main():
         formatter.message(role, redact(text))
 
     def approve(name, args):
-        display({"approval_required": name, "arguments": args}, "Approve")
+        visible = safe_tool_arguments(name, args) if config.silent_writes else args
+        display({"approval_required": name, "arguments": visible,
+                 "reason": approval_reason(name, args)}, "Approve")
         if not sys.stdin.isatty():
             display("Denied: approval requires an interactive terminal.")
             return False
@@ -200,8 +205,11 @@ def main():
             return False
 
     def event(kind, payload):
-        if debug or kind == "tool_start":
-            display({kind: payload}, "Tool")
+        name = payload.get("name")
+        writing = name in WRITE_TOOLS
+        if debug or kind == "tool_start" or (writing and kind == "tool_result"):
+            visible = hide_write_payloads(payload) if config.silent_writes else payload
+            display({kind: visible}, "Tool")
         if kind == "tool_start":
             tool_started[payload.get("name")] = time.monotonic()
         elif kind == "tool_result":
@@ -387,6 +395,14 @@ def main():
                 display(f"Debug {'on' if debug else 'off'}")
             elif prompt == "/debug-context":
                 display(agent.debug_context())
+            elif prompt == "/silent" or prompt.startswith("/silent "):
+                value = prompt[7:].strip()
+                if value not in ("", "on", "off"):
+                    display("Use /silent on or /silent off")
+                else:
+                    if value:
+                        config.silent_writes = value == "on"
+                    display({"silent_writes": config.silent_writes})
             elif prompt == "/api" or prompt.startswith("/api "):
                 value = prompt[4:].strip()
                 try:
@@ -590,6 +606,8 @@ def main():
                     end = max(0, len(history) - skip)
                     for message in history[max(0, end-count):end]:
                         visible = {k: v for k, v in message.items() if k != "reasoning_content"}
+                        if config.silent_writes:
+                            visible = hide_write_payloads(visible)
                         rendered = json.dumps(visible, ensure_ascii=False)
                         role = {"user": "You", "assistant": "Agent", "tool": "Tool"}.get(
                             message.get("role"), "Info")

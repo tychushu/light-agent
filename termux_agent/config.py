@@ -25,6 +25,7 @@ class Config:
     api_kind: str = "local"
     user_agent: str = "termux-agent/0.1"
     stream: bool = True
+    silent_writes: bool = True
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -39,7 +40,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "user_agent", "stream"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "user_agent", "stream", "silent_writes"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -76,6 +77,8 @@ class Config:
         return ["default", *ProfileStore(path).entries().keys()]
 
     def validate(self) -> None:
+        if not isinstance(self.silent_writes, bool):
+            raise ValueError("silent_writes must be a boolean")
         if (not isinstance(self.max_input_file_chars, int) or
                 isinstance(self.max_input_file_chars, bool) or not 1 <= self.max_input_file_chars <= 1_000_000):
             raise ValueError("max_input_file_chars must be between 1 and 1000000")

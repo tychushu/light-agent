@@ -371,3 +371,27 @@ The prompt body is no longer hardcoded in Python. Wheels include the template.
 Empty, invalid UTF-8, or over-16,000-character prompts produce an actionable
 error instead of falling back to a hidden code string. Directory/session
 `agent.md` instructions are appended to this base as before.
+
+## Silent file writes
+
+`silent_writes = true` is the default. Tool logs and approval prompts summarize
+`write_file` and `edit_file` arguments using path, character/byte counts and
+replacement counts instead of displaying `content`, `old_text`, or `new_text`.
+Writing results are always shown as metadata: size, replacement count, SHA-256,
+and `verified`. The hash is computed from the on-disk file internally; no file
+body is returned to the model as part of write verification. A mismatch or
+verification error is reported without claiming a confirmed write.
+
+`/silent` shows the current setting. `/silent on` or `/silent off` changes the
+current process's display behavior; set top-level `silent_writes = false` in
+config.toml to persist raw tool-argument display. API keys remain redacted.
+With silent writes enabled, `/debug-context` and historical tool-call displays
+also mask write/edit payloads. These are display copies: API requests and saved
+sessions retain the real arguments required for the tool protocol. Approval
+policies still apply to the original arguments.
+
+This feature limits tool-payload echo. It does not alter provider filtering or
+hide text that the model chooses to quote in reasoning/final responses. Explicit
+reads, clipboard displays, and shell commands retain their normal output. Prefer
+`write_file`/`edit_file` for quiet file changes; a `verified: true` result confirms
+that the intended bytes were written without needing a separate textual reread.
