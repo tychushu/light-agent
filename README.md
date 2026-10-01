@@ -133,7 +133,7 @@ Instruction changes start a fresh conversation and reset usage statistics;
 Files are not silently reread each turn. The 16000-character limit is enforced
 before sending (oversize files produce an error, never silently truncate).
 `/stats` counts the actual combined system prompt; `/debug-context` shows the
-injected text. No file means the original 163-character system prompt is unchanged.
+injected text. Without scoped instructions, the system prompt comes from the editable base prompt file (the shipped default is 163 characters).
 
 ## Preconfigured phone endpoints
 
@@ -351,3 +351,23 @@ binary data, and non-UTF-8 files produce a readable error before any API request
 The default limit is 64,000 characters. Set the top-level
 `max_input_file_chars = 64000` in config.toml to adjust it (1–1,000,000). Oversized
 files are refused so partial contents are never mistaken for the complete text.
+
+
+## Edit the built-in system prompt
+
+The active base prompt is a UTF-8 text file:
+
+```text
+~/.config/termux-agent/system_prompt.txt
+```
+
+Edit this file directly. `/clear`, `/session new`, or restarting into a new
+session reads the new contents. Existing sessions retain their saved prompt
+snapshot, including when loading/unloading Skills later.
+
+The package ships `termux_agent/system_prompt.txt` as the first-use template.
+The active file is created only when absent, never overwritten by source updates.
+The prompt body is no longer hardcoded in Python. Wheels include the template.
+Empty, invalid UTF-8, or over-16,000-character prompts produce an actionable
+error instead of falling back to a hidden code string. Directory/session
+`agent.md` instructions are appended to this base as before.

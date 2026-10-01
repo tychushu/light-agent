@@ -4,7 +4,7 @@ import io
 import unittest
 from pathlib import Path
 
-from termux_agent.agent import Agent, SYSTEM
+from termux_agent.agent import Agent
 from termux_agent.config import Config
 from termux_agent.sessions import snapshot, restore
 from termux_agent.skills import SkillRegistry, MAX_SKILL_CHARS
@@ -19,7 +19,7 @@ class SkillTests(unittest.TestCase):
     def test_zero_load_and_manual_session_lifecycle(self):
         agent = Agent(Config(), client=NullClient())
         self.assertEqual(agent.get_active_skills(), {})
-        self.assertEqual(agent.system, SYSTEM)
+        self.assertEqual(agent.system, agent.base_system)
         agent.load_skill('demo', 'Do the demo.')
         self.assertIn('<!-- SKILL_START: demo -->', agent.system)
         agent.unload_skill('demo')
@@ -27,7 +27,7 @@ class SkillTests(unittest.TestCase):
         agent.load_skill('one', 'One instructions')
         agent.load_skill('two', 'Two instructions')
         agent.clear_skills()
-        self.assertEqual(agent.system, SYSTEM)
+        self.assertEqual(agent.system, agent.base_system)
 
     def test_frontmatter_tolerance_scope_and_precedence(self):
         with tempfile.TemporaryDirectory() as td:
@@ -54,7 +54,7 @@ class SkillTests(unittest.TestCase):
             agent.load_skill('manual','remember')
             scope={'directory':td,'config_path':str(config_file),'instructions':'','session_file':None,'disabled':False,'instruction_path':None}
             payload=snapshot(agent,scope)
-            _,restored,_=restore(payload,lambda cfg,text: Agent(cfg,client=NullClient(),instructions=text))
+            _,restored,_=restore(payload,lambda cfg,text,base_system=None: Agent(cfg,client=NullClient(),instructions=text,base_system=base_system))
             self.assertEqual(restored.get_active_skills(),{'manual':'remember'})
             restored.unload_skill('manual')
             self.assertEqual(restored.system,agent.base_system)

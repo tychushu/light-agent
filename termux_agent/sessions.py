@@ -46,7 +46,8 @@ def validate_messages(messages):
 
 def snapshot(agent, scope):
     validate_messages(agent.messages)
-    value = {'version': 2, 'config': agent.config.public_dict(), 'scope': scope,
+    value = {'version': 3, 'config': agent.config.public_dict(), 'scope': scope,
+             'base_system': agent.base_system,
              'messages': agent.messages, 'active_skills': agent.get_active_skills(), 'counters': {k: getattr(agent, k) for k in COUNTERS}}
     keys = {v for k, v in os.environ.items() if k.endswith('_API_KEY') and v}
     if agent.config.api_key:
@@ -65,7 +66,7 @@ def snapshot(agent, scope):
 
 
 def restore(payload, build_agent):
-    if payload.get('version') not in (1, 2):
+    if payload.get('version') not in (1, 2, 3):
         raise ValueError('Unsupported session version')
     validate_messages(payload['messages'])
     scope, saved = payload['scope'], payload['config']
@@ -74,20 +75,37 @@ def restore(payload, build_agent):
         raise ValueError('API profile endpoint/model changed; restore its original config or start a new session')
     if not Path(scope['directory']).is_dir():
         raise ValueError('Session directory no longer exists')
+    counters = payload['counters']
     for key in COUNTERS:
-        value = payload['counters'][key]
+        value = counters.get(key, 0)
         if key in ('_usage_history', '_request_history_chars'):
             if not isinstance(value, list):
                 raise ValueError('Invalid session statistics')
         elif not isinstance(value, int) or value < 0:
             raise ValueError('Invalid session statistics')
-    agent = build_agent(config, scope['instructions'])
-    for name, content in payload.get('active_skills', {}).items():
+    active_skills = payload.get('active_skills', {})
+    if not isinstance(active_skills, dict):
+        raise ValueError('Invalid session skills')
+    if any(not isinstance(name, str) or not isinstance(content, str)
+           for name, content in active_skills.items()):
+        raise ValueError('Invalid session skills')
+    base = payload.get('base_system')
+    if base is None:
+        base = payload['messages'][0]['content']
+        if not isinstance(base, str):
+            raise ValueError('Invalid saved system prompt')
+        for name, content in reversed(list(active_skills.items())):
+            block = f"\n\n<!-- SKILL_START: {name} -->\n{content}\n<!-- SKILL_END: {name} -->"
+            base = base.removesuffix(block)
+    if not isinstance(base, str) or not base.strip():
+        raise ValueError('Invalid saved system prompt')
+    agent = build_agent(config, scope['instructions'], base_system=base)
+    for name, content in active_skills.items():
         agent.load_skill(name, content)
     agent.messages = payload['messages']
     agent.system = agent.messages[0]['content']
     for key in COUNTERS:
-        setattr(agent, key, payload['counters'][key])
+        setattr(agent, key, counters.get(key, 0))
     return config, agent, scope
 
 

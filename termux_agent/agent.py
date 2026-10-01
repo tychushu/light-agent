@@ -9,20 +9,20 @@ from .client import Client
 from .tools import TOOLS, execute
 
 from .approval import needs_approval
-
-
-SYSTEM = "You are a concise Termux terminal agent.\nUse tools when needed.\nInspect before modifying.\nPrefer minimal changes.\nVerify important changes before claiming success."
+from .instructions import load_system_prompt
 
 
 class Agent:
     def __init__(self, config: Any, approve: Callable[[str, dict[str, Any]], bool] | None = None,
-                 event: Callable[[str, dict[str, Any]], None] | None = None, client: Any | None = None, instructions: str = ""):
+                 event: Callable[[str, dict[str, Any]], None] | None = None, client: Any | None = None, instructions: str = "",
+                 base_system: str | None = None):
         self.config = config
         self.config.validate()
         self.approve = approve
         self.event = event
+        self.base_system = base_system if base_system is not None else (
+            load_system_prompt() + ("\n\n" + instructions if instructions else ""))
         self.client = client or Client(config)
-        self.base_system = SYSTEM + ("\n\n" + instructions if instructions else "")
         self.active_skills: dict[str, str] = {}
         self.system = self.base_system
         self._direct_shell_count = 0

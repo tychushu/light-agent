@@ -229,15 +229,20 @@ def main():
             display(value, "Agent")
         stream_wrote = False
 
-    def build_agent(next_config, text):
+    def build_agent(next_config, text, base_system=None):
         kwargs = {"approve": approve, "event": event}
         if text:
             kwargs["instructions"] = text
+        if base_system is not None:
+            kwargs["base_system"] = base_system
         built = Agent(next_config, **kwargs)
         built.client.on_stream = stream_output
         return built
 
-    agent = build_agent(config, instructions)
+    try:
+        agent = None if options.session else build_agent(config, instructions)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     store = None if options.no_session else SessionStore()
     session_id, revision = new_id(), 0
 
@@ -260,7 +265,7 @@ def main():
 
     def save_current(force=False):
         nonlocal revision
-        if store and (force or revision or len(agent.messages) > 1):
+        if store and agent is not None and (force or revision or len(agent.messages) > 1):
             scope = {"directory": str(directory), "config_path": config_path,
                      "session_file": session_file, "disabled": disabled,
                      "instructions": instructions, "instruction_path": instruction_path}
@@ -317,7 +322,8 @@ def main():
         except Exception:
             replacement.client.close()
             raise
-        agent.client.close()
+        if agent is not None:
+            agent.client.close()
         config, agent = next_config, replacement
         directory, config_path = Path(scope['directory']), scope['config_path']
         session_file, disabled = scope['session_file'], scope['disabled']
@@ -648,7 +654,8 @@ def main():
             save_current()
         except (ValueError, OSError, sqlite3.Error) as exc:
             display(f"Session save failed: {exc}; this turn was not saved.")
-        agent.client.close()
+        if agent is not None:
+            agent.client.close()
         save_readline_history()
         if store:
             store.close()

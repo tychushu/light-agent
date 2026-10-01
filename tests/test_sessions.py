@@ -42,7 +42,7 @@ class SessionTests(unittest.TestCase):
         identifier = new_id()
         self.assertEqual(self.store.save(identifier, 0, payload), 1)
         revision, saved = self.store.load(identifier)
-        config, agent, scope = restore(saved, lambda cfg, text: Agent(cfg, client=FakeClient(), instructions=text))
+        config, agent, scope = restore(saved, lambda cfg, text, base_system=None: Agent(cfg, client=FakeClient(), instructions=text, base_system=base_system))
         self.assertEqual(revision, 1)
         self.assertEqual(agent.messages[-1]['reasoning_content'], 'keep this')
         self.assertEqual(agent.stats()['api_calls_total'], 2)
