@@ -395,3 +395,42 @@ hide text that the model chooses to quote in reasoning/final responses. Explicit
 reads, clipboard displays, and shell commands retain their normal output. Prefer
 `write_file`/`edit_file` for quiet file changes; a `verified: true` result confirms
 that the intended bytes were written without needing a separate textual reread.
+
+## Bounded automatic task execution
+
+`/run TASK` runs one task automatically. `/auto on` enables that behavior for
+subsequent messages in the current process; `/auto off` restores the normal
+chat loop. `/auto steps 64` changes the total request limit for subsequent tasks.
+For a persistent setting, use top-level TOML keys:
+
+```toml
+auto_continue = true
+max_steps = 16
+max_continuations = 3
+```
+
+The source default is opt-in (`auto_continue = false`), so plain chat retains its
+original fixed context and one-request behavior. In automatic mode the model
+must finish a no-tool response with complete/blocked/continue status. A plan-only
+response or missing status triggers a bounded continuation instead of silently
+ending the task. The internal markers are hidden from streamed answer text.
+All follow-up requests share `max_steps`; `max_continuations` limits consecutive
+text-only pauses without tool progress and resets after tool execution. API
+errors, Ctrl-C, an actual approval denial, completion, an explicit blocker, or
+budget exhaustion stop execution. No previous tool call is replayed by the
+controller. The model still chooses tools and can misjudge completion; this is
+not a separate planner or a guarantee that every task is correct.
+
+The short mode instructions are editable at
+`~/.config/termux-agent/task_prompt.txt` and `task_continue.txt`, copied from
+package templates only on first use. They are added only to automatic requests;
+existing base prompt, scoped agent.md, Skills and saved sessions keep their
+normal behavior. `/stats` reports `last_run` status, continuation count and
+`auto_prompt_chars`; server usage totals include every continuation request.
+
+Approval controls remain active. When a read_file call needs approval, `a`
+explicitly allows all further read_file calls in that same task. It never
+approves Shell, write_file or edit_file calls, and the grant resets on the next
+human task. With the usual on-risk policy, ordinary read_file calls already
+run without extra approval. Instructions inside a file do not grant permission
+to bypass a denied tool.

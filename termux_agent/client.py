@@ -7,6 +7,7 @@ import time
 from typing import Any, Callable
 
 import httpx
+from .continuation import MarkerFilter
 
 
 class ClientError(RuntimeError):
@@ -28,6 +29,11 @@ class Client:
         self.last_usage: dict[str, Any] | None = None
         self.streamed = False
         self.streamed_text = False
+        self.control_markers = ()
+        self._marker_filter = None
+
+    def set_control_markers(self, markers):
+        self.control_markers = tuple(markers)
 
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
         body = {"model": self.config.model, "messages": messages, "tools": tools,
@@ -36,6 +42,7 @@ class Client:
         self.last_request = deepcopy(body)
         self.last_usage = None
         self.streamed = self.streamed_text = False
+        self._marker_filter = MarkerFilter(self.control_markers) if self.control_markers else None
         headers = {"Content-Type": "application/json", "User-Agent": self.config.user_agent}
         if self.config.api_key:
             headers["Authorization"] = "Bearer " + self.config.api_key
@@ -90,6 +97,11 @@ class Client:
         return message
 
     def _emit(self, kind: str, text: str) -> None:
+        if kind == "content" and self._marker_filter is not None:
+            text = self._marker_filter.feed(text)
+        self._emit_visible(kind, text)
+
+    def _emit_visible(self, kind: str, text: str) -> None:
         if not text:
             return
         if self.on_stream:
@@ -159,6 +171,8 @@ class Client:
                 data_lines.append(line[5:].lstrip())
         if data_lines:
             consume("\n".join(data_lines))
+        if self._marker_filter is not None:
+            self._emit_visible("content", self._marker_filter.feed("", final=True))
         self.last_usage = usage
         message: dict[str, Any] = {"role": "assistant", "content": "".join(content)}
         if reasoning:

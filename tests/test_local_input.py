@@ -18,7 +18,7 @@ class LocalInputTests(unittest.TestCase):
             for name in ('~/中文 note.txt', '～/中文 note.txt', '"' + str(file) + '"'):
                 result = load_text_submission(name, COMMANDS)
                 self.assertEqual(result.text, '内容\r\n/exit\n')
-                self.assertEqual(result.path, file)
+                self.assertEqual(result.path, file.resolve())
         self.assertIsNone(path_value('/help', COMMANDS))
         self.assertIsNone(path_value('/api local', COMMANDS))
         self.assertEqual(path_value('"/help"', COMMANDS), '/help')

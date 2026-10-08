@@ -1,0 +1,1 @@
+Continue the unfinished authorized task with tools now. End with [TASK_DONE] only when complete or [TASK_BLOCKED] for a real blocker. Do not ask again for permission already granted, and never bypass a tool approval denial.

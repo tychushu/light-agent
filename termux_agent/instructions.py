@@ -25,9 +25,13 @@ def _read_system_prompt(source):
 
 
 def load_system_prompt():
-    source = system_prompt_path()
+    return load_prompt_file("system_prompt.txt")
+
+
+def load_prompt_file(name):
+    source = Path.home() / ".config/termux-agent" / name
     if not source.exists():
-        template = _read_system_prompt(files("termux_agent").joinpath("system_prompt.txt"))
+        template = _read_system_prompt(files("termux_agent").joinpath(name))
         source.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         try:
             fd = os.open(source, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

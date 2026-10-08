@@ -26,6 +26,8 @@ class Config:
     user_agent: str = "termux-agent/0.1"
     stream: bool = True
     silent_writes: bool = True
+    auto_continue: bool = False
+    max_continuations: int = 3
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -40,7 +42,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "user_agent", "stream", "silent_writes"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -77,6 +79,11 @@ class Config:
         return ["default", *ProfileStore(path).entries().keys()]
 
     def validate(self) -> None:
+        if not isinstance(self.auto_continue, bool):
+            raise ValueError("auto_continue must be a boolean")
+        if (not isinstance(self.max_continuations, int) or isinstance(self.max_continuations, bool)
+                or not 1 <= self.max_continuations <= 8):
+            raise ValueError("max_continuations must be between 1 and 8")
         if not isinstance(self.silent_writes, bool):
             raise ValueError("silent_writes must be a boolean")
         if (not isinstance(self.max_input_file_chars, int) or

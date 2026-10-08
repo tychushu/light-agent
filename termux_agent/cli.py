@@ -30,6 +30,8 @@ Tab             Complete command, API, session and Skill names
 /debug          Toggle request usage and tool result diagnostics
 /debug-context  Show last request messages and tools, with key redacted
 /silent [on|off]  Hide/show write and edit payloads in tool logs
+/auto [on|off|steps N]  Automatic task mode and request limit
+/run TASK        Run an authorized task through to completion
 /api [name|number|next]  List or switch API (new conversation)
 /api add NAME URL MODEL [KEY_ENV] [local|cloud]  Add a profile
 /api default NAME   Use this profile on future launches
@@ -181,6 +183,7 @@ def main():
     profile_store = ProfileStore(config_path)
     tool_started = {}
     stream_wrote = False
+    read_grant = False
     formatter = Columns(sys.stdout, enabled=sys.stdout.isatty() and options.prompt is None)
 
     def redact(text):
@@ -193,6 +196,9 @@ def main():
         formatter.message(role, redact(text))
 
     def approve(name, args):
+        nonlocal read_grant
+        if name == "read_file" and read_grant:
+            return True
         visible = safe_tool_arguments(name, args) if config.silent_writes else args
         display({"approval_required": name, "arguments": visible,
                  "reason": approval_reason(name, args)}, "Approve")
@@ -200,11 +206,20 @@ def main():
             display("Denied: approval requires an interactive terminal.")
             return False
         try:
-            return input("Allow this tool call? [y/N] ").strip().lower() in {"y", "yes"}
+            prompt = ("Allow this tool call? [y/N/a=all reads this task] "
+                      if name == "read_file" else "Allow this tool call? [y/N] ")
+            choice = input(prompt).strip().lower()
+            if name == "read_file" and choice in ("a", "all"):
+                read_grant = True
+                return True
+            return choice in {"y", "yes"}
         except (EOFError, KeyboardInterrupt):
             return False
 
     def event(kind, payload):
+        if kind == "continuation":
+            display({"automatic_continuation": payload})
+            return
         name = payload.get("name")
         writing = name in WRITE_TOOLS
         if debug or kind == "tool_start" or (writing and kind == "tool_result"):
@@ -232,7 +247,8 @@ def main():
         streamed = getattr(agent.client, "streamed", False)
         if stream_wrote:
             formatter.finish()
-        failure = value.startswith(("LLM 请求失败", "LLM 请求已中断", "已达到最大模型请求"))
+        failure = value.startswith(("LLM 请求失败", "LLM 请求已中断", "已达到最大模型请求",
+                                    "自动任务", "任务因审批", "工具执行已中断"))
         if value and (not streamed or not getattr(agent.client, "streamed_text", False) or failure):
             display(value, "Agent")
         stream_wrote = False
@@ -279,15 +295,17 @@ def main():
                      "instructions": instructions, "instruction_path": instruction_path}
             revision = store.save(session_id, revision, snapshot(agent, scope))
 
-    def submit_input(value):
-        nonlocal stream_wrote
+    def submit_input(value, automatic=None):
+        nonlocal stream_wrote, read_grant
+        read_grant = False
         try:
             submission = load_text_submission(value, COMMANDS, config.max_input_file_chars)
             if submission is not None:
                 display({"file": str(submission.path), "chars": len(submission.text),
                          "api": config.api_profile})
                 value = submission.text
-            show_answer(agent.run(value))
+            answer = agent.run(value) if automatic is None else agent.run(value, auto_continue=automatic)
+            show_answer(answer)
             save_current()
             return True
         except KeyboardInterrupt:
@@ -349,6 +367,7 @@ def main():
             return
         display("Termux Agent — /help for commands")
         display({"api": config.api_profile, "directory": str(directory), "agent_file": instruction_path, "session": session_id if store else "in-memory"})
+        display({"auto_continue": config.auto_continue, "max_steps": config.max_steps})
         if formatter.enabled:
             display("Tab 补全命令和 ~/本地路径；文件路径回车提交文本。")
         while True:
@@ -403,6 +422,28 @@ def main():
                     if value:
                         config.silent_writes = value == "on"
                     display({"silent_writes": config.silent_writes})
+            elif prompt == "/auto" or prompt.startswith("/auto "):
+                value = prompt[5:].strip()
+                try:
+                    if value in ("on", "off"):
+                        config.auto_continue = value == "on"
+                    elif value.startswith("steps "):
+                        count = int(value[6:].strip())
+                        if not 1 <= count <= 256:
+                            raise ValueError("Automatic request limit must be 1–256")
+                        config.max_steps = count
+                    elif value:
+                        raise ValueError("Use /auto on|off|steps N")
+                    display({"auto_continue": config.auto_continue, "max_steps": config.max_steps,
+                             "max_continuations": config.max_continuations})
+                except ValueError as exc:
+                    display(f"Error: {exc}")
+            elif prompt == "/run" or prompt.startswith("/run "):
+                task = prompt[4:].strip()
+                if task:
+                    submit_input(task, automatic=True)
+                else:
+                    display("Use /run TASK or /run ~/task-instructions.txt")
             elif prompt == "/api" or prompt.startswith("/api "):
                 value = prompt[4:].strip()
                 try:

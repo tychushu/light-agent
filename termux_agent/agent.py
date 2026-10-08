@@ -9,8 +9,9 @@ from .client import Client
 from .tools import TOOLS, execute
 
 from .approval import needs_approval
-from .instructions import load_system_prompt
+from .instructions import load_system_prompt, load_prompt_file
 from .display_privacy import hide_write_payloads
+from .continuation import TASK_MARKERS, task_status
 
 
 class Agent:
@@ -33,6 +34,9 @@ class Agent:
         self._usage_history: list[dict[str, Any] | None] = []
         self._request_history_chars: list[int] = []
         self._conversation_count = 0
+        self._approval_denied = False
+        self._last_auto_prompt_chars = 0
+        self.last_run = {"status": "idle", "auto": False, "continuations": 0}
 
     def _sync_skills(self) -> None:
         self.system = self.base_system
@@ -96,49 +100,94 @@ class Agent:
         except Exception:
             return False
 
-    def run(self, text: str) -> str:
+    def run(self, text: str, auto_continue: bool | None = None) -> str:
         if not isinstance(text, str) or not text.strip():
             raise ValueError("input must be a non-empty string")
+        automatic = self.config.auto_continue if auto_continue is None else auto_continue
+        rules = load_prompt_file("task_prompt.txt") if automatic else ""
+        nudge = load_prompt_file("task_continue.txt") if automatic else ""
+        self._last_auto_prompt_chars = len(rules) + 2 if rules else 0
+        self._approval_denied = False
+        self.last_run = {"status": "running", "auto": automatic, "continuations": 0}
+        pauses = 0
+        if hasattr(self.client, "set_control_markers"):
+            self.client.set_control_markers(TASK_MARKERS if automatic else ())
+
+        def finish(status, value):
+            self.last_run["status"] = status
+            return value
+
         self.messages.append({"role": "user", "content": text})
         self._conversation_count += 1
         for step in range(self.config.max_steps):
             self._total_calls += 1
+            request_messages = self.messages
+            if rules:
+                request_messages = [{"role": "system", "content": self.system + "\n\n" + rules},
+                                    *self.messages[1:]]
             try:
-                answer = self.client.chat(self.messages, TOOLS)
+                answer = self.client.chat(request_messages, TOOLS)
             except KeyboardInterrupt:
                 self._usage_history.append(None)
-                self._request_history_chars.append(self._history_chars())
-                return "LLM 请求已中断。"
+                self._request_history_chars.append(self._history_chars(request_messages))
+                return finish("interrupted", "LLM 请求已中断。")
             except Exception as exc:
                 self._usage_history.append(None)
-                self._request_history_chars.append(self._history_chars())
-                return f"LLM 请求失败：{exc}"
+                self._request_history_chars.append(self._history_chars(request_messages))
+                return finish("error", f"LLM 请求失败：{exc}")
             if not isinstance(answer, dict):
-                return "LLM 响应格式错误：assistant message must be an object"
+                self._usage_history.append(None)
+                self._request_history_chars.append(self._history_chars(request_messages))
+                return finish("error", "LLM 响应格式错误：assistant message must be an object")
             usage = getattr(self.client, "last_usage", None)
             usage = self._clean_usage(usage)
             self._usage_history.append(usage)
-            self._request_history_chars.append(self._history_chars())
+            self._request_history_chars.append(self._history_chars(request_messages))
             content = answer.get("content")
+            content = content if isinstance(content, str) else ""
+            status = None
+            if automatic:
+                content, status = task_status(content)
             reasoning = {"reasoning_content": answer["reasoning_content"]} if "reasoning_content" in answer else {}
             calls = answer.get("tool_calls")
             if not isinstance(calls, list) or not calls:
-                self.messages.append({"role": "assistant", "content": content if isinstance(content, str) else "", **reasoning})
-                return content if isinstance(content, str) else ""
+                self.messages.append({"role": "assistant", "content": content, **reasoning})
+                if not automatic:
+                    return finish("complete", content)
+                if self._approval_denied:
+                    return finish("blocked", "任务因审批拒绝停止；未执行被拒绝的操作。")
+                if status == "done":
+                    return finish("complete", content)
+                if status == "blocked":
+                    return finish("blocked", content or "自动任务已阻塞，需要用户输入或权限。")
+                if step == self.config.max_steps - 1:
+                    return finish("limit", "已达到最大模型请求次数；自动任务尚未确认完成。")
+                if pauses >= self.config.max_continuations:
+                    return finish("stalled", "自动任务已停止：连续多轮未执行工具或确认完成。")
+                pauses += 1
+                self.last_run["continuations"] += 1
+                self._emit("continuation", {"step": step + 1, "attempt": pauses,
+                                           "max_steps": self.config.max_steps})
+                self.messages.append({"role": "user", "content": nudge})
+                continue
             invalid = self._validate_calls(calls)
             if invalid:
                 # Do not persist a malformed assistant tool-call turn: subsequent
                 # requests must never contain dangling or invented tool_call_ids.
                 self.messages.append({"role": "assistant", "content": content if isinstance(content, str) else "", **reasoning})
-                return f"模型返回了格式错误的工具调用：{invalid}"
+                return finish("error", f"模型返回了格式错误的工具调用：{invalid}")
             self.messages.append({"role": "assistant", "content": content, "tool_calls": calls, **reasoning})
+            if automatic and self._approval_denied:
+                self._fill_tool_results(calls, denied=True, reason="task stopped after approval denial")
+                return finish("blocked", "任务因审批拒绝停止；未执行新的工具调用。")
             if step == self.config.max_steps - 1:
                 self._fill_tool_results(calls, denied=True, reason="maximum API request count reached")
-                return "已达到最大模型请求次数；未执行最后一轮工具调用。"
+                return finish("limit", "已达到最大模型请求次数；未执行最后一轮工具调用。")
             interrupted = self._fill_tool_results(calls)
+            pauses = 0
             if interrupted:
-                return "工具执行已中断；历史记录已保留为完整工具调用。"
-        return "已达到最大模型请求次数。"
+                return finish("interrupted", "工具执行已中断；历史记录已保留为完整工具调用。")
+        return finish("limit", "已达到最大模型请求次数。")
 
     @staticmethod
     def _validate_calls(calls: list[Any]) -> str | None:
@@ -167,8 +216,9 @@ class Agent:
                 usage[field] = number
         return usage or None
 
-    def _history_chars(self) -> int:
-        return sum(len(json.dumps(m, ensure_ascii=False, separators=(",", ":"))) for m in self.messages)
+    def _history_chars(self, messages=None) -> int:
+        messages = self.messages if messages is None else messages
+        return sum(len(json.dumps(m, ensure_ascii=False, separators=(",", ":"))) for m in messages)
 
     def _fill_tool_results(self, calls: list[Any], denied: bool = False, reason: str = "") -> bool:
         """Append one tool result per call, even if one call is malformed/interrupted."""
@@ -189,6 +239,7 @@ class Agent:
             elif not name:
                 result = {"error": "tool name is missing"}
             elif not self._approved(name, args or {}):
+                self._approval_denied = True
                 result = {"error": "approval denied or unavailable"}
             else:
                 self._emit("tool_start", {"name": name, "arguments": args})
@@ -222,7 +273,9 @@ class Agent:
                 "usage_history": list(self._usage_history), "usage_missing_requests": missing,
                 "conversation_count": self._conversation_count,
                 "conversation_message_count": len(self.messages),
-                "system_chars": len(self.system),
+                "system_chars": len(self.system) + self._last_auto_prompt_chars,
+                "auto_prompt_chars": self._last_auto_prompt_chars,
+                "auto_continue": self.config.auto_continue, "last_run": dict(self.last_run),
                 "tool_schema_chars": len(json.dumps(TOOLS, ensure_ascii=False, separators=(",", ":"))),
                 "request_history_chars": list(self._request_history_chars),
                 "current_history_chars": self._history_chars()}
