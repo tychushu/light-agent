@@ -140,3 +140,26 @@ class ContinuationTests(unittest.TestCase):
         results=[m for m in clients[0].sent[-1] if m['role']=='tool']
         self.assertEqual(len(results),2)
         self.assertTrue(all('error' not in json.loads(m['content']) for m in results))
+
+    def test_provider_refusal_is_a_blocker_not_a_continuation_trigger(self):
+        for reply in ({'content':'The request was rejected because it was considered high risk'},
+                      {'content':'', 'refusal':'provider refused'}):
+            client = ScriptedClient([reply])
+            agent = Agent(Config(auto_continue=True), client=client)
+            agent.run('read the files')
+            self.assertEqual(len(client.sent), 1)
+            self.assertEqual(agent.last_run['status'], 'blocked')
+            self.assertEqual(agent.last_run['blocked_by'], 'provider')
+            self.assertEqual(agent.last_run['continuations'], 0)
+
+    def test_content_filter_finish_reason_stops_without_retry(self):
+        requests = []
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(200,json={'choices':[{'message':{'content':'filtered'},'finish_reason':'content_filter'}]})
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            client = Client(Config(stream=False), http)
+            agent = Agent(Config(auto_continue=True), client=client)
+            self.assertEqual(agent.run('task'), 'filtered')
+            self.assertEqual(agent.last_run['status'], 'blocked')
+            self.assertEqual(len(requests), 1)

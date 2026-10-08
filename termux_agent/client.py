@@ -29,6 +29,7 @@ class Client:
         self.last_usage: dict[str, Any] | None = None
         self.streamed = False
         self.streamed_text = False
+        self.last_finish_reason = None
         self.control_markers = ()
         self._marker_filter = None
 
@@ -41,6 +42,7 @@ class Client:
         url = self.config.base_url.rstrip("/") + "/chat/completions"
         self.last_request = deepcopy(body)
         self.last_usage = None
+        self.last_finish_reason = None
         self.streamed = self.streamed_text = False
         self._marker_filter = MarkerFilter(self.control_markers) if self.control_markers else None
         headers = {"Content-Type": "application/json", "User-Agent": self.config.user_agent}
@@ -94,6 +96,7 @@ class Client:
         if not isinstance(message, dict):
             raise ClientError("LLM response has no assistant message")
         self.last_usage = result.get("usage") if isinstance(result.get("usage"), dict) else None
+        self.last_finish_reason = choices[0].get("finish_reason")
         return message
 
     def _emit(self, kind: str, text: str) -> None:
@@ -174,6 +177,7 @@ class Client:
         if self._marker_filter is not None:
             self._emit_visible("content", self._marker_filter.feed("", final=True))
         self.last_usage = usage
+        self.last_finish_reason = finish
         message: dict[str, Any] = {"role": "assistant", "content": "".join(content)}
         if reasoning:
             message["reasoning_content"] = "".join(reasoning)

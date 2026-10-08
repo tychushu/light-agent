@@ -11,7 +11,7 @@ from .tools import TOOLS, execute
 from .approval import needs_approval
 from .instructions import load_system_prompt, load_prompt_file
 from .display_privacy import hide_write_payloads
-from .continuation import TASK_MARKERS, task_status
+from .continuation import TASK_MARKERS, provider_blocked, task_status
 
 
 class Agent:
@@ -149,6 +149,10 @@ class Agent:
             if automatic:
                 content, status = task_status(content)
             reasoning = {"reasoning_content": answer["reasoning_content"]} if "reasoning_content" in answer else {}
+            if provider_blocked(answer, getattr(self.client, "last_finish_reason", None)):
+                self.messages.append({"role": "assistant", "content": content, **reasoning})
+                self.last_run["blocked_by"] = "provider"
+                return finish("blocked", content or "自动任务已停止：模型服务拒绝了请求。")
             calls = answer.get("tool_calls")
             if not isinstance(calls, list) or not calls:
                 self.messages.append({"role": "assistant", "content": content, **reasoning})

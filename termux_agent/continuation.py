@@ -3,6 +3,17 @@ import re
 
 TASK_MARKERS = ("[TASK_DONE]", "[TASK_BLOCKED]", "[TASK_CONTINUE]")
 _STATUS = re.compile(r"\[TASK_(DONE|BLOCKED|CONTINUE)\]\s*$")
+_PROVIDER_REJECTION = re.compile(
+    r"^\s*(?:the request was rejected because|request (?:blocked|rejected).*(?:safety|high risk|content filter)"
+    r"|i (?:cannot|can't) (?:help|assist) with|(?:抱歉|对不起)[，, ]*我(?:无法|不能)(?:帮助|协助|提供))",
+    re.I,
+)
+
+
+def provider_blocked(answer, finish_reason=None):
+    content = answer.get("content")
+    return bool(answer.get("refusal") or finish_reason == "content_filter" or
+                (isinstance(content, str) and _PROVIDER_REJECTION.search(content)))
 
 
 def task_status(text):

@@ -416,7 +416,7 @@ response or missing status triggers a bounded continuation instead of silently
 ending the task. The internal markers are hidden from streamed answer text.
 All follow-up requests share `max_steps`; `max_continuations` limits consecutive
 text-only pauses without tool progress and resets after tool execution. API
-errors, Ctrl-C, an actual approval denial, completion, an explicit blocker, or
+errors/refusals, Ctrl-C, an actual approval denial, completion, an explicit blocker, or
 budget exhaustion stop execution. No previous tool call is replayed by the
 controller. The model still chooses tools and can misjudge completion; this is
 not a separate planner or a guarantee that every task is correct.
