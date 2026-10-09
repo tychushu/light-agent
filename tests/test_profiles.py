@@ -175,3 +175,103 @@ class StreamingTests(unittest.TestCase):
             with self.assertRaises(ClientError):
                 client.chat([], [])
         self.assertEqual(len(attempts), 1)
+
+
+class ProviderErrorDiagnosticsTests(unittest.TestCase):
+    def test_streaming_405_is_not_retried_and_diagnostic_is_bounded_and_redacted(self):
+        attempts, consumed = [], []
+        secret = "private-token-should-not-appear"
+        secret_message = "provider-private-body-text-should-not-appear"
+
+        class LargeErrorStream(httpx.SyncByteStream):
+            def __iter__(self):
+                payload = (('{"error":{"type":"method_error","code":"route_405",'
+                            f'"message":"{secret_message}"}}').encode() + b" " * 8192)
+                for offset in range(0, len(payload), 512):
+                    chunk = payload[offset:offset + 512]
+                    consumed.append(len(chunk))
+                    yield chunk
+
+        def respond(request):
+            attempts.append(request)
+            return httpx.Response(405, headers={"content-type": "application/json",
+                                                "allow": "GET, OPTIONS"},
+                                  stream=LargeErrorStream(), request=request)
+
+        config = Config(base_url="https://router.example/v1", api_key=secret, stream=True)
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            client = Client(config, http_client=http, sleeper=lambda _: self.fail("405 retried"))
+            with self.assertRaises(ClientError) as raised:
+                client.chat([], [])
+
+        diagnostic = str(raised.exception)
+        self.assertEqual(len(attempts), 1)
+        self.assertIn("405", diagnostic)
+        self.assertIn("router.example", diagnostic)
+        self.assertIn("/v1/chat/completions", diagnostic)
+        self.assertIn("GET", diagnostic)
+        self.assertLessEqual(sum(consumed), 2048)
+        self.assertNotIn(secret, diagnostic)
+        self.assertNotIn(secret_message, diagnostic)
+        self.assertNotIn("Authorization", diagnostic)
+        self.assertNotIn("?", diagnostic)
+
+    def test_http_error_json_identifiers_are_shown_but_message_is_redacted(self):
+        private_text = "do-not-print-provider-message"
+
+        def respond(request):
+            return httpx.Response(400, json={"error": {"type": "bad_request",
+                                                          "code": "invalid_tools",
+                                                          "message": private_text}},
+                                  request=request)
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            with self.assertRaises(ClientError) as raised:
+                Client(Config(stream=False), http_client=http).chat([], [])
+        diagnostic = str(raised.exception)
+        self.assertIn("400", diagnostic)
+        self.assertIn("bad_request", diagnostic)
+        self.assertIn("invalid_tools", diagnostic)
+        self.assertNotIn(private_text, diagnostic)
+
+    def test_http_200_html_is_rejected_with_gateway_hint(self):
+        def respond(request):
+            return httpx.Response(200, text="<html><title>upstream gateway</title></html>",
+                                  headers={"content-type": "text/html"}, request=request)
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            with self.assertRaises(ClientError) as raised:
+                Client(Config(stream=False), http_client=http).chat([], [])
+        diagnostic = str(raised.exception).lower()
+        self.assertTrue(any(marker in diagnostic for marker in ("html", "gateway", "content-type")))
+
+    def test_sse_with_only_null_or_no_choices_is_rejected(self):
+        bodies = (
+            b'data: null\n\n',
+            b'data: {"choices": []}\n\n',
+            b'data: {"object":"billing.summary","billing":{}}\n\n',
+            b'data: {"choices":[{"delta":{}}]}\n\n',
+        )
+        for body in bodies:
+            with self.subTest(body=body):
+                def respond(request):
+                    return httpx.Response(200, content=body,
+                                          headers={"content-type": "text/event-stream"},
+                                          request=request)
+
+                with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+                    with self.assertRaises(ClientError):
+                        Client(Config(stream=True), http_client=http).chat([], [])
+
+    def test_sse_empty_assistant_with_finish_reason_is_valid(self):
+        body = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+
+        def respond(request):
+            return httpx.Response(200, content=body,
+                                  headers={"content-type": "text/event-stream"},
+                                  request=request)
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            message = Client(Config(stream=True), http_client=http).chat([], [])
+        self.assertEqual(message["role"], "assistant")
+        self.assertEqual(message["content"], "")

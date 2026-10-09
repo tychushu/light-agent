@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 import json
+import re
 import time
 from typing import Any, Callable
 
@@ -69,13 +70,15 @@ class Client:
                 continue
             try:
                 response.raise_for_status()
+                if "text/html" in response.headers.get("content-type", "").lower():
+                    raise ClientError("LLM endpoint returned HTML instead of API data (possible gateway/WAF response)")
                 if body["stream"]:
                     self.streamed = True
                     return self._read_sse(response)
                 result = response.json()
                 return self._message(result)
             except httpx.HTTPStatusError as exc:
-                raise ClientError(f"LLM endpoint returned HTTP {exc.response.status_code}") from None
+                raise ClientError(self._http_error(exc.response)) from None
             except httpx.TimeoutException:
                 raise ClientError("LLM response timed out") from None
             except httpx.RequestError as exc:
@@ -85,6 +88,43 @@ class Client:
             finally:
                 response.close()
         raise ClientError("LLM request failed after retries")
+
+    def _http_error(self, response: httpx.Response) -> str:
+        # Read a bounded diagnostic sample; never echo provider messages or bodies.
+        url = response.request.url
+        details = [url.host + url.path]
+        sample = b""
+        try:
+            for chunk in response.iter_bytes(chunk_size=2048):
+                sample += chunk[:2048 - len(sample)]
+                if len(sample) >= 2048:
+                    break
+        except httpx.HTTPError:
+            pass
+        if ("text/html" in response.headers.get("content-type", "").lower()
+                or sample.lstrip().lower().startswith((b"<!doctype html", b"<html"))):
+            details.append("HTML response; possible gateway/WAF")
+        else:
+            try:
+                result = json.loads(sample)
+                error = result.get("error", {}) if isinstance(result, dict) else {}
+                if isinstance(error, dict):
+                    for name in ("type", "code"):
+                        value = error.get(name, "")
+                        if not isinstance(value, (str, int)) or isinstance(value, bool):
+                            continue
+                        value = str(value)
+                        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value) and not (
+                                self.config.api_key and self.config.api_key in value):
+                            details.append(f"{name}={value}")
+            except ValueError:
+                pass
+        methods = [m.strip().upper() for m in response.headers.get("allow", "").split(",")]
+        methods = [m for m in methods if m in {"GET", "POST", "HEAD", "OPTIONS", "PUT", "DELETE", "PATCH", "CONNECT", "TRACE"}]
+        if methods:
+            details.append("Allow=" + ",".join(methods))
+        diagnostic = f"LLM endpoint returned HTTP {response.status_code} ({'; '.join(details)})"
+        return diagnostic.replace(self.config.api_key, "[REDACTED]") if self.config.api_key else diagnostic
 
     def _message(self, result: Any) -> dict[str, Any]:
         if not isinstance(result, dict):
@@ -118,9 +158,10 @@ class Client:
         data_lines = []
         usage = None
         finish = None
+        saw_choice = False
 
         def consume(data: str) -> None:
-            nonlocal usage, finish
+            nonlocal usage, finish, saw_choice
             if not data or data.strip() in ("[DONE]", "null"):
                 return
             try:
@@ -135,6 +176,9 @@ class Client:
             if not choices or not isinstance(choices[0], dict):
                 return
             choice = choices[0]
+            if not isinstance(choice.get("delta"), dict) and not choice.get("finish_reason"):
+                return
+            saw_choice = True
             finish = choice.get("finish_reason") or finish
             delta = choice.get("delta") or {}
             if not isinstance(delta, dict):
@@ -174,6 +218,8 @@ class Client:
                 data_lines.append(line[5:].lstrip())
         if data_lines:
             consume("\n".join(data_lines))
+        if not saw_choice or not (content or reasoning or calls or finish):
+            raise ClientError("LLM endpoint returned no assistant choices in SSE; possible gateway response")
         if self._marker_filter is not None:
             self._emit_visible("content", self._marker_filter.feed("", final=True))
         self.last_usage = usage

@@ -144,6 +144,11 @@ The phone defaults to `local` (Qwen3.8-27B-MTPLX-Speed at the existing LAN API).
 Assistant `reasoning_content` is preserved verbatim for subsequent requests,
 including tool rounds. Streaming is enabled by default for OpenAI-compatible profiles; set `stream = false` for non-stream endpoints.
 
+HTTP errors include the endpoint host/path, safe error type/code identifiers,
+and allowed methods when available. Provider error messages and response bodies
+are not echoed. HTML gateway responses and SSE streams without assistant choices
+stop the task with an error; HTTP 405 is not automatically retried.
+
 `ta --api local` and `ta --api cloud` also work directly. Private credentials
 are intentionally absent from this source package. The phone launcher injects
 them via environment variables; the application still never reads keys from TOML.
