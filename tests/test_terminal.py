@@ -9,6 +9,7 @@ import select
 import signal
 import sys
 import struct
+import subprocess
 import tempfile
 import termios
 import time
@@ -116,10 +117,108 @@ class TerminalTests(unittest.TestCase):
                 'configure_readline(pathlib.Path.home()/".local/share/termux-agent/repl_history"); '
                 'readline.add_history("ask termux-secret-123"); save_readline_history(); '
                 'p=pathlib.Path.home()/".local/share/termux-agent/repl_history"; '
-                'print("RESULT="+str(oct(p.stat().st_mode & 0o777))+":"+p.read_text().strip())')
+                'readline.clear_history(); readline.read_history_file(str(p)); '
+                'print("RESULT="+str(oct(p.stat().st_mode & 0o777))+":"+readline.get_history_item(1))')
         text = self.exchange(code, [])
         self.assertIn('RESULT=0o600:ask [REDACTED]', text)
         self.assertNotIn('termux-secret-123', text)
+
+    def test_status_refreshes_after_session_restore_api_switch_and_new_session(self):
+        from pathlib import Path
+
+        paths = {}
+        def setup(home):
+            from termux_agent.config import Config
+            from termux_agent.sessions import SessionStore
+
+            root = Path(home)
+            directory_a, directory_b = root / "work-a", root / "work-b"
+            directory_a.mkdir()
+            directory_b.mkdir()
+            paths.update(directory_a=directory_a, directory_b=directory_b)
+            config_path = root / ".config/termux-agent/config.toml"
+            config_path.parent.mkdir(parents=True)
+            config_path.write_text(
+                'default_api="local"\n'
+                '[apis.local]\nbase_url="http://127.0.0.1:8085/v1"\nmodel="model-A"\n'
+                '[apis.cloud]\nbase_url="https://example.invalid/v1"\nmodel="model-B"\n',
+                encoding="utf-8")
+            selected_config = Config.load(config_path, "local")
+            store = SessionStore(root / ".local/share/termux-agent")
+            scope = {"directory": str(directory_b), "config_path": str(config_path),
+                     "session_file": None, "disabled": True, "instructions": "",
+                     "instruction_path": None}
+            payload = {
+                "version": 3,
+                "config": selected_config.public_dict(),
+                "scope": scope,
+                "base_system": "test system prompt",
+                "messages": [{"role": "system", "content": "test system prompt"}],
+                "active_skills": {},
+                "counters": {"_total_calls": 0, "_tool_calls_total": 0,
+                             "_usage_history": [], "_request_history_chars": [],
+                             "_conversation_count": 0, "_direct_shell_count": 0},
+            }
+            store.save("abcdef123456", 0, payload)
+            store.close()
+
+        code = '''import sys
+from pathlib import Path
+import termux_agent.agent as core
+from termux_agent.cli import main
+class FakeClient:
+    def __init__(self, config):
+        self.streamed = self.streamed_text = False
+        self.on_stream = None
+    def close(self): pass
+core.Client = FakeClient
+home = Path.home()
+sys.argv = ["ta", "--config", str(home / ".config/termux-agent/config.toml"),
+           "--directory", str(home / "work-a"), "--no-agent"]
+main()
+'''
+        def exchanges(home):
+            prompt = "You     │ ".encode()
+            return [(prompt, b"/session load abcdef123456\n"),
+                    (prompt, b"/api cloud\n"),
+                    (prompt, b"/session new\n"),
+                    (prompt, b"/exit\n")]
+
+        text = self.exchange(code, exchanges, setup=setup, columns=160)
+        rows = re.findall(r"Status\s+│ Session=([^ ]+) \| Model=([^ ]+) \| Cwd=([^\r\n]+)", text)
+        self.assertTrue(rows, text)
+        self.assertEqual([row[1] for row in rows], ["model-A", "model-A", "model-B", "model-B"], text)
+        self.assertEqual(rows[1][0], "abcdef123456")
+        self.assertNotEqual(rows[0][0], rows[2][0])
+        self.assertNotEqual(rows[2][0], rows[3][0])
+        self.assertEqual(len(rows), 4, text)
+        self.assertEqual(rows[0][2], str(paths["directory_a"].resolve()))
+        self.assertEqual(rows[1][2], str(paths["directory_b"]))
+        self.assertNotIn("\x1b[", text)
+
+    def test_status_wraps_narrow_tty_and_is_absent_from_piped_cli(self):
+        code = ('import sys; from termux_agent.cli import main; '
+                'sys.argv=["ta", "--no-session", "--no-agent"]; main()')
+        text = self.exchange(code, [("You: ".encode(), b"/exit\n")], columns=32)
+        joined = re.sub(r"\r?\n {8}", "", text)
+        self.assertIn("Status:", text)
+        self.assertIn("Session=", joined)
+        self.assertIn("(memory)", joined)
+        self.assertIn("Model=Qwen3.8-27B-MTPLX-Speed", joined)
+        self.assertIn("Cwd=", joined)
+        self.assertNotIn("\x1b[", text)
+        for line in text.splitlines():
+            self.assertLessEqual(len(line), 32, line)
+
+        with tempfile.TemporaryDirectory(prefix="ta-pipe-home-") as home:
+            env = os.environ.copy()
+            env["HOME"] = home
+            env["TERM"] = "dumb"
+            result = subprocess.run([sys.executable, "-c", code], input=b"/exit\n",
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    env=env, timeout=10, check=True)
+        output = result.stdout.decode("utf-8", "replace")
+        self.assertNotIn("Status", output)
 
     def test_tab_completes_slash_command_and_api_profile(self):
         from pathlib import Path

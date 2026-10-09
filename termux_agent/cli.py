@@ -372,6 +372,9 @@ def main():
             display("Tab 补全命令和 ~/本地路径；文件路径回车提交文本。")
         while True:
             try:
+                if formatter.enabled and sys.stdin.isatty():
+                    session_label = session_id + (" (memory)" if store is None else "")
+                    display(f"Session={session_label} | Model={config.model} | Cwd={directory}", "Status")
                 prompt = read_prompt(formatter.prompt(), formatter.continuation()).strip()
             except (EOFError, KeyboardInterrupt):
                 print()

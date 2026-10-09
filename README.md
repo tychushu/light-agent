@@ -307,6 +307,12 @@ argument is being completed. Startup and ordinary chat input do not scan Skills.
 Use `/help` to see all commands. Readline history and Backspace/Delete bindings
 continue to work in SecureCRT.
 
+Before each input prompt, a `Status` bar shows the current session ID, model ID,
+and absolute working directory. It refreshes after API/session changes and
+wraps complete values on narrow terminals. Sessions started with `--no-session`
+show their transient ID with `(memory)`. The bar is limited to the interactive
+terminal; piped input/output and `--prompt` do not add status lines.
+
 ## Tab completion and conversation columns
 
 In an interactive terminal, each turn uses a role column and a wrapping content
