@@ -38,6 +38,8 @@ max_steps = 16
 max_output_chars = 20000
 approval_policy = "on-risk"
 timeout = 120.0 # HTTP request timeout; shell defaults to 30 seconds
+# retry_wait_budget = 20.0 # total retry wait budget, 0..60 seconds
+# retry_thinking_400 = false # opt-in for the known structured-thinking 400 response
 ```
 
 `ta --config path.toml` selects another config. `ta --prompt '执行 uname -a'` runs
@@ -65,7 +67,7 @@ verification is model behavior, not a mandatory filesystem policy.
 
 No services, Android settings, root configuration or startup scripts are changed.
 Completed turns are saved locally unless `--no-session` is used. Failed calls become tool results so the model
-can recover. SSE token/reasoning/tool-call deltas stream interactively. HTTP 502/503/504 and connect failures retry at most twice; partial streams are never replayed.
+can recover. SSE token/reasoning/tool-call deltas stream interactively. HTTP 502/503/504 and connect failures retry at most twice; partial streams are never replayed. The optional `retry_thinking_400` recovery policy is off by default; see the profile guidance below. It is a recovery measure for a known upstream response, not a root-cause fix.
 
 ## Test / uninstall
 
@@ -103,6 +105,9 @@ api_key_env = "TERMUX_AGENT_API_KEY"
 base_url = "https://YOUR-PROVIDER/v1"
 model = "YOUR-MODEL-ID"
 api_key_env = "CLOUD_API_KEY"
+# Enable only for a profile that returns the known structured-thinking error:
+# retry_thinking_400 = true
+# retry_wait_budget = 20.0
 ```
 
 Set the corresponding environment variable before starting `ta`. `/api` lists
@@ -112,6 +117,38 @@ variable; omission means no Authorization header, never reuse another profile's
 key. Switching saves the previous session, reloads TOML, starts fresh conversation/statistics, and keeps the
 currently selected instruction file. Unknown/invalid profiles leave the current
 session intact. Nothing is sent until your next prompt.
+
+The thinking-error recovery is disabled by default. Enable it only on the affected
+named profile with `retry_thinking_400 = true`; a top-level setting applies to
+`default` but never enables named profiles. For each logical model call,
+`retry_wait_budget` defaults to 20 seconds, accepts finite values from 0 through
+60, and can be overridden per profile. With the feature enabled, that call has
+at most three total HTTP attempts
+shared across connect failures, HTTP 502/503/504, and the narrowly matched
+structured HTTP 400 JSON error. Its type/code must match the known
+`invalid_request_error` shape (the observed code may be null), and its message
+must match the fixed thinking echo-back sentence, such as `The
+content[].thinking in the thinking mode must be passed back to the API` or the
+known `reasoning_content` variant, allowing only known request/trace ID suffixes.
+Other 400 responses and HTTP 401/402/403/405/429/500 are not retried. Existing
+connect/502/503/504 classification and backoff stay in effect when the feature
+is off.
+
+When enabled, retries use equal-jitter delays in the 0.5-to-1.0 range of
+exponential backoff based on 1 then 2 seconds, capped at 8 seconds, and send an
+equivalent copy of the request. If a valid `Retry-After` is longer than ordinary
+backoff and exceeds the remaining wait budget, retries stop; the client does not
+retry earlier. Before a response begins, retry waits and requests are bounded
+by the remaining `Config.timeout` deadline. Once a
+successful SSE response starts, it is never replayed and already-run tools are
+not run again. The pre-response deadline uses a temporary Unix timer in the
+main CLI thread and restores its handler before successful body reading. It
+does not replace another active process alarm; callers outside a Unix main
+thread cannot enable this policy. `/stats` exposes `http_attempts_last` alongside
+logical API calls. Retry diagnostics use `Info api_retry` and report the attempt,
+status, and delay without logging the provider body. This policy
+only helps recover from the identified upstream behavior; it does not fix its
+cause or guarantee equivalent behavior in every UI.
 
 `ta --directory /path/to/project` sets the working directory and reads only
 `/path/to/project/agent.md`. No parent traversal, global config instruction file,
@@ -221,7 +258,9 @@ OpenAI-compatible API profiles stream Server-Sent Events by default. Content and
 reasoning deltas display as they arrive; split tool-call names and JSON arguments
 are reassembled before entering the agent loop. `data: null`, empty choices and
 `[DONE]` frames are ignored. Transient HTTP 502/503/504 or connect failures retry
-at 250 ms then 500 ms; no retry replays a partially received response.
+at most twice with the existing backoff when the thinking-error option is off;
+no retry replays a partially received response. See the profile guidance above
+for the optional structured-thinking HTTP 400 recovery.
 Set `stream = false` in TOML for providers without SSE support. Usage is reported
 when the stream ends with a usage frame. Configure a larger profile timeout for
 long reasoning.

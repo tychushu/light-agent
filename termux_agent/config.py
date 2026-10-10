@@ -19,6 +19,8 @@ class Config:
     max_input_file_chars: int = 64_000
     approval_policy: str = "on-risk"
     timeout: float = 120.0
+    retry_thinking_400: bool = False
+    retry_wait_budget: float = 20.0
     api_key: str = ""
     api_key_env: str = "TERMUX_AGENT_API_KEY"
     api_profile: str = "default"
@@ -42,7 +44,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -58,9 +60,11 @@ class Config:
             for required in ("base_url", "model"):
                 if required not in entry:
                     raise ValueError(f"API profile requires {required}")
-            for key in ("base_url", "model", "timeout", "user_agent", "stream"):
+            for key in ("base_url", "model", "timeout", "retry_wait_budget", "user_agent", "stream"):
                 if key in entry:
                     setattr(config, key, entry[key])
+            # Retrying the known thinking-format error is opt-in per API profile.
+            config.retry_thinking_400 = entry.get("retry_thinking_400", False)
             config.api_key_env = entry.get("api_key_env", "")
             config.api_kind = entry.get("kind", store.kind_for(config.base_url))
         else:
@@ -93,6 +97,16 @@ class Config:
             raise ValueError("api_kind must be local or cloud")
         if not isinstance(self.stream, bool):
             raise ValueError("stream must be a boolean")
+        if not isinstance(self.retry_thinking_400, bool):
+            raise ValueError("retry_thinking_400 must be a boolean")
+        retry_budget_valid = isinstance(self.retry_wait_budget, (int, float)) and not isinstance(self.retry_wait_budget, bool)
+        if retry_budget_valid:
+            try:
+                retry_budget_valid = math.isfinite(self.retry_wait_budget) and 0 <= self.retry_wait_budget <= 60
+            except OverflowError:
+                retry_budget_valid = False
+        if not retry_budget_valid:
+            raise ValueError("retry_wait_budget must be between 0 and 60 seconds")
         if not isinstance(self.user_agent, str) or not self.user_agent.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in self.user_agent):
             raise ValueError("user_agent must be a single-line ASCII string")
         if not isinstance(self.base_url, str) or not self.base_url.startswith(("http://", "https://")):

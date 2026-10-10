@@ -261,6 +261,7 @@ def main():
             kwargs["base_system"] = base_system
         built = Agent(next_config, **kwargs)
         built.client.on_stream = stream_output
+        built.client.on_retry = lambda info: display({"api_retry": info})
         return built
 
     try:

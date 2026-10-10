@@ -9,6 +9,9 @@ max_input_file_chars = 64000
 approval_policy = "on-risk"
 silent_writes = true
 timeout = 120.0
+retry_wait_budget = 20.0
+# Defaults to false; enable only for a profile confirmed to return the known error.
+# retry_thinking_400 = false
 stream = true # set false for APIs without SSE support
 
 [apis.local]
@@ -22,3 +25,6 @@ model = "deepseek-v4-flash"
 api_key_env = "AGENTROUTER_API_KEY"
 user_agent = "claude-cli/2.1.119 (external, cli)"
 timeout = 300.0
+# Per-profile opt-in; uncomment only if this API returns the known error.
+# retry_thinking_400 = true
+# retry_wait_budget = 20.0

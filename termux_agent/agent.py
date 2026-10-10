@@ -271,7 +271,9 @@ class Agent:
             totals[field] = sum(observed) if observed else None
             missing[field] = len(self._usage_history) - len(observed)
         last_usage = self._usage_history[-1] if self._usage_history else None
-        return {"api_calls_total": self._total_calls, "tool_calls_total": self._tool_calls_total,
+        return {"api_calls_total": self._total_calls,
+                "http_attempts_last": getattr(self.client, "last_attempts", 0),
+                "tool_calls_total": self._tool_calls_total,
                 "direct_shell_commands": self._direct_shell_count, "active_skills": list(self.active_skills),
                 "usage_totals": totals, "last_request_usage": last_usage,
                 "usage_history": list(self._usage_history), "usage_missing_requests": missing,
