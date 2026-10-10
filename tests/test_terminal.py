@@ -14,9 +14,15 @@ import tempfile
 import termios
 import time
 import unittest
+from datetime import datetime
 
 
 class TerminalTests(unittest.TestCase):
+    @staticmethod
+    def unwrap_timestamped(text):
+        prefix = re.compile(r"^(?:\d{2}:\d{2} [^:│]+: |\d{2}:\d{2} [^│]+│ | {14}│ | {14})")
+        return "".join(prefix.sub("", line) for line in text.splitlines())
+
     def exchange(self, code, exchanges, setup=None, columns=80):
         test_home = tempfile.mkdtemp(prefix="ta-terminal-home-")
         if setup:
@@ -200,7 +206,7 @@ main()
         code = ('import sys; from termux_agent.cli import main; '
                 'sys.argv=["ta", "--no-session", "--no-agent"]; main()')
         text = self.exchange(code, [("You: ".encode(), b"/exit\n")], columns=32)
-        joined = re.sub(r"\r?\n {8}", "", text)
+        joined = re.sub(r"\r?\n {14}", "", text)
         self.assertIn("Status:", text)
         self.assertIn("Session=", joined)
         self.assertIn("(memory)", joined)
@@ -283,6 +289,64 @@ main()
             self.assertIn("Tool", text)
             for line in text.splitlines():
                 self.assertLessEqual(sum(_cells(c) for c in line), width)
+
+    def test_message_timestamps_are_stable_per_stream_and_refresh_per_message(self):
+        from termux_agent.terminal_ui import Columns
+
+        out = io.StringIO()
+        times = iter((datetime(2026, 10, 10, 12, 34, 59),
+                      datetime(2026, 10, 10, 12, 35, 0)))
+        ui = Columns(out, enabled=True, width=lambda: 52, clock=lambda: next(times))
+
+        # Multiple chunks and wrapped lines are one streamed message, even if
+        # wall-clock time changes while the stream is being rendered.
+        ui.feed("Agent", "A" * 90)
+        ui.feed("Agent", "B")
+        ui.finish()
+        ui.message("Agent", "next")
+
+        text = out.getvalue()
+        self.assertIn("12:34 Agent", text)
+        self.assertIn("12:35 Agent", text)
+        self.assertEqual(text.count("12:34"), 1, text)
+        self.assertEqual(text.count("12:35"), 1, text)
+        body = self.unwrap_timestamped(text)
+        self.assertIn("A" * 90 + "B", body)
+        self.assertIn("next", body)
+
+    def test_message_timestamps_are_added_to_prompt_but_not_piped_output(self):
+        from termux_agent.terminal_ui import Columns
+
+        moment = datetime(2026, 10, 10, 8, 7)
+        ui = Columns(io.StringIO(), enabled=True, width=lambda: 32,
+                     clock=lambda: moment)
+        self.assertIn("08:07", ui.prompt())
+        self.assertIn("You", ui.prompt())
+
+        out = io.StringIO()
+        piped = Columns(out, enabled=False, clock=lambda: moment)
+        piped.message("Agent", "plain output")
+        self.assertEqual(out.getvalue(), "plain output\n")
+
+    def test_timestamped_messages_fit_narrow_and_wide_terminal_widths(self):
+        from termux_agent.terminal_ui import Columns, _cells
+
+        moment = datetime(2026, 10, 10, 8, 7)
+        for width in (20, 32, 80):
+            with self.subTest(width=width):
+                out = io.StringIO()
+                ui = Columns(out, enabled=True, width=lambda: width,
+                             clock=lambda: moment)
+                ui.message("Status", "状态" * 20 + " Session=model-A | Cwd=/tmp")
+                text = out.getvalue()
+                self.assertIn("08:07", text)
+                self.assertIn("Status", text)
+                body = self.unwrap_timestamped(text)
+                self.assertIn("Session=model-A", body)
+                self.assertIn("Cwd=/tmp", body)
+                for line in text.splitlines():
+                    self.assertLessEqual(sum(_cells(char) for char in line), width,
+                                         (width, line))
 
     def test_piped_stream_keeps_reasoning_and_answer_separate(self):
         from termux_agent.terminal_ui import Columns

@@ -312,6 +312,12 @@ argument is being completed. Startup and ordinary chat input do not scan Skills.
 Use `/help` to see all commands. Readline history and Backspace/Delete bindings
 continue to work in SecureCRT.
 
+Interactive messages and the input prompt show the device's local display time
+in compact `HH:MM` form, for example `10:16 Agent │ Done.` A streamed message
+keeps its initial timestamp; continuation lines leave the time/role area blank.
+Timestamps are terminal display metadata. Piped output and `--prompt` keep their
+plain output format.
+
 Before each input prompt, a `Status` bar shows the current session ID, model ID,
 and absolute working directory. It refreshes after API/session changes and
 wraps complete values on narrow terminals. Sessions started with `--no-session`

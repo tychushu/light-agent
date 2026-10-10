@@ -1,6 +1,7 @@
 """Width-aware two-column transcript and lazy slash-command completion."""
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 import shutil
 import unicodedata
@@ -28,10 +29,12 @@ def _cells(char: str) -> int:
 
 
 class Columns:
-    def __init__(self, out, enabled=True, width=None):
+    def __init__(self, out, enabled=True, width=None, clock=None):
         self.out = out
         self.enabled = enabled
         self.width = width or (lambda: shutil.get_terminal_size((80, 24)).columns)
+        self.clock = clock or datetime.now
+        self.stamp = ""
         self.role = None
         self.used = 0
         self.line_started = False
@@ -39,12 +42,12 @@ class Columns:
     def _layout(self, role):
         width = max(20, self.width())
         if width < 52:
-            prefix = f"{role}: "
+            prefix = f"{self.stamp} {role}: "
             continuation = " " * len(prefix)
         else:
-            prefix = f"{role:<8}│ "
-            continuation = " " * 8 + "│ "
-        return prefix, continuation, max(8, width - len(prefix))
+            prefix = f"{self.stamp} {role:<8}│ "
+            continuation = " " * 14 + "│ "
+        return prefix, continuation, max(2, width - len(prefix))
 
     def _prefix(self):
         prefix, continuation, _ = self._layout(self.role)
@@ -65,6 +68,7 @@ class Columns:
         if role != self.role:
             self.finish()
             self.role = role
+            self.stamp = self.clock().strftime("%H:%M")
         _, _, available = self._layout(role)
         for char in value:
             if char == "\n":
@@ -91,12 +95,13 @@ class Columns:
             self.out.write("\n")
             self.out.flush()
         self.role = None
+        self.stamp = ""
         self.used = 0
         self.line_started = False
 
     def message(self, role, value):
+        self.finish()
         if not self.enabled:
-            self.finish()
             self.out.write(value + "\n")
             self.out.flush()
             return
@@ -107,12 +112,13 @@ class Columns:
         self.finish()
         if not self.enabled:
             return "ta> "
-        return "You: " if self.width() < 52 else "You     │ "
+        label = "You: " if self.width() < 52 else "You     │ "
+        return self.clock().strftime("%H:%M") + " " + label
 
     def continuation(self):
         if not self.enabled:
             return "... "
-        return "...: " if self.width() < 52 else "...     │ "
+        return " " * 6 + ("...: " if self.width() < 52 else "...     │ ")
 
 
 class Completer:
