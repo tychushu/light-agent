@@ -19,7 +19,7 @@ class ClientError(RuntimeError):
 
 
 class Client:
-    RETRYABLE_STATUS = {502, 503, 504}
+    RETRYABLE_STATUS = {500, 502, 503, 504}
     RETRYABLE_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
 
     def __init__(self, config: Any, http_client: httpx.Client | None = None,

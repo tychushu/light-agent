@@ -125,6 +125,121 @@ class RetryBehaviorTests(unittest.TestCase):
         self.assertEqual(len(attempts), 1)
         self.assertEqual(client.last_attempts, 1)
 
+    def test_http_500_recovers_with_or_without_thinking_retry_in_both_stream_modes(self):
+        for enabled in (False, True):
+            for stream in (False, True):
+                with self.subTest(enabled=enabled, stream=stream):
+                    attempts, sleeps, events, chunks = [], [], [], []
+
+                    def respond(request):
+                        attempts.append(request.content)
+                        if len(attempts) == 1:
+                            return error_response(request, 500, error_type="api_error",
+                                                  message="Service temporarily unavailable")
+                        if stream:
+                            return httpx.Response(
+                                200, request=request,
+                                headers={"content-type": "text/event-stream"},
+                                content=(b'data: {"choices":[{"delta":{"content":"ok"},'
+                                         b'"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n'),
+                            )
+                        return success_response(request)
+
+                    client = self.client(httpx.MockTransport(respond), enabled=enabled,
+                                         sleeper=sleeps.append, randomizer=lambda: 0.0)
+                    client.config.stream = stream
+                    client.on_retry = events.append
+                    client.on_stream = lambda kind, text: chunks.append((kind, text))
+
+                    self.assertEqual(client.chat([{"role": "user", "content": "test"}], [])
+                                     ["content"], "ok")
+                    self.assertEqual(client.last_attempts, 2)
+                    self.assertEqual(len(attempts), 2)
+                    self.assertEqual(attempts[0], attempts[1])
+                    self.assertEqual(sleeps, [0.5 if enabled else 0.25])
+                    self.assertEqual([event["status"] for event in events],
+                                     [500] if enabled else [])
+                    self.assertEqual(chunks, [("content", "ok")] if stream else [])
+
+    def test_persistent_http_500_stops_after_three_attempts(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                attempts, sleeps = [], []
+
+                def respond(request):
+                    attempts.append(request)
+                    return error_response(request, 500, error_type="api_error",
+                                          message="Service temporarily unavailable private body")
+
+                client = self.client(httpx.MockTransport(respond), enabled=enabled,
+                                     sleeper=sleeps.append, randomizer=lambda: 0.0)
+                with self.assertRaises(ClientError) as raised:
+                    client.chat([], [])
+                self.assertEqual(client.last_attempts, 3)
+                self.assertEqual(len(attempts), 3)
+                self.assertEqual(sleeps, [0.5, 1.0] if enabled else [0.25, 0.5])
+                self.assertIn("HTTP 500", str(raised.exception))
+                self.assertIn("type=api_error", str(raised.exception))
+                self.assertNotIn("private body", str(raised.exception))
+
+    def test_http_500_thinking_400_and_gateway_errors_share_three_attempts(self):
+        attempts, events = [], []
+
+        def respond(request):
+            attempts.append(request.content)
+            if len(attempts) == 1:
+                return error_response(request, 500, error_type="api_error",
+                                      message="Service temporarily unavailable")
+            if len(attempts) == 2:
+                return error_response(request)
+            return httpx.Response(503, request=request)
+
+        client = self.client(httpx.MockTransport(respond), sleeper=lambda _: None)
+        client.on_retry = events.append
+        with self.assertRaisesRegex(ClientError, "HTTP 503"):
+            client.chat([], [])
+        self.assertEqual(client.last_attempts, 3)
+        self.assertEqual(len(attempts), 3)
+        self.assertEqual(attempts, [attempts[0]] * 3)
+        self.assertEqual([event["status"] for event in events], [500, 400])
+
+    def test_http_500_after_tool_result_does_not_execute_tool_again(self):
+        attempts = []
+
+        def respond(request):
+            attempts.append(request.content)
+            if len(attempts) == 1:
+                return httpx.Response(200, request=request, json={"choices": [{"message": {
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{"id": "call_once", "type": "function",
+                                    "function": {"name": "read_file",
+                                                 "arguments": '{"path":"/tmp/test"}'}}],
+                }}]})
+            if len(attempts) < 4:
+                return error_response(request, 500, error_type="api_error",
+                                      message="Service temporarily unavailable")
+            return success_response(request)
+
+        config = Config(stream=False, retry_thinking_400=True,
+                        approval_policy="never", max_steps=2)
+        http = httpx.Client(transport=httpx.MockTransport(respond))
+        self.addCleanup(http.close)
+        client = Client(config, http_client=http, sleeper=lambda _: None)
+        agent = Agent(config, client=client, base_system="test")
+        with patch("termux_agent.agent.execute", return_value={"text": "file result"}) as execute:
+            self.assertEqual(agent.run("read the file"), "ok")
+
+        execute.assert_called_once_with("read_file", {"path": "/tmp/test"},
+                                        config.max_output_chars)
+        self.assertEqual(len(attempts), 4)
+        self.assertEqual(client.last_attempts, 3)
+        self.assertEqual(attempts[1:], [attempts[1]] * 3)
+        history = json.loads(attempts[-1])["messages"]
+        tool_results = [message for message in history if message.get("role") == "tool"]
+        self.assertEqual(len(tool_results), 1)
+        self.assertEqual(tool_results[0]["tool_call_id"], "call_once")
+        self.assertIn("file result", tool_results[0]["content"])
+
     def test_nonmatching_400s_and_other_statuses_are_not_retried(self):
         cases = [
             (400, "The content field is invalid.", "invalid_request_error", None),
@@ -135,6 +250,8 @@ class RetryBehaviorTests(unittest.TestCase):
             (403, THINKING_MESSAGE, "invalid_request_error", None),
             (405, THINKING_MESSAGE, "invalid_request_error", None),
             (429, THINKING_MESSAGE, "invalid_request_error", None),
+            (501, THINKING_MESSAGE, "invalid_request_error", None),
+            (505, THINKING_MESSAGE, "invalid_request_error", None),
         ]
         for status, message, error_type, code in cases:
             with self.subTest(status=status, message=message, code=code):
@@ -170,25 +287,27 @@ class RetryBehaviorTests(unittest.TestCase):
         self.assertEqual(client.last_attempts, 3)
 
     def test_retry_after_wait_over_budget_fails_without_early_request(self):
-        attempts, sleeps = [], []
+        for status in (400, 500):
+            with self.subTest(status=status):
+                attempts, sleeps = [], []
 
-        def respond(request):
-            attempts.append(request)
-            return error_response(request, headers={"Retry-After": "21"})
+                def respond(request):
+                    attempts.append(request)
+                    return error_response(request, status, headers={"Retry-After": "21"})
 
-        config = Config(stream=False, retry_thinking_400=True,
-                        retry_wait_budget=20.0)
-        http = httpx.Client(transport=httpx.MockTransport(respond))
-        self.addCleanup(http.close)
-        client = Client(config, http_client=http, sleeper=sleeps.append,
-                        clock=lambda: 100.0, wall_clock=lambda: 1_700_000_000.0,
-                        randomizer=lambda: 0.0)
+                config = Config(stream=False, retry_thinking_400=True,
+                                retry_wait_budget=20.0)
+                http = httpx.Client(transport=httpx.MockTransport(respond))
+                self.addCleanup(http.close)
+                client = Client(config, http_client=http, sleeper=sleeps.append,
+                                clock=lambda: 100.0, wall_clock=lambda: 1_700_000_000.0,
+                                randomizer=lambda: 0.0)
 
-        with self.assertRaises(ClientError):
-            client.chat([], [])
-        self.assertEqual(len(attempts), 1)
-        self.assertEqual(sleeps, [])
-        self.assertEqual(client.last_attempts, 1)
+                with self.assertRaises(ClientError):
+                    client.chat([], [])
+                self.assertEqual(len(attempts), 1)
+                self.assertEqual(sleeps, [])
+                self.assertEqual(client.last_attempts, 1)
 
     def test_cumulative_wait_budget_and_deadline_stop_before_next_request(self):
         attempts, sleeps = [], []
@@ -509,34 +628,38 @@ class RetryBehaviorTests(unittest.TestCase):
             signal.setitimer(signal.ITIMER_REAL, *previous_timer)
 
     def test_started_sse_stream_is_never_replayed_after_read_error(self):
-        attempts = []
-
         class InterruptedStream(httpx.SyncByteStream):
             def __iter__(self):
                 yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
                 raise httpx.ReadError("stream broke")
 
-        def respond(request):
-            attempts.append(request)
-            return httpx.Response(
-                200,
-                headers={"content-type": "text/event-stream"},
-                stream=InterruptedStream(),
-                request=request,
-            )
+        for initial_500 in (False, True):
+            with self.subTest(initial_500=initial_500):
+                attempts = []
 
-        config = Config(stream=True, retry_thinking_400=True)
-        http = httpx.Client(transport=httpx.MockTransport(respond))
-        self.addCleanup(http.close)
-        client = Client(config, http_client=http, sleeper=lambda _: None)
-        chunks = []
-        client.on_stream = lambda kind, value: chunks.append((kind, value))
+                def respond(request):
+                    attempts.append(request)
+                    if initial_500 and len(attempts) == 1:
+                        return error_response(request, 500, error_type="api_error")
+                    return httpx.Response(
+                        200,
+                        headers={"content-type": "text/event-stream"},
+                        stream=InterruptedStream(),
+                        request=request,
+                    )
 
-        with self.assertRaises(ClientError):
-            client.chat([], [])
-        self.assertEqual(len(attempts), 1)
-        self.assertEqual(client.last_attempts, 1)
-        self.assertEqual(chunks, [("content", "partial")])
+                config = Config(stream=True, retry_thinking_400=True)
+                http = httpx.Client(transport=httpx.MockTransport(respond))
+                self.addCleanup(http.close)
+                client = Client(config, http_client=http, sleeper=lambda _: None)
+                chunks = []
+                client.on_stream = lambda kind, value: chunks.append((kind, value))
+
+                with self.assertRaises(ClientError):
+                    client.chat([], [])
+                self.assertEqual(len(attempts), 2 if initial_500 else 1)
+                self.assertEqual(client.last_attempts, len(attempts))
+                self.assertEqual(chunks, [("content", "partial")])
 
     def test_tool_runs_once_only_after_complete_assistant_tool_call_response(self):
         attempts = []

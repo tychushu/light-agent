@@ -67,7 +67,7 @@ verification is model behavior, not a mandatory filesystem policy.
 
 No services, Android settings, root configuration or startup scripts are changed.
 Completed turns are saved locally unless `--no-session` is used. Failed calls become tool results so the model
-can recover. SSE token/reasoning/tool-call deltas stream interactively. HTTP 502/503/504 and connect failures retry at most twice; partial streams are never replayed. The optional `retry_thinking_400` recovery policy is off by default; see the profile guidance below. It is a recovery measure for a known upstream response, not a root-cause fix.
+can recover. SSE token/reasoning/tool-call deltas stream interactively. HTTP 500/502/503/504 and connect failures retry at most twice; partial streams are never replayed. The optional `retry_thinking_400` recovery policy is off by default; see the profile guidance below. It is a recovery measure for a known upstream response, not a root-cause fix.
 
 ## Test / uninstall
 
@@ -124,15 +124,17 @@ named profile with `retry_thinking_400 = true`; a top-level setting applies to
 `retry_wait_budget` defaults to 20 seconds, accepts finite values from 0 through
 60, and can be overridden per profile. With the feature enabled, that call has
 at most three total HTTP attempts
-shared across connect failures, HTTP 502/503/504, and the narrowly matched
+shared across connect failures, HTTP 500/502/503/504, and the narrowly matched
 structured HTTP 400 JSON error. Its type/code must match the known
 `invalid_request_error` shape (the observed code may be null), and its message
 must match the fixed thinking echo-back sentence, such as `The
 content[].thinking in the thinking mode must be passed back to the API` or the
 known `reasoning_content` variant, allowing only known request/trace ID suffixes.
-Other 400 responses and HTTP 401/402/403/405/429/500 are not retried. Existing
-connect/502/503/504 classification and backoff stay in effect when the feature
-is off.
+Other 400 responses and HTTP 401/402/403/405/429/501/505 are not retried.
+HTTP 500 (including an upstream `api_error` / service temporarily unavailable)
+retries automatically for every API profile, without an extra opt-in. Existing
+connect/500/502/503/504 classification and backoff stay in effect when the
+thinking-error feature is off.
 
 When enabled, retries use equal-jitter delays in the 0.5-to-1.0 range of
 exponential backoff based on 1 then 2 seconds, capped at 8 seconds, and send an
@@ -257,7 +259,7 @@ changed and no separate input-history file is written. Restart an already-runnin
 OpenAI-compatible API profiles stream Server-Sent Events by default. Content and
 reasoning deltas display as they arrive; split tool-call names and JSON arguments
 are reassembled before entering the agent loop. `data: null`, empty choices and
-`[DONE]` frames are ignored. Transient HTTP 502/503/504 or connect failures retry
+`[DONE]` frames are ignored. Transient HTTP 500/502/503/504 or connect failures retry
 at most twice with the existing backoff when the thinking-error option is off;
 no retry replays a partially received response. See the profile guidance above
 for the optional structured-thinking HTTP 400 recovery.
