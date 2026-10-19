@@ -20,6 +20,7 @@ from .terminal_ui import Columns, Completer, COMMANDS
 from .local_input import load_text_submission, path_value
 from .display_privacy import WRITE_TOOLS, hide_write_payloads, safe_tool_arguments
 from .approval import reason as approval_reason
+from .history import history_entry
 
 HELP = """/help           Show commands
 Tab             Complete command, API, session and Skill names
@@ -189,11 +190,11 @@ def main():
     def redact(text):
         return text.replace(config.api_key, "[REDACTED]") if config.api_key else text
 
-    def display(value, role="Info"):
+    def display(value, role="Info", stamp=None):
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
         # Do not let model/tool text inject terminal control sequences.
         text = ''.join(c if c in '\n\t' or c.isprintable() else f'\\x{ord(c):02x}' for c in text)
-        formatter.message(role, redact(text))
+        formatter.message(role, redact(text), stamp=stamp)
 
     def approve(name, args):
         nonlocal read_grant
@@ -649,14 +650,12 @@ def main():
                         raise ValueError("Use /history [1–100] [non-negative skip]")
                     history = agent.messages[1:]
                     end = max(0, len(history) - skip)
-                    for message in history[max(0, end-count):end]:
-                        visible = {k: v for k, v in message.items() if k != "reasoning_content"}
-                        if config.silent_writes:
-                            visible = hide_write_payloads(visible)
-                        rendered = json.dumps(visible, ensure_ascii=False)
-                        role = {"user": "You", "assistant": "Agent", "tool": "Tool"}.get(
-                            message.get("role"), "Info")
-                        display(rendered[:4000] + (" [TRUNCATED]" if len(rendered) > 4000 else ""), role)
+                    start = max(0, end-count)
+                    display(f"History {start + 1 if start < end else 0}–{end} / {len(history)}"
+                            " · --:-- = time not recorded")
+                    for message in history[start:end]:
+                        role, rendered = history_entry(message, config.silent_writes)
+                        display(rendered, role, stamp="--:--")
                 except ValueError as exc:
                     display(f"Error: {exc}")
             elif prompt == "/session" or prompt.startswith("/session "):

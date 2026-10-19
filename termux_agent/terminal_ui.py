@@ -55,7 +55,7 @@ class Columns:
         self.line_started = True
         self.used = 0
 
-    def feed(self, role, value):
+    def feed(self, role, value, stamp=None):
         if not self.enabled:
             if self.role is not None and role != self.role:
                 self.out.write("\n")
@@ -68,7 +68,7 @@ class Columns:
         if role != self.role:
             self.finish()
             self.role = role
-            self.stamp = self.clock().strftime("%H:%M")
+            self.stamp = stamp if stamp is not None else self.clock().strftime("%H:%M")
         _, _, available = self._layout(role)
         for char in value:
             if char == "\n":
@@ -99,13 +99,13 @@ class Columns:
         self.used = 0
         self.line_started = False
 
-    def message(self, role, value):
+    def message(self, role, value, stamp=None):
         self.finish()
         if not self.enabled:
             self.out.write(value + "\n")
             self.out.flush()
             return
-        self.feed(role, value)
+        self.feed(role, value, stamp=stamp)
         self.finish()
 
     def prompt(self):

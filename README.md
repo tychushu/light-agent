@@ -220,6 +220,13 @@ to 20 messages, allows 1–100 at once and bounds each displayed message to 4000
 characters. `/history 20 20` shows the preceding page. Stored messages are complete;
 this display truncation never changes the saved conversation. Reasoning text is
 retained for the API protocol but hidden from the normal history display.
+History renders message text with its original paragraphs and newlines instead
+of a JSON message envelope. Interactive terminals use the usual You/Agent/Tool
+columns and width-aware wrapping. Tool calls show their name, call ID and formatted
+arguments; results display multiline text directly. Silent-write bodies remain
+hidden. The header shows the displayed range and total message count. Because
+stored messages do not include original send times, history uses `--:--` rather
+than presenting the current time as a historical timestamp.
 
 API/model identity, working directory, loaded agent.md text snapshot and source,
 messages (including tool IDs/results and reasoning_content), and usage counters
