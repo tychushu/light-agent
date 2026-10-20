@@ -17,6 +17,7 @@ class Config:
     max_steps: int = 16
     max_output_chars: int = 20_000
     max_input_file_chars: int = 64_000
+    max_context_chars: int = 500_000
     approval_policy: str = "on-risk"
     timeout: float = 120.0
     retry_thinking_400: bool = False
@@ -49,7 +50,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -65,7 +66,7 @@ class Config:
             for required in ("base_url", "model"):
                 if required not in entry:
                     raise ValueError(f"API profile requires {required}")
-            for key in ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "user_agent", "stream"):
+            for key in ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "user_agent", "stream", "max_context_chars"):
                 if key in entry:
                     setattr(config, key, entry[key])
             # Retrying the known thinking-format error is opt-in per API profile.
@@ -88,6 +89,9 @@ class Config:
         return ["default", *ProfileStore(path).entries().keys()]
 
     def validate(self) -> None:
+        if (isinstance(self.max_context_chars, bool) or not isinstance(self.max_context_chars, int)
+                or not 1000 <= self.max_context_chars <= 20_000_000):
+            raise ValueError('max_context_chars must be between 1000 and 20000000')
         if not isinstance(self.web_fetch_enabled, bool):
             raise ValueError("web_fetch_enabled must be a boolean")
         if (not isinstance(self.lightpanda_binary, str) or

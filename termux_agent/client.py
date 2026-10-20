@@ -18,6 +18,16 @@ class ClientError(RuntimeError):
     pass
 
 
+class ContextLengthError(ClientError):
+    pass
+
+
+class EmptyResponseError(ClientError):
+    def __init__(self, text, message):
+        super().__init__(text)
+        self.assistant_message = message
+
+
 class Client:
     RETRYABLE_STATUS = {500, 502, 503, 504}
     # Only used while sending/receiving headers, never during successful body reads.
@@ -119,6 +129,9 @@ class Client:
                     except ValueError:
                         value = None
                     error = self._http_error(response, sample)
+                    classified = self._classified_error(response, sample)
+                    if isinstance(classified, ContextLengthError):
+                        raise classified
                     matched = (thinking_echo_error(value) if response.status_code == 400
                                else rate_limit_error(value))
                     if ("text/html" not in response.headers.get("content-type", "").lower()
@@ -130,7 +143,7 @@ class Client:
                         waited = self._wait_retry(attempt, error, cause, status,
                                                   after, deadline, waited)
                         continue
-                    raise ClientError(error)
+                    raise classified
                 response.raise_for_status()
                 if "text/html" in response.headers.get("content-type", "").lower():
                     raise ClientError("LLM endpoint returned HTML instead of API data (possible gateway/WAF response)")
@@ -139,12 +152,12 @@ class Client:
                 accepted()
                 if body["stream"]:
                     self.streamed = True
-                    return self._read_sse(response)
+                    return self._checked_message(self._read_sse(response))
                 response.read()
                 result = response.json()
-                return self._message(result)
+                return self._checked_message(self._message(result))
             except httpx.HTTPStatusError as exc:
-                raise ClientError(self._http_error(exc.response)) from None
+                raise self._classified_error(exc.response) from None
             except httpx.TimeoutException:
                 raise ClientError("LLM response timed out") from None
             except httpx.RequestError as exc:
@@ -188,6 +201,38 @@ class Client:
         except httpx.HTTPError:
             return b""
         return sample
+
+    def _classified_error(self, response, sample=None):
+        sample = self._error_sample(response) if sample is None else sample
+        diagnostic = self._http_error(response, sample)
+        if response.status_code in (400, 413, 422) and 'text/html' not in response.headers.get('content-type', '').lower():
+            try:
+                data = json.loads(sample)
+                error = data.get('error', {}) if isinstance(data, dict) else {}
+                if isinstance(error, dict):
+                    code = str(error.get('code', '')).lower()
+                    text = str(error.get('message', '')).lower()
+                    if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long') or any(
+                            phrase in text for phrase in ('maximum context length', 'context length exceeded',
+                                                         'context window exceeded', 'prompt is too long')):
+                        return ContextLengthError('上下文超过模型窗口；请使用 /compact 归档并缩短上下文，或 /clear 新建会话。')
+            except ValueError:
+                pass
+        return ClientError(diagnostic)
+
+    def _checked_message(self, message):
+        content = message.get('content')
+        if (not message.get('tool_calls') and (content is None or isinstance(content, str) and not content.strip())
+                and not message.get('refusal')
+                and self.last_finish_reason not in ('content_filter', 'safety', 'refusal')):
+            if self.last_finish_reason == 'length':
+                text = '模型输出预算已耗尽，未产生最终回答；请提高服务端输出上限或降低思考强度。'
+            elif message.get('reasoning_content'):
+                text = '模型仅返回思考内容，未产生最终回答；请检查输出预算和模型设置。'
+            else:
+                text = '模型返回空回答；请检查模型设置或稍后重试。'
+            raise EmptyResponseError(text, message)
+        return message
 
     def _http_error(self, response: httpx.Response, sample=None) -> str:
         # Never echo provider messages or response bodies.

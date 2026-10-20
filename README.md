@@ -209,8 +209,11 @@ To fully remove the phone credential copy, additionally remove
 
 ## Sessions and conversation history
 
-`ta` starts a new session. Completed turns and normal exits are saved to
-`~/.local/share/termux-agent/sessions.sqlite3` (directory 0700, database 0600).
+`ta` starts a new session. Requests, assistant messages and completed tools are
+checkpointed to `~/.local/share/termux-agent/sessions.sqlite3` (directory 0700,
+database and any `-wal` / `-shm` sidecars 0600). SQLite uses WAL with `FULL`
+synchronization and a five-second busy timeout. WAL permits concurrent readers
+and a writer; revision checks still reject conflicting conversation saves.
 SQLite is part of the Python standard library; no new dependency or service.
 `ta --no-session` keeps the run entirely in memory.
 
@@ -218,6 +221,9 @@ SQLite is part of the Python standard library; no new dependency or service.
 |---|---|
 | `/sessions [N]` | List up to N recent sessions (default 50, max 500) |
 | `/sessions find TEXT` | Find up to 50 saved sessions by title substring |
+| `/compact [N]` | Keep the latest N user turns in a new session (default 6); preserve the complete original session |
+| `/recall TEXT` | Search saved titles, message text and tool arguments; show at most 20 matching sessions with snippets |
+| `/export [ID] [markdown\|json] [PATH]` | Export current/specified session to a new 0600 file; default Markdown under the session data directory's `exports/` |
 | `/title [NAME]` | Show or change the current session title |
 | `/session` | Show current session ID, title and saved status |
 | `/session new [title]` | Save current session, create a blank one |
@@ -280,9 +286,42 @@ combined with `--session`.
 `/clear` now resets current-session stats too; old stats remain in saved history.
 Two processes cannot silently overwrite the same changed session: a revision
 conflict leaves the in-memory conversation intact; `/session fork` saves it under
-a new ID. Failed/incomplete tool turns are not committed. Abrupt process termination
-can lose the active unfinished turn; only the last completed snapshot is restored,
+a new ID. Checkpoints close pending tool calls with an explicit unknown-outcome
+result in the saved copy; the live tool call is not changed. On restoration,
+inspect actual state before repeating a tool with an unknown outcome. A tool may
+have completed its external side effect just before the process died. Recovery
+does not execute or replay tools automatically.
+
+Streaming text/reasoning is saved separately as an incomplete draft, at most once
+every two seconds (plus the first chunk). Each field retains up to its last 64,000
+characters, with truncation marked. A kill can still lose the last unsaved chunks.
+Loading that session displays the draft; `/export` includes the full retained
+draft. Drafts are not treated as completed model messages or fed back into the
+model. Completed responses replace drafts; failed/interrupted responses retain
+them. Metadata saves and normal exits preserve an unconsumed recovery draft.
+
+Snapshots retain complete model history,
 and old tool calls are never replayed automatically.
+
+### Context budgets, compaction and retrieval
+
+`max_context_chars = 500000` is the default character budget for serialized
+messages plus tool schemas, and can be overridden in an API profile. It is not a
+token estimate or a claim about the model's context window. Requests warn at 80%
+and stop before sending when over budget. Recognized provider context-window
+errors also suggest `/compact`; those errors are not retried or silently pruned.
+`/stats` reports this budget and server-provided `reasoning_tokens` when available.
+An accepted response with only reasoning/empty content produces an explicit
+diagnostic instead of an empty answer, without retrying it automatically.
+
+`/compact 6` saves the complete original conversation and switches to a new
+session containing current system/Skill instructions, an archive-ID notice and
+the latest six user turns. Tool-call/result groups and their reasoning metadata
+stay together. This is local history reduction, not an LLM-generated summary;
+there is no extra model call. The old session remains searchable and loadable.
+One large turn can still exceed the budget; retain fewer turns or start fresh.
+`/recall keyword` searches only on demand and does not insert search results into
+model context. No full-text index or background scan is created.
 
 The database is local plaintext, containing conversation/file/tool content, with
 known API key values redacted. This is history storage, not an automatic memory
@@ -290,6 +329,17 @@ system: unrelated sessions are never loaded into prompts. Snapshots are limited 
 20 MiB per session. Deleting a session removes its database record, not a guaranteed
 secure erase. Uninstall leaves history intact; remove the database separately if
 no longer needed.
+
+Exports include full retained text, reasoning and tool data, including write
+payloads hidden in the terminal. The file is not overwritten if its path already
+exists. Exports normally live in `~/.local/share/termux-agent/exports/`; historical
+backups or troubleshooting copies may remain under `diagnostics/` or paths chosen
+by the operator. There is no automatic retention/deletion policy. To remove all
+local history, first stop every `ta` process, then remove the database together
+with any WAL/SHM sidecars and review exports and backup locations separately.
+Never delete an active WAL file alone or copy just an open database file: use
+SQLite's backup API for a consistent live backup. Deletion on flash storage is
+not a guarantee of secure erasure.
 
 ## SSH terminal editing
 

@@ -263,7 +263,7 @@ class ProviderErrorDiagnosticsTests(unittest.TestCase):
                     with self.assertRaises(ClientError):
                         Client(Config(stream=True), http_client=http).chat([], [])
 
-    def test_sse_empty_assistant_with_finish_reason_is_valid(self):
+    def test_sse_empty_assistant_with_finish_reason_is_reported(self):
         body = b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
 
         def respond(request):
@@ -272,6 +272,6 @@ class ProviderErrorDiagnosticsTests(unittest.TestCase):
                                   request=request)
 
         with httpx.Client(transport=httpx.MockTransport(respond)) as http:
-            message = Client(Config(stream=True), http_client=http).chat([], [])
-        self.assertEqual(message["role"], "assistant")
-        self.assertEqual(message["content"], "")
+            from termux_agent.client import EmptyResponseError
+            with self.assertRaises(EmptyResponseError):
+                Client(Config(stream=True), http_client=http).chat([], [])

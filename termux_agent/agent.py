@@ -7,7 +7,8 @@ from dataclasses import replace
 import uuid
 from typing import Any, Callable
 
-from .client import Client
+from .client import Client, ContextLengthError, EmptyResponseError
+from .context import context_chars
 from .tools import TOOLS, DELEGATE_TOOL, WEB_FETCH_TOOL, execute, web_fetch_available
 
 from .approval import needs_approval
@@ -24,6 +25,7 @@ class Agent:
         self.config.validate()
         self.approve = approve
         self.event = event
+        self.checkpoint = None
         self.base_system = base_system if base_system is not None else (
             load_system_prompt() + ("\n\n" + instructions if instructions else ""))
         self.client = client or Client(config)
@@ -84,6 +86,11 @@ class Agent:
             except Exception:
                 pass
 
+    def _checkpoint(self):
+        # Persistence failures must stop further tools, rather than vanish in _emit.
+        if self.checkpoint:
+            self.checkpoint()
+
     @staticmethod
     def _tool_args(raw: Any) -> tuple[dict[str, Any] | None, str | None]:
         if isinstance(raw, dict):
@@ -121,21 +128,32 @@ class Agent:
         self._subagents_this_run = 0
         self.last_run = {"status": "running", "auto": automatic, "continuations": 0}
         pauses = 0
+        warned_context = False
         if hasattr(self.client, "set_control_markers"):
             self.client.set_control_markers(TASK_MARKERS if automatic else ())
 
         def finish(status, value):
             self.last_run["status"] = status
+            self._checkpoint()
             return value
 
         self.messages.append({"role": "user", "content": text})
         self._conversation_count += 1
+        self._checkpoint()
         for step in range(self.config.max_steps):
-            self._total_calls += 1
             request_messages = self.messages
             if rules:
                 request_messages = [{"role": "system", "content": self.system + "\n\n" + rules},
                                     *self.messages[1:]]
+            chars = context_chars(request_messages, self.tools)
+            if chars > self.config.max_context_chars:
+                return finish('context_limit', f'LLM 请求失败：上下文保护 {chars:,}/{self.config.max_context_chars:,} 字符；'
+                              '请使用 /compact 归档并缩短上下文，或 /clear 新建会话。')
+            if not warned_context and chars >= self.config.max_context_chars * 0.8:
+                self._emit('context_warning', {'chars': chars, 'limit': self.config.max_context_chars})
+                warned_context = True
+            self._emit('request_start', {})
+            self._total_calls += 1
             try:
                 answer = self.client.chat(request_messages, self.tools)
             except KeyboardInterrupt:
@@ -143,9 +161,13 @@ class Agent:
                 self._request_history_chars.append(self._history_chars(request_messages))
                 return finish("interrupted", "LLM 请求已中断。")
             except Exception as exc:
-                self._usage_history.append(None)
+                self._usage_history.append(self._clean_usage(getattr(self.client, 'last_usage', None))
+                                           if isinstance(exc, EmptyResponseError) else None)
                 self._request_history_chars.append(self._history_chars(request_messages))
-                return finish("error", f"LLM 请求失败：{exc}")
+                if isinstance(exc, EmptyResponseError):
+                    self.messages.append({**exc.assistant_message, 'role': 'assistant'})
+                status = 'context_limit' if isinstance(exc, ContextLengthError) else 'empty_response' if isinstance(exc, EmptyResponseError) else 'error'
+                return finish(status, f"LLM 请求失败：{exc}")
             if not isinstance(answer, dict):
                 self._usage_history.append(None)
                 self._request_history_chars.append(self._history_chars(request_messages))
@@ -184,6 +206,7 @@ class Agent:
                 self._emit("continuation", {"step": step + 1, "attempt": pauses,
                                            "max_steps": self.config.max_steps})
                 self.messages.append({"role": "user", "content": nudge})
+                self._checkpoint()
                 continue
             invalid = self._validate_calls(calls)
             if invalid:
@@ -192,6 +215,7 @@ class Agent:
                 self.messages.append({"role": "assistant", "content": content if isinstance(content, str) else "", **reasoning})
                 return finish("error", f"模型返回了格式错误的工具调用：{invalid}")
             self.messages.append({"role": "assistant", "content": content, "tool_calls": calls, **reasoning})
+            self._checkpoint()
             if automatic and self._approval_denied:
                 self._fill_tool_results(calls, denied=True, reason="task stopped after approval denial")
                 return finish("blocked", "任务因审批拒绝停止；未执行新的工具调用。")
@@ -229,6 +253,10 @@ class Agent:
             number = value.get(field)
             if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
                 usage[field] = number
+        details = value.get('completion_tokens_details')
+        reasoning = value.get('reasoning_tokens', details.get('reasoning_tokens') if isinstance(details, dict) else None)
+        if isinstance(reasoning, int) and not isinstance(reasoning, bool) and reasoning >= 0:
+            usage['reasoning_tokens'] = reasoning
         return usage or None
 
     def _history_chars(self, messages=None) -> int:
@@ -276,6 +304,7 @@ class Agent:
                 self._emit("tool_result", {"name": name, "result": result})
             self.messages.append({"role": "tool", "tool_call_id": call_id,
                                   "content": json.dumps(result, ensure_ascii=False, separators=(",", ":"))})
+            self._checkpoint()
         return interrupted
 
     def _delegate(self, args):
@@ -335,15 +364,18 @@ class Agent:
         self._approval_denied = False
         self._conversation_count += 1
         self.messages.append({"role": "user", "content": "/sub " + task})
+        self._checkpoint()
         calls = [{"id": "delegate_" + uuid.uuid4().hex[:12], "type": "function",
                   "function": {"name": "delegate", "arguments": json.dumps({"task": task}, ensure_ascii=False)}}]
         self.messages.append({"role": "assistant", "content": "", "tool_calls": calls})
+        self._checkpoint()
         interrupted = self._fill_tool_results(calls)
         result = json.loads(self.messages[-1]["content"])
         status = "interrupted" if interrupted else result.get("status", "blocked" if self._approval_denied else "error")
         summary = result.get("summary", result.get("error", ""))
         self.messages.append({"role": "assistant", "content": f"[{status}] {summary}"})
         self.last_run = {"status": status, "auto": False, "continuations": 0}
+        self._checkpoint()
         return result
 
     def clear(self) -> None:
@@ -353,7 +385,7 @@ class Agent:
     def stats(self) -> dict[str, Any]:
         totals = {}
         missing = {}
-        for field in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        for field in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"):
             observed = [item[field] for item in self._usage_history if item and field in item]
             totals[field] = sum(observed) if observed else None
             missing[field] = len(self._usage_history) - len(observed)
@@ -374,7 +406,10 @@ class Agent:
                 "auto_continue": self.config.auto_continue, "last_run": dict(self.last_run),
                 "tool_schema_chars": len(json.dumps(self.tools, ensure_ascii=False, separators=(",", ":"))),
                 "request_history_chars": list(self._request_history_chars),
-                "current_history_chars": self._history_chars()}
+                "current_history_chars": self._history_chars(),
+                "context_budget": {'chars': context_chars(self.messages, self.tools),
+                                   'limit': self.config.max_context_chars,
+                                   'unit': 'characters, not tokens'}}
 
     def debug_context(self) -> dict[str, Any]:
         request = getattr(self.client, "last_request", None)

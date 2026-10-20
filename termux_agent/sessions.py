@@ -1,4 +1,5 @@
 """Local SQLite sessions: atomic snapshots, revision checks, no API credentials."""
+import copy
 import json
 import os
 from pathlib import Path
@@ -55,14 +56,9 @@ def validate_messages(messages):
         raise ValueError('Incomplete tool turn')
 
 
-def snapshot(agent, scope):
-    validate_messages(agent.messages)
-    value = {'version': 3, 'config': agent.config.public_dict(), 'scope': scope,
-             'base_system': agent.base_system,
-             'messages': agent.messages, 'active_skills': agent.get_active_skills(), 'counters': {k: getattr(agent, k) for k in COUNTERS}}
+def scrub_keys(value, extra=()):
     keys = {v for k, v in os.environ.items() if k.endswith('_API_KEY') and v}
-    if agent.config.api_key:
-        keys.add(agent.config.api_key)
+    keys.update(v for v in extra if v)
     def scrub(obj):
         if isinstance(obj, str):
             for key in keys:
@@ -74,6 +70,28 @@ def snapshot(agent, scope):
             return [scrub(v) for v in obj]
         return obj
     return scrub(value)
+
+
+def snapshot(agent, scope, checkpoint=False):
+    messages = copy.deepcopy(agent.messages) if checkpoint else agent.messages
+    if checkpoint:
+        pending = {}
+        for message in messages:
+            if message.get('role') == 'assistant' and message.get('tool_calls'):
+                pending = {call['id']: call for call in message['tool_calls']}
+            elif message.get('role') == 'tool':
+                pending.pop(message.get('tool_call_id'), None)
+        for identifier in pending:
+            messages.append({'role': 'tool', 'tool_call_id': identifier, 'content': json.dumps({
+                'error': 'Interrupted checkpoint: tool outcome is unknown. It may have run. '
+                         'Inspect actual state before retrying; do not assume success or replay automatically.'})})
+    validate_messages(messages)
+    value = {'version': 3, 'config': agent.config.public_dict(), 'scope': scope,
+             'base_system': agent.base_system,
+             'messages': messages, 'active_skills': agent.get_active_skills(), 'counters': {k: getattr(agent, k) for k in COUNTERS}}
+    if checkpoint:
+        value['checkpoint'] = True
+    return scrub_keys(value, (agent.config.api_key,))
 
 
 def restore(payload, build_agent):
@@ -125,21 +143,39 @@ class SessionStore:
         root = Path(root) if root else Path.home() / '.local/share/termux-agent'
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         root.chmod(0o700)
+        self.root = root
         path = root / 'sessions.sqlite3'
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         os.close(fd)
         path.chmod(0o600)
         self.db = sqlite3.connect(path, timeout=5)
+        try:
+            self.db.execute('PRAGMA busy_timeout=5000')
+            self.db.execute('PRAGMA journal_mode=WAL')
+            self.db.execute('PRAGMA synchronous=FULL')
+        except sqlite3.Error:
+            self.db.close()
+            raise
         self.db.execute('CREATE TABLE IF NOT EXISTS sessions '
                         '(id TEXT PRIMARY KEY, title TEXT, updated REAL, revision INTEGER, payload TEXT)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS drafts '
+                        '(id TEXT PRIMARY KEY, revision INTEGER, updated REAL, payload TEXT)')
         self.db.commit()
+        self._secure_files()
+
+    def _secure_files(self):
+        for suffix in ('', '-wal', '-shm'):
+            try:
+                (self.root / ('sessions.sqlite3' + suffix)).chmod(0o600)
+            except FileNotFoundError:
+                pass
 
     @staticmethod
     def check_id(identifier):
         if not re.fullmatch('[0-9a-f]{12}', identifier):
             raise ValueError('Use the exact 12-character session ID from /sessions')
 
-    def save(self, identifier, revision, payload):
+    def save(self, identifier, revision, payload, clear_draft=True):
         self.check_id(identifier)
         text = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
         if len(text.encode()) > 20 * 1024 * 1024:
@@ -154,7 +190,32 @@ class SessionStore:
                                          (text, time.time(), identifier, revision))
                 if result.rowcount != 1:
                     raise ValueError('Session changed/deleted in another process; use /session fork to preserve this conversation separately')
+            if clear_draft:
+                self.db.execute('DELETE FROM drafts WHERE id=?', (identifier,))
+            else:
+                self.db.execute('UPDATE drafts SET revision=? WHERE id=? AND revision=?',
+                                (revision + 1, identifier, revision))
+        self._secure_files()
         return revision + 1
+
+    def save_draft(self, identifier, revision, draft):
+        self.check_id(identifier)
+        text = json.dumps(scrub_keys(draft), ensure_ascii=False)
+        if len(text) > 256_000:
+            raise ValueError('Stream draft exceeds 256000 characters')
+        with self.db:
+            result = self.db.execute('INSERT OR REPLACE INTO drafts '
+                                     'SELECT id,revision,?,? FROM sessions WHERE id=? AND revision=?',
+                                     (time.time(), text, identifier, revision))
+            if result.rowcount != 1:
+                raise ValueError('Session changed while streaming; draft was not overwritten')
+        self._secure_files()
+
+    def draft(self, identifier):
+        self.check_id(identifier)
+        row = self.db.execute('SELECT d.payload FROM drafts d JOIN sessions s ON s.id=d.id '
+                              'AND s.revision=d.revision WHERE d.id=?', (identifier,)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def load(self, identifier):
         self.check_id(identifier)
@@ -184,6 +245,79 @@ class SessionStore:
         return [row[0] for row in self.db.execute(
             'SELECT id FROM sessions ORDER BY updated DESC LIMIT ?', (limit,))]
 
+    def recall(self, query, limit=20, silent_writes=True):
+        """On-demand literal search: no startup scan or persistent full-text index."""
+        from .history import history_entry
+        query = validate_title(query).casefold()
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError('Recall limit must be between 1 and 100')
+        results = []
+        for identifier, title, updated, text in self.db.execute(
+                'SELECT id,title,updated,payload FROM sessions ORDER BY updated DESC'):
+            payload = json.loads(text)
+            index, snippet = None, None
+            if query in (title or '').casefold():
+                snippet = title
+            else:
+                for index, message in enumerate(payload['messages'][1:], 1):
+                    raw = json.dumps({'content': message.get('content'), 'tool_calls': message.get('tool_calls')},
+                                     ensure_ascii=False)
+                    if query in raw.casefold():
+                        visible = history_entry(message, silent_writes, limit=20 * 1024 * 1024)[1]
+                        position = visible.casefold().find(query)
+                        if position < 0:
+                            snippet = '命中已保存内容；按静默显示规则隐藏正文。'
+                        else:
+                            start = max(0, position - 60)
+                            snippet = ('…' if start else '') + visible[start:start + 200]
+                        break
+            if snippet is not None:
+                results.append({'id': identifier, 'title': title,
+                                'updated': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated)),
+                                'message': index, 'snippet': ' '.join(snippet.split())[:220]})
+                if len(results) >= limit:
+                    break
+        return results
+
+    def export(self, identifier, format='markdown', path=None):
+        self.check_id(identifier)
+        if format not in ('markdown', 'json'):
+            raise ValueError('Export format must be markdown or json')
+        row = self.db.execute('SELECT title,updated,revision,payload FROM sessions WHERE id=?', (identifier,)).fetchone()
+        if row is None:
+            raise ValueError('Session not found')
+        revision, payload = row[2], json.loads(row[3])
+        data = {'id': identifier, 'title': row[0], 'updated': row[1], 'revision': revision,
+                'payload': payload, 'draft': self.draft(identifier)}
+        text = json.dumps(data, ensure_ascii=False, indent=2) + '\n'
+        if format == 'markdown':
+            from .history import history_entry
+            def block(body):
+                fence = '`' * max(3, max((len(m.group()) + 1 for m in re.finditer(r'`+', body)), default=3))
+                return fence + 'text\n' + body + '\n' + fence + '\n'
+            parts = [f'# {row[0] or "Session"}\n\nSession: {identifier}\n']
+            for index, message in enumerate(payload['messages']):
+                body = history_entry(message, silent_writes=False, limit=20 * 1024 * 1024)[1]
+                if message.get('reasoning_content'):
+                    body += '\n\n[Reasoning]\n' + str(message['reasoning_content'])
+                parts.append(f'## {index} · {message["role"]}\n\n' + block(body))
+            if data['draft']:
+                parts.append('## Interrupted stream draft\n\n' + block(json.dumps(data['draft'], ensure_ascii=False, indent=2)))
+            text = '\n'.join(parts)
+        target = Path(path).expanduser() if path else self.root / 'exports' / (
+            identifier + '-' + str(time.time_ns()) + ('.json' if format == 'json' else '.md'))
+        target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            target.unlink(missing_ok=True)
+            raise
+        return target.resolve()
+
     def rename(self, identifier, title):
         self.check_id(identifier)
         title = validate_title(title)
@@ -202,6 +336,7 @@ class SessionStore:
         with self.db:
             if self.db.execute('DELETE FROM sessions WHERE id=?', (identifier,)).rowcount != 1:
                 raise ValueError('Session not found')
+            self.db.execute('DELETE FROM drafts WHERE id=?', (identifier,))
 
     def close(self):
         self.db.close()

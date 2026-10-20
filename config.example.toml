@@ -10,6 +10,7 @@ web_fetch_enabled = false # optional; needs an existing Lightpanda executable
 lightpanda_binary = "" # empty: TERMUX_AGENT_LIGHTPANDA, then PATH; supports ~/bin/lightpanda
 max_output_chars = 20000
 max_input_file_chars = 64000
+max_context_chars = 500000 # messages + tool schemas, characters NOT tokens; per-profile override allowed
 approval_policy = "on-risk"
 silent_writes = true
 timeout = 120.0

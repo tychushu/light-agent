@@ -26,6 +26,9 @@ HELP = """/help           显示命令帮助（Show commands）
 Tab             补全命令、API 配置、会话 ID 和技能名称
 ~/path 或 /path  补全本地路径；回车将 UTF-8 文本文件内容提交给模型
 /clear          新建空白会话，保留原会话历史
+/compact [N]    归档完整会话，新会话保留最近 N 轮（默认 6），不调用模型
+/recall TEXT    在已保存会话正文和工具参数中检索，最多显示 20 个会话
+/export [ID] [markdown|json] [PATH]  导出会话；默认当前会话、Markdown、新文件
 /stats          查看模型调用、服务端 token 用量和上下文大小
 /config         查看当前生效配置，不显示密钥
 /debug          开关请求用量和工具结果的调试显示
@@ -196,6 +199,8 @@ def main():
     tool_started = {}
     stream_wrote = False
     read_grant = False
+    stream_draft = {}
+    draft_saved_at = 0.0
     formatter = Columns(sys.stdout, enabled=sys.stdout.isatty() and options.prompt is None)
 
     def redact(text):
@@ -229,6 +234,14 @@ def main():
             return False
 
     def event(kind, payload):
+        nonlocal stream_draft, draft_saved_at
+        if kind == 'request_start':
+            stream_draft, draft_saved_at = {}, 0.0
+            return
+        if kind == 'context_warning':
+            display(f"上下文字符预算已用 {payload['chars'] / payload['limit']:.0%}；"
+                    '可用 /compact 缩短上下文（字符预算不等于模型 token 窗口）。', 'Context')
+            return
         if kind in ("subagent_start", "subagent_end"):
             detail = (f"model={payload['model']} · steps≤{payload['max_steps']}"
                       if kind == "subagent_start" else payload["status"])
@@ -257,10 +270,20 @@ def main():
                     pass
 
     def stream_output(kind, value):
-        nonlocal stream_wrote
+        nonlocal stream_wrote, draft_saved_at
         safe = "".join(c if c in "\n\t" or c.isprintable() else f"\\x{ord(c):02x}" for c in value)
         formatter.feed("Think" if kind == "reasoning" else "Agent", redact(safe))
         stream_wrote = True
+        if store and revision:
+            field = 'reasoning_content' if kind == 'reasoning' else 'content'
+            combined = stream_draft.get(field, '') + redact(value)
+            if len(combined) > 64000:
+                stream_draft['truncated'] = True
+            stream_draft[field] = combined[-64000:]
+            now = time.monotonic()
+            if not draft_saved_at or now - draft_saved_at >= 2:
+                store.save_draft(session_id, revision, stream_draft)
+                draft_saved_at = now
 
     def show_answer(value):
         nonlocal stream_wrote
@@ -287,13 +310,19 @@ def main():
         built = Agent(next_config, **kwargs)
         built.client.on_stream = stream_output
         built.client.on_retry = retry_output
+        built.checkpoint = lambda: save_current(checkpoint=True)
         return built
 
     try:
         agent = None if options.session else build_agent(config, instructions)
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
-    store = None if options.no_session else SessionStore()
+    try:
+        store = None if options.no_session else SessionStore()
+    except (OSError, sqlite3.Error) as exc:
+        if agent is not None:
+            agent.client.close()
+        parser.error(f'Session store unavailable: {exc}')
     session_id, revision = new_id(), 0
 
     if _readline:
@@ -313,13 +342,14 @@ def main():
             _readline.parse_and_bind("set show-all-if-ambiguous off")
             _readline.parse_and_bind("tab: menu-complete")
 
-    def save_current(force=False):
+    def save_current(force=False, checkpoint=False):
         nonlocal revision
         if store and agent is not None and (force or revision or len(agent.messages) > 1):
             scope = {"directory": str(directory), "config_path": config_path,
                      "session_file": session_file, "disabled": disabled,
                      "instructions": instructions, "instruction_path": instruction_path}
-            revision = store.save(session_id, revision, snapshot(agent, scope))
+            revision = store.save(session_id, revision, snapshot(agent, scope, checkpoint=checkpoint),
+                                  clear_draft=checkpoint and agent.last_run['status'] not in ('error', 'interrupted'))
 
     def submit_input(value, automatic=None):
         nonlocal stream_wrote, read_grant
@@ -396,6 +426,31 @@ def main():
         session_id, revision = identifier, next_revision
         registry = SkillRegistry()
         profile_store = ProfileStore(config_path)
+        draft = store.draft(identifier)
+        if payload.get('checkpoint') or draft:
+            display('恢复了未完成任务的检查点；工具状态不明时先核实实际结果。', 'Recovery')
+        if draft:
+            display('上次流式草稿（未完成，未加入模型上下文；/export 可完整导出）：\n' +
+                    (draft.get('content') or draft.get('reasoning_content') or '')[:4000], 'Draft')
+
+    def compact_current(keep):
+        from .context import compact_messages
+        if not 1 <= keep <= 100:
+            raise ValueError('Use /compact [1–100 recent user turns]')
+        save_current(force=True)
+        original = session_id
+        title = current_title()
+        _, payload = store.load(original)
+        messages, omitted = compact_messages(payload['messages'], keep, original)
+        if not omitted:
+            display('消息轮次未超过保留数量，无需精简。', 'Context')
+            return
+        payload['messages'] = messages
+        identifier = new_id()
+        store.save(identifier, 0, payload)
+        store.rename(identifier, title[:100] + ' · compact')
+        load_session(identifier)
+        display(f'完整历史保留于 {original}；当前会话 {identifier} 已省略 {omitted} 条早期消息。', 'Context')
 
     try:
         if options.session:
@@ -450,6 +505,39 @@ def main():
                     display(f"Error: {exc}")
             elif prompt == "/stats":
                 display(agent.stats())
+            elif prompt == '/compact' or prompt.startswith('/compact '):
+                try:
+                    if not store:
+                        raise ValueError('/compact 需要会话持久化，请去掉 --no-session')
+                    compact_current(int(prompt[8:].strip() or 6))
+                except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+                    display(f'Error: {exc}')
+            elif prompt == '/recall' or prompt.startswith('/recall '):
+                try:
+                    if not store:
+                        raise ValueError('/recall 需要会话持久化')
+                    save_current()
+                    rows = store.recall(prompt[7:].strip(), silent_writes=config.silent_writes)
+                    display(rows if rows else '未找到匹配会话。', 'Recall')
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    display(f'Error: {exc}')
+            elif prompt == '/export' or prompt.startswith('/export '):
+                try:
+                    if not store:
+                        raise ValueError('/export 需要会话持久化')
+                    args = shlex.split(prompt)[1:]
+                    target = session_id
+                    if args and args[0] not in ('markdown', 'json'):
+                        target = args.pop(0)
+                        store.check_id(target)
+                    if len(args) > 2:
+                        raise ValueError('Use /export [ID] [markdown|json] [PATH]')
+                    if target == session_id:
+                        save_current(force=True)
+                    path = store.export(target, args[0] if args else 'markdown', args[1] if len(args) > 1 else None)
+                    display(f'已导出：{path}（本地明文，权限 0600）', 'Export')
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    display(f'Error: {exc}')
             elif prompt == "/config":
                 display({**config.public_dict(), "directory": str(directory), "agent_file": instruction_path})
             elif prompt == "/debug":
