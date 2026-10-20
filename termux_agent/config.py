@@ -24,6 +24,8 @@ class Config:
     retry_max_attempts: int = 3
     max_subagents: int = 3
     subagent_max_steps: int = 6
+    web_fetch_enabled: bool = False
+    lightpanda_binary: str = ""
     api_key: str = ""
     api_key_env: str = "TERMUX_AGENT_API_KEY"
     api_profile: str = "default"
@@ -47,7 +49,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -86,6 +88,11 @@ class Config:
         return ["default", *ProfileStore(path).entries().keys()]
 
     def validate(self) -> None:
+        if not isinstance(self.web_fetch_enabled, bool):
+            raise ValueError("web_fetch_enabled must be a boolean")
+        if (not isinstance(self.lightpanda_binary, str) or
+                any(ord(c) < 32 or ord(c) == 127 for c in self.lightpanda_binary)):
+            raise ValueError("lightpanda_binary must be an executable name or path without control characters")
         for key, low, high in (("retry_max_attempts", 1, 6), ("max_subagents", 0, 8),
                                ("subagent_max_steps", 1, 12)):
             value = getattr(self, key)

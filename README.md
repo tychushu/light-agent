@@ -4,6 +4,9 @@ A thin native Termux ↔ OpenAI-compatible API adapter. Python >=3.11, one
 runtime dependency (`httpx`), four filesystem/shell tools plus optional sub-agent
 delegation, local sessions, no framework or daemon.
 
+Optional JavaScript-rendered page retrieval through an existing Lightpanda
+installation is disabled by default; see [web_fetch setup and acceptance](docs/web-fetch.md).
+
 ## Install
 
 From a clone or a copy of this directory, in **native Termux**:

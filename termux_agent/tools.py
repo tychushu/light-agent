@@ -10,8 +10,10 @@ import tempfile
 import math
 import time
 import hashlib
+import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 TOOLS = [
@@ -20,6 +22,180 @@ TOOLS = [
     {"type": "function", "function": {"name": "write_file", "description": "Write UTF-8 atomically; verified SHA-256 confirms the write without returning text.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"], "additionalProperties": False}}},
     {"type": "function", "function": {"name": "edit_file", "description": "Replace exact text only at the expected count; return verified SHA-256, not text.", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}, "expected_replacements": {"type": "integer", "minimum": 1}}, "required": ["path", "old_text", "new_text"], "additionalProperties": False}}},
 ]
+
+WEB_FETCH_TOOL = {"type": "function", "function": {"name": "web_fetch", "description": "Fetch a web page through the Lightpanda headless browser (JavaScript executed) and return Markdown, HTML or a semantic text tree.", "parameters": {"type": "object", "properties": {"url": {"type": "string"}, "format": {"type": "string", "enum": ["markdown", "html", "tree"]}, "selector": {"type": "string"}, "wait_ms": {"type": "integer", "minimum": 0, "maximum": 60000}, "strip": {"type": "string", "enum": ["none", "clutter", "shell"]}}, "required": ["url"], "additionalProperties": False}}}
+
+WEB_FETCH_FORMATS = {"markdown": "markdown", "html": "html", "tree": "semantic_tree_text"}
+WEB_FETCH_STRIP = {"none": (), "clutter": ("clutter",), "shell": ("shell",)}
+WEB_FETCH_DEFAULT_WAIT_MS = 5_000
+WEB_FETCH_MAX_WAIT_MS = 60_000
+WEB_FETCH_MAX_SECONDS = 120.0
+
+
+def web_fetch_available(binary: str | None = None) -> bool:
+    """True when the browser binary can be resolved; used to hide the tool."""
+    return bool(_web_fetch_binary(binary))
+
+
+def _web_fetch_binary(binary: str | None = None) -> str:
+    candidate = binary or os.environ.get("TERMUX_AGENT_LIGHTPANDA", "lightpanda")
+    if not candidate:
+        return ""
+    candidate = os.path.expanduser(candidate)
+    if os.sep in candidate:
+        return candidate if os.path.isfile(candidate) and os.access(candidate, os.X_OK) else ""
+    return shutil.which(candidate) or ""
+
+
+def _web_fetch_process(command, env, timeout, output_limit):
+    """Drain both pipes with bounded RAM; always reap the browser process group."""
+    selector = selectors.DefaultSelector()
+    try:
+        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, env=env, start_new_session=True)
+    except (OSError, ValueError) as exc:
+        selector.close()
+        raise ValueError(f"cannot start lightpanda: {exc}") from None
+    out, err = bytearray(), bytearray()
+    deadline = time.monotonic() + timeout
+
+    def signal_group(sig):
+        try:
+            os.killpg(proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            if proc.poll() is None:
+                try:
+                    proc.send_signal(sig)
+                except ProcessLookupError:
+                    pass
+
+    try:
+        for label, pipe in (("out", proc.stdout), ("err", proc.stderr)):
+            os.set_blocking(pipe.fileno(), False)
+            selector.register(pipe, selectors.EVENT_READ, label)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            for key, _ in selector.select(min(0.1, remaining)):
+                try:
+                    chunk = os.read(key.fileobj.fileno(), 65536)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    key.fileobj.close()
+                elif key.data == "out":
+                    if len(out) + len(chunk) > output_limit:
+                        raise ValueError(f"web_fetch browser output exceeds {output_limit} byte limit")
+                    out.extend(chunk)
+                else:
+                    err.extend(chunk[-4096:])
+                    del err[:-4096]
+        proc.wait(timeout=max(0, deadline - time.monotonic()))
+        return bytes(out), bytes(err), proc.returncode
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"web_fetch timed out after {timeout:g}s") from None
+    finally:
+        # Always KILL remaining descendants, even if the group leader exited
+        # after TERM or an interrupt. No second unbounded communicate() call.
+        signal_group(signal.SIGTERM)
+        try:
+            proc.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+        finally:
+            signal_group(signal.SIGKILL)
+            try:
+                proc.wait(timeout=1)
+            finally:
+                selector.close()
+                proc.stdout.close()
+                proc.stderr.close()
+
+
+def _web_fetch(args: dict, cap: int, binary: str | None = None,
+               timeout: float | None = None) -> dict:
+    """Load one http(s) URL in Lightpanda and return bounded page content."""
+    if set(args) - {"url", "format", "selector", "wait_ms", "strip"}:
+        raise ValueError("web_fetch accepts only url, format, selector, wait_ms and strip")
+    url = args.get("url")
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("url must be a non-empty string")
+    url = url.strip()
+    parsed = urlsplit(url)
+    if (parsed.scheme.lower() not in ("http", "https") or not parsed.hostname or
+            any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url)):
+        raise ValueError("url must start with http:// or https://")
+    parsed.port  # Reject malformed ports before launching the browser.
+    fmt = args.get("format", "markdown")
+    if not isinstance(fmt, str) or fmt not in WEB_FETCH_FORMATS:
+        raise ValueError(f"format must be one of {sorted(WEB_FETCH_FORMATS)}")
+    strip = args.get("strip", "none")
+    if not isinstance(strip, str) or strip not in WEB_FETCH_STRIP:
+        raise ValueError(f"strip must be one of {sorted(WEB_FETCH_STRIP)}")
+    selector = args.get("selector")
+    if selector is not None and (not isinstance(selector, str) or not selector.strip()):
+        raise ValueError("selector must be a non-empty string when provided")
+    wait_ms = args.get("wait_ms", WEB_FETCH_DEFAULT_WAIT_MS)
+    if isinstance(wait_ms, bool) or not isinstance(wait_ms, int) or not 0 <= wait_ms <= WEB_FETCH_MAX_WAIT_MS:
+        raise ValueError(f"wait_ms must be an integer between 0 and {WEB_FETCH_MAX_WAIT_MS}")
+    exe = _web_fetch_binary(binary)
+    if not exe:
+        raise ValueError("lightpanda binary not found; set TERMUX_AGENT_LIGHTPANDA")
+    if timeout is None:
+        timeout = min(WEB_FETCH_MAX_SECONDS, max(15.0, wait_ms / 1000 + 20.0))
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("web_fetch timeout must be positive and finite")
+    timeout = min(timeout, WEB_FETCH_MAX_SECONDS)
+
+    command = [exe, "fetch", "--json", "--log-level", "error",
+               "--dump", WEB_FETCH_FORMATS[fmt],
+               "--wait-ms", str(wait_ms)]
+    if fmt in ("markdown", "html"):
+        # The flag is rejected for semantic_tree dumps; those are clipped below.
+        # Over-read one UTF-8 character beyond the character cap so browser-side
+        # byte clipping cannot silently turn a truncated page into truncated=false.
+        command += ["--dump-max-bytes", str(cap * 4 + 4)]
+    for mode in WEB_FETCH_STRIP[strip]:
+        command += ["--strip-mode", mode]
+    if selector is not None:
+        command += ["--dump-selector", selector.strip()]
+    command.append(url)
+
+    env = os.environ.copy()
+    # Upstream telemetry is on by default; never send it from this agent.
+    env["LIGHTPANDA_DISABLE_TELEMETRY"] = "true"
+    env.update({"TERM": "dumb", "CI": "1"})
+    output_limit = min(8 * 1024 * 1024, max(65536, cap * 32 + 65536))
+    out, err, returncode = _web_fetch_process(command, env, timeout, output_limit)
+    text = out.decode("utf-8", "replace")
+    stderr = err.decode("utf-8", "replace").strip()
+    payload = None
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except ValueError:
+            payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("results"), list) and payload["results"]:
+        payload = payload["results"][0]
+    failure = payload.get("error") if isinstance(payload, dict) else None
+    if returncode != 0:
+        detail = failure[-400:] if isinstance(failure, str) and failure else (stderr[-400:] or f"exit {returncode}")
+        raise ValueError(f"lightpanda failed: {detail}")
+    content = payload.get("content") if isinstance(payload, dict) else None
+    if not isinstance(content, str):
+        content = text
+    truncated = len(content) > cap
+    if truncated:
+        content = _clip(content, cap)
+    status = payload.get("http_status") if isinstance(payload, dict) else None
+    if status is None and isinstance(payload, dict):
+        status = payload.get("status")
+    return {"url": payload.get("url") if isinstance(payload, dict) and isinstance(payload.get("url"), str) else url,
+            "status": status if isinstance(status, int) and not isinstance(status, bool) else None,
+            "format": fmt, "content": content, "chars": len(content), "truncated": truncated}
 
 MAX_FILE_BYTES = 10 * 1024 * 1024
 DELEGATE_TOOL = {
@@ -320,7 +496,7 @@ def _edit_file(args: dict) -> dict:
             "chars_written": len(result)}
 
 
-def execute(name: str, args: dict, max_output_chars: int = 20000) -> dict:
+def execute(name: str, args: dict, max_output_chars: int = 20000, *, lightpanda_binary: str | None = None) -> dict:
     """Run a named tool and turn failures into compact model-readable results."""
     try:
         if not isinstance(args, dict):
@@ -336,6 +512,8 @@ def execute(name: str, args: dict, max_output_chars: int = 20000) -> dict:
             return _write_file(args)
         if name == "edit_file":
             return _edit_file(args)
+        if name == "web_fetch":
+            return _web_fetch(args, cap, binary=lightpanda_binary)
         raise ValueError(f"unknown tool: {name}")
     except Exception as exc:
         return {"error": f"{type(exc).__name__}: {exc}"}

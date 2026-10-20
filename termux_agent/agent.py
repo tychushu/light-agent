@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Callable
 
 from .client import Client
-from .tools import TOOLS, DELEGATE_TOOL, execute
+from .tools import TOOLS, DELEGATE_TOOL, WEB_FETCH_TOOL, execute, web_fetch_available
 
 from .approval import needs_approval
 from .instructions import load_system_prompt, load_prompt_file
@@ -28,7 +28,9 @@ class Agent:
             load_system_prompt() + ("\n\n" + instructions if instructions else ""))
         self.client = client or Client(config)
         self._allow_delegation = allow_delegation
-        self.tools = TOOLS + ([DELEGATE_TOOL] if allow_delegation and config.max_subagents else [])
+        self._web_fetch_enabled = config.web_fetch_enabled and web_fetch_available(config.lightpanda_binary or None)
+        self.tools = (TOOLS + ([WEB_FETCH_TOOL] if self._web_fetch_enabled else []) +
+                      ([DELEGATE_TOOL] if allow_delegation and config.max_subagents else []))
         self._subagents_this_run = 0
         self._subagent_calls_total = 0
         self._subagent_api_calls_total = 0
@@ -251,14 +253,21 @@ class Agent:
                 result = {"error": parse_error}
             elif not name:
                 result = {"error": "tool name is missing"}
+            elif name == "web_fetch" and not self._web_fetch_enabled:
+                result = {"error": "web_fetch is disabled or lightpanda is unavailable"}
             elif not self._approved(name, args or {}):
                 self._approval_denied = True
                 result = {"error": "approval denied or unavailable"}
             else:
                 self._emit("tool_start", {"name": name, "arguments": args})
                 try:
-                    result = (self._delegate(args or {}) if name == "delegate" else
-                              execute(name, args or {}, self.config.max_output_chars))
+                    if name == "delegate":
+                        result = self._delegate(args or {})
+                    elif name == "web_fetch":
+                        result = execute(name, args or {}, self.config.max_output_chars,
+                                         lightpanda_binary=self.config.lightpanda_binary or None)
+                    else:
+                        result = execute(name, args or {}, self.config.max_output_chars)
                 except KeyboardInterrupt:
                     interrupted = True
                     result = {"error": "tool execution interrupted"}
