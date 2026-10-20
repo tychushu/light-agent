@@ -202,6 +202,39 @@ main()
         self.assertEqual(rows[1][2], str(paths["directory_b"]))
         self.assertNotIn("\x1b[", text)
 
+    def test_titles_refresh_after_rename_new_session_and_restore_in_real_tty(self):
+        from pathlib import Path
+        def setup(home):
+            path = Path(home) / '.config/termux-agent/config.toml'
+            path.parent.mkdir(parents=True)
+            path.write_text('model="m"\n')
+        code = '''import sys
+from pathlib import Path
+import termux_agent.agent as core
+import termux_agent.cli as cli
+class FakeClient:
+    def __init__(self, config): pass
+    def chat(self, *args): raise AssertionError("No model calls for title commands")
+    def close(self): pass
+core.Client = FakeClient
+identifiers = iter(["111111111111", "222222222222"])
+cli.new_id = lambda: next(identifiers)
+sys.argv = ["ta", "--directory", str(Path.home()), "--no-agent"]
+cli.main()
+'''
+        prompt = 'You     │ '.encode()
+        text = self.exchange(code, [(prompt, '/title 稿件审阅\n'.encode()),
+                                    (prompt, '/sessions find 审阅\n'.encode()),
+                                    (prompt, '/session new 第二会话\n'.encode()),
+                                    (prompt, b'/session load 111111111111\n'),
+                                    (prompt, b'/exit\n')], setup=setup, columns=100)
+        self.assertGreaterEqual(text.count('Title=稿件审阅'), 2, text)
+        self.assertIn('Title=第二会话', text)
+        self.assertIn('1 saved sessions', text)
+        self.assertIn('* 111111111111 · 稿件审阅', text)
+        self.assertNotIn('LLM 请求失败', text)
+        self.assertNotIn('Unknown command', text)
+
     def test_status_wraps_narrow_tty_and_is_absent_from_piped_cli(self):
         code = ('import sys; from termux_agent.cli import main; '
                 'sys.argv=["ta", "--no-session", "--no-agent"]; main()')

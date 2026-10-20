@@ -13,7 +13,7 @@ from .instructions import load_instructions
 
 from .agent import Agent
 from .config import Config
-from .sessions import SessionStore, new_id, snapshot, restore
+from .sessions import SessionStore, new_id, snapshot, restore, validate_title
 from .skills import SkillRegistry
 from .api_profiles import ProfileStore
 from .terminal_ui import Columns, Completer, COMMANDS
@@ -44,7 +44,9 @@ Tab             Complete command, API, session and Skill names
 /paste         Show Android clipboard text
 !command       Run Shell directly (approval still applies)
 /sessions [N]   List saved sessions (default 50, max 500)
-/session        Show ID; new, load ID, rename NAME, delete ID, fork, save
+/sessions find TEXT  Find saved sessions by title
+/title [NAME]   Show or change the current session title
+/session        Show ID/title; new, load ID, rename NAME, rename-id ID NAME, delete ID, fork, save
 /history [N] [skip]  Show recent messages; skip to page backward
 /sub TASK       Run one bounded sub-agent; /sub shows limits
 /exit           Save and exit
@@ -336,6 +338,19 @@ def main():
             display(f"Error: {exc}")
         return False
 
+    def current_title():
+        try:
+            title = store.title(session_id) if store and revision else None
+        except sqlite3.Error:
+            return '[unavailable]'
+        return ' '.join(str(title).split()) if title else 'New session'
+
+    def rename_current(value):
+        title = validate_title(value)
+        save_current(force=True)
+        store.rename(session_id, title)
+        display(f"{session_id} · {title}", "Session")
+
     def switch_api(name, persist=False):
         nonlocal config, agent, session_id, revision
         candidate = Config.load(config_path, name)
@@ -390,7 +405,8 @@ def main():
             try:
                 if formatter.enabled and sys.stdin.isatty():
                     session_label = session_id + (" (memory)" if store is None else "")
-                    display(f"Session={session_label} | Model={config.model} | Cwd={directory}", "Status")
+                    display(f"Session={session_label} | Model={config.model} | Cwd={directory}\n"
+                            f"Title={current_title()}", "Status")
                 prompt = read_prompt(formatter.prompt(), formatter.continuation()).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
@@ -663,12 +679,45 @@ def main():
                             display(f"Session save failed: {exc}")
                     else:
                         display("Shell command denied or approval unavailable.")
+            elif prompt == "/title" or prompt.startswith("/title "):
+                if not store:
+                    display("Persistence disabled by --no-session.")
+                    continue
+                try:
+                    value = prompt[6:].strip()
+                    if value:
+                        rename_current(value)
+                    else:
+                        display(f"{session_id} · {current_title()}", "Session")
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    display(f"Error: {exc}")
             elif prompt == "/sessions" or prompt.startswith("/sessions "):
                 try:
-                    limit = int(prompt[9:].strip() or 50)
+                    value = prompt[9:].strip()
+                    query = None
+                    if value == "find" or value.startswith("find "):
+                        if not value[4:].strip():
+                            raise ValueError("Use /sessions find TEXT")
+                        query = validate_title(value[4:].strip())
+                        limit = 50
+                    else:
+                        limit = int(value or 50)
                     if not 1 <= limit <= 500:
                         raise ValueError("Session count must be 1–500")
-                    display(store.listing(limit) if store else "Persistence disabled by --no-session.")
+                    if not store:
+                        display("Persistence disabled by --no-session.")
+                        continue
+                    rows = store.listing(limit, query=query) if query is not None else store.listing(limit)
+                    if not formatter.enabled:
+                        display(rows)
+                    else:
+                        display(f"{len(rows)} saved sessions" + (f" · title contains {query}" if query else ''), 'Sessions')
+                        for row in rows:
+                            marker = '*' if row['id'] == session_id else ' '
+                            title = ' '.join(str(row['title']).split()) or 'New session'
+                            display(f"{marker} {row['id']} · {title}\n"
+                                    f"{row['updated']} · {row['api']} / {row['model']}\n"
+                                    f"{row['directory']}", 'Session')
                 except (ValueError, sqlite3.Error) as exc:
                     display(f"Error: {exc}")
             elif prompt == "/history" or prompt.startswith("/history "):
@@ -694,7 +743,7 @@ def main():
                 command, _, value = prompt[8:].strip().partition(" ")
                 try:
                     if not command:
-                        display({"id": session_id, "saved": bool(revision)})
+                        display({"id": session_id, "title": current_title(), "saved": bool(revision)})
                     elif command in ("new", "fork"):
                         if command == "new":
                             save_current()
@@ -705,14 +754,21 @@ def main():
                         save_current(force=True)
                         if value:
                             store.rename(session_id, value)
-                        display({"id": session_id})
+                        display({"id": session_id, "title": current_title()})
                     elif command == "load":
                         if value != session_id:
                             load_session(value)
-                        display({"id": session_id, "api": config.api_profile, "directory": str(directory)})
+                        display({"id": session_id, "title": current_title(), "api": config.api_profile, "directory": str(directory)})
                     elif command == "rename":
-                        save_current(force=True)
-                        store.rename(session_id, value)
+                        rename_current(value)
+                    elif command == "rename-id":
+                        target, _, title = value.partition(' ')
+                        title = validate_title(title)
+                        if target == session_id:
+                            rename_current(title)
+                        else:
+                            store.rename(target, title)
+                            display(f"{target} · {title}", 'Session')
                     elif command == "save":
                         save_current(force=True)
                         display({"id": session_id, "saved": True})
@@ -730,7 +786,7 @@ def main():
                         else:
                             display("Deletion cancelled; use --yes for explicit noninteractive deletion.")
                     else:
-                        display("Use /session new|fork|load ID|rename NAME|delete ID|save")
+                        display("Use /session new|fork|load ID|rename NAME|rename-id ID NAME|delete ID|save")
                 except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
                     display(f"Error: {exc}")
             elif prompt.startswith("/"):

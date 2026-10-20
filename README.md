@@ -217,15 +217,33 @@ SQLite is part of the Python standard library; no new dependency or service.
 | Command | Behavior |
 |---|---|
 | `/sessions [N]` | List up to N recent sessions (default 50, max 500) |
-| `/session` | Show current session ID and saved status |
+| `/sessions find TEXT` | Find up to 50 saved sessions by title substring |
+| `/title [NAME]` | Show or change the current session title |
+| `/session` | Show current session ID, title and saved status |
 | `/session new [title]` | Save current session, create a blank one |
 | `/session load ID` | Save current and restore the specified session |
 | `ta --session ID` | Resume a session after restarting ta |
 | `/session rename title` | Rename current session |
+| `/session rename-id ID title` | Rename another session without loading/switching to it |
 | `/session fork [title]` | Copy current conversation/statistics into a separate session |
 | `/session save` | Explicitly save current state |
 | `/session delete ID` | Confirm and delete an inactive session |
 | `/history [N] [skip]` | View last N messages, skipping recent messages to page backward |
+
+For example, `/title 稿件校对` names the current session and `/sessions find 校对`
+finds it later. Titles are trimmed, single-line strings of 1–120 characters;
+names need not be unique, and loading still uses the session ID. You can name an
+empty session before its first prompt. The name survives saving, restarting and
+restoring; later conversation saves do not replace it with the first prompt.
+These commands make no model requests and do not add title/search text to model
+context. They require session persistence; `--no-session` disables them.
+
+The status area shows the current title and refreshes after renaming or switching
+sessions. Interactive `/sessions` output presents IDs/titles and API/directory
+metadata in wrapped rows; `*` marks the active session. Piped output retains JSON.
+Search is literal (including `%` and `_`) and ASCII case-insensitive. Renaming an
+inactive session only updates its title, without changing its payload, revision,
+last-message timestamp or the active conversation.
 
 Use exact 12-character IDs from `/sessions`. For noninteractive deletion, append
 `--yes`. Active-session deletion is refused; first switch away. History defaults

@@ -18,6 +18,16 @@ def new_id():
     return uuid.uuid4().hex[:12]
 
 
+def validate_title(title):
+    if not isinstance(title, str):
+        raise ValueError('Title must contain 1–120 characters on one line')
+    title = title.strip()
+    if (not title or len(title) > 120 or
+            any(ord(c) < 32 or 127 <= ord(c) <= 159 or c in '\u2028\u2029' for c in title)):
+        raise ValueError('Title must contain 1–120 characters on one line')
+    return title
+
+
 def validate_messages(messages):
     if not isinstance(messages, list) or not messages or not isinstance(messages[0], dict) or messages[0].get('role') != 'system':
         raise ValueError('Invalid session messages')
@@ -136,7 +146,8 @@ class SessionStore:
             raise ValueError('Session exceeds 20 MiB; start a new session')
         with self.db:
             if revision == 0:
-                title = next((m.get('content', '')[:60] for m in payload['messages'] if m['role'] == 'user'), 'New session')
+                first = next((m.get('content', '') for m in payload['messages'] if m['role'] == 'user'), '')
+                title = (' '.join(first.split())[:60] if isinstance(first, str) else '') or 'New session'
                 self.db.execute('INSERT INTO sessions VALUES (?,?,?,?,?)', (identifier, title, time.time(), 1, text))
             else:
                 result = self.db.execute('UPDATE sessions SET payload=?,updated=?,revision=revision+1 WHERE id=? AND revision=?',
@@ -152,8 +163,15 @@ class SessionStore:
             raise ValueError('Session not found')
         return row[0], json.loads(row[1])
 
-    def listing(self, limit=50):
-        rows = self.db.execute('SELECT id,title,updated,revision,payload FROM sessions ORDER BY updated DESC LIMIT ?', (limit,))
+    def listing(self, limit=50, query=None):
+        sql = 'SELECT id,title,updated,revision,payload FROM sessions'
+        params = []
+        if query is not None:
+            query = validate_title(query)
+            sql += " WHERE instr(lower(coalesce(title,'')),lower(?)) > 0"
+            params.append(query)
+        sql += ' ORDER BY updated DESC LIMIT ?'
+        rows = self.db.execute(sql, (*params, limit))
         result = []
         for identifier, title, updated, revision, text in rows:
             payload = json.loads(text)
@@ -168,11 +186,16 @@ class SessionStore:
 
     def rename(self, identifier, title):
         self.check_id(identifier)
-        if not title.strip() or len(title) > 120:
-            raise ValueError('Title must contain 1–120 characters')
+        title = validate_title(title)
         with self.db:
             if self.db.execute('UPDATE sessions SET title=? WHERE id=?', (title, identifier)).rowcount != 1:
                 raise ValueError('Session not found')
+        return title
+
+    def title(self, identifier):
+        self.check_id(identifier)
+        row = self.db.execute('SELECT title FROM sessions WHERE id=?', (identifier,)).fetchone()
+        return row[0] if row is not None else None
 
     def delete(self, identifier):
         self.check_id(identifier)
