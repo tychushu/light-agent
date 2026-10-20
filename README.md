@@ -240,9 +240,11 @@ context. They require session persistence; `--no-session` disables them.
 
 The status area shows the current title and refreshes after renaming or switching
 sessions. Interactive `/sessions` and title-search output use one table row per
-session: last activity time, full ID, title, API profile name, working directory.
+session: last activity time, full ID, title, API profile / model ID, working directory.
 `*` marks the active ID. Columns adapt to terminal width with CJK-aware alignment;
-long fields use ellipses and home paths use `~`. The API/path columns keep their
+long fields use ellipses and home paths use `~`. The API/model column receives
+more space to show model identifiers (for example `cloud / deepseek-v4-flash`).
+The API/model and path columns keep their
 beginning and end when clipped. Time is minute precision, with the year/date
 shortened in narrower terminals. Extremely narrow terminals may still wrap to
 preserve full IDs. Piped output retains the original full JSON metadata.
@@ -427,7 +429,9 @@ Press Tab to cycle slash commands. Completion also offers `/api` profile names,
 `/session load` and `delete` IDs, and local Markdown files for `/agent`.
 `/skill load` and `info` offer Hermes Skill names only when that particular
 argument is being completed. Startup and ordinary chat input do not scan Skills.
-Use `/help` to see all commands. Readline history and Backspace/Delete bindings
+Use `/help` to see all commands with Simplified Chinese explanations; `ta --help`
+also provides Chinese descriptions of startup options. Command names and parameter
+syntax remain unchanged. Readline history and Backspace/Delete bindings
 continue to work in SecureCRT.
 
 Interactive messages and the input prompt show the device's local display time

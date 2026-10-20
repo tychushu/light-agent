@@ -22,34 +22,42 @@ from .display_privacy import WRITE_TOOLS, hide_write_payloads, safe_tool_argumen
 from .approval import reason as approval_reason
 from .history import history_entry
 
-HELP = """/help           Show commands
-Tab             Complete command, API, session and Skill names
-~/path or /path  Tab completes local files; Enter submits UTF-8 text
-/clear          Start fresh; keep previous session in history
-/stats          Server token usage and context sizes
-/config         Show effective configuration, without credentials
-/debug          Toggle request usage and tool result diagnostics
-/debug-context  Show last request messages and tools, with key redacted
-/silent [on|off]  Hide/show write and edit payloads in tool logs
-/auto [on|off|steps N]  Automatic task mode and request limit
-/run TASK        Run an authorized task through to completion
-/api [name|number|next]  List or switch API (new conversation)
-/api add NAME URL MODEL [KEY_ENV] [local|cloud]  Add a profile
-/api default NAME   Use this profile on future launches
-/api show NAME      View profile without credentials
-/api remove NAME    Remove a profile added with /api add
-/agent [path|off|directory|reload]  Session instructions (new conversation)
-/skill list|info|load|unload|clear   Explicit Hermes Skill control
-/copy [text]   Copy text/last answer to Android clipboard
-/paste         Show Android clipboard text
-!command       Run Shell directly (approval still applies)
-/sessions [N]   List saved sessions (default 50, max 500)
-/sessions find TEXT  Find saved sessions by title
-/title [NAME]   Show or change the current session title
-/session        Show ID/title; new, load ID, rename NAME, rename-id ID NAME, delete ID, fork, save
-/history [N] [skip]  Show recent messages; skip to page backward
-/sub TASK       Run one bounded sub-agent; /sub shows limits
-/exit           Save and exit
+HELP = """/help           显示命令帮助（Show commands）
+Tab             补全命令、API 配置、会话 ID 和技能名称
+~/path 或 /path  补全本地路径；回车将 UTF-8 文本文件内容提交给模型
+/clear          新建空白会话，保留原会话历史
+/stats          查看模型调用、服务端 token 用量和上下文大小
+/config         查看当前生效配置，不显示密钥
+/debug          开关请求用量和工具结果的调试显示
+/debug-context  查看上次请求的消息和工具，密钥会脱敏
+/silent [on|off]  开关写入、编辑和委派参数的静默显示
+/auto [on|off|steps N]  开关自动连续执行，或设置模型调用上限
+/run TASK       连续执行已授权任务，直到完成、阻塞或达到上限
+/api [name|number|next]  列出或切换 API 配置；切换后新建会话
+/api add NAME URL MODEL [KEY_ENV] [local|cloud]  添加 API 配置
+/api default NAME   设置以后启动时默认使用的 API 配置
+/api show NAME      查看指定 API 配置，不显示密钥
+/api remove NAME    删除通过 /api add 添加的 API 配置
+/agent [path|off|directory|reload]  选择或重载目录/会话 agent.md；新建会话
+/skill list|info|load|unload|clear   列出、查看、手动加载、卸载或清空技能
+/copy [text]    复制指定文字或最后一次回答到 Android 剪贴板
+/paste          显示 Android 剪贴板文字
+!command        直接运行 Shell，不调用模型；审批规则仍生效
+/sessions [N]   列出会话：时间、ID、标题、API / 模型、路径；默认 50，最多 500
+/sessions find TEXT  按标题关键词查找已保存会话
+/title [NAME]   查看或修改当前会话标题，无需调用模型
+/session        查看当前会话 ID、标题和保存状态
+/session new [NAME]  新建空白会话，可指定标题
+/session load ID     保存当前会话，再恢复指定会话
+/session rename NAME  修改当前会话标题
+/session rename-id ID NAME  修改其他会话标题，不切换会话
+/session fork [NAME]  将当前对话复制为独立会话，可指定标题
+/session save        保存当前会话
+/session delete ID   删除非当前会话，需要确认
+/history [N] [skip]  查看最近 N 条消息，skip 可向前翻页
+/sub TASK       直接委派一个子任务；/sub 查看执行上限
+/exit           保存当前会话并退出
+KEY_ENV 是密钥环境变量名；NAME / ID / TEXT 等是需要替换的参数。
 """
 
 
@@ -155,15 +163,15 @@ def read_prompt(prompt="ta> ", continuation="... "):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Minimal native Termux LLM agent")
-    parser.add_argument("--config", help="TOML configuration path")
-    parser.add_argument("--prompt", help="Run one prompt and exit")
-    parser.add_argument("--api", help="Named API profile from config")
-    parser.add_argument("--directory", default=None, help="Working directory; loads only its agent.md")
-    parser.add_argument("--agent", help="Explicit session instruction file; replaces directory agent.md")
-    parser.add_argument("--no-agent", action="store_true", help="Disable instruction files")
-    parser.add_argument("--session", help="Resume saved session ID")
-    parser.add_argument("--no-session", action="store_true", help="Keep this run in memory only")
+    parser = argparse.ArgumentParser(description="轻量原生 Termux LLM Agent；交互命令帮助见 /help")
+    parser.add_argument("--config", help="指定 TOML 配置文件路径")
+    parser.add_argument("--prompt", help="执行一条提示词后退出")
+    parser.add_argument("--api", help="选择配置中的 API 名称")
+    parser.add_argument("--directory", default=None, help="设置工作目录，仅加载该目录的 agent.md")
+    parser.add_argument("--agent", help="指定会话指令文件，替代目录 agent.md")
+    parser.add_argument("--no-agent", action="store_true", help="不加载 agent.md 指令文件")
+    parser.add_argument("--session", help="按 ID 恢复已保存会话及其作用域")
+    parser.add_argument("--no-session", action="store_true", help="仅在内存中运行，不保存会话")
     options = parser.parse_args()
     if options.prompt is None and not configure_readline(
             Path.home() / ".local/share/termux-agent/repl_history"):

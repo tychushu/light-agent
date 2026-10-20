@@ -102,6 +102,7 @@ class TerminalTests(unittest.TestCase):
                                    (prompt, b'!printf BANG_DIRECT\n'),
                                    (prompt, b'/exitX\x1b[D\x1b[3~\n')])
         self.assertIn('Show commands', text)
+        self.assertIn('显示命令帮助', text)
         self.assertIn('BANG_DIRECT', text)
         self.assertNotIn('Unknown command', text)
         self.assertNotIn('LLM 请求失败', text)

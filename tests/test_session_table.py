@@ -3,6 +3,7 @@ import copy
 import io
 import unicodedata
 import unittest
+from unittest.mock import patch
 
 from termux_agent.terminal_ui import Columns, _table_cell, session_table
 
@@ -15,7 +16,8 @@ def cells(text):
 class SessionTableTests(unittest.TestCase):
     def row(self, **overrides):
         return dict({'id': 'abcdef123456', 'updated': '2026-10-20 16:56:23',
-                     'title': '稿件校对', 'api': 'cloud', 'directory': '/home/me/work/project'}, **overrides)
+                     'title': '稿件校对', 'api': 'cloud', 'model': 'deepseek-v4-flash',
+                     'directory': '/home/me/work/project'}, **overrides)
 
     def test_one_line_per_session_with_requested_field_order(self):
         lines = session_table([self.row()], 120, 'abcdef123456', '/home/me')
@@ -31,6 +33,7 @@ class SessionTableTests(unittest.TestCase):
         self.assertLess(line.index('abcdef123456'), line.index('稿件校对'))
         self.assertLess(line.index('稿件校对'), line.index('cloud'))
         self.assertLess(line.index('cloud'), line.index('~/work/project'))
+        self.assertIn('cloud / deepseek-v4-flash', line)
 
     def test_long_chinese_titles_profiles_and_paths_fit_without_changing_data(self):
         rows = [self.row(title='很长的中文标题' * 20, api='cloud-provider-long-name',
@@ -48,10 +51,10 @@ class SessionTableTests(unittest.TestCase):
                 self.assertIn('123456abcdef', lines[2])
                 self.assertIn('…', lines[1])
         self.assertEqual(rows, before)
-        self.assertTrue(session_table(rows[:1], 80, home='/home/me')[1].endswith('report'))
+        self.assertTrue(session_table(rows[:1], 120, home='/home/me')[1].endswith('report'))
 
     def test_controls_are_escaped_and_secrets_redacted_before_sizing(self):
-        row = self.row(title='SECRET\ntext\x1b[31m', api='SECRET-cloud', directory='/home/me/SECRET/project')
+        row = self.row(title='SECRET\ntext\x1b[31m', api='SECRET-cloud', model='SECRET-model', directory='/home/me/SECRET/project')
         lines = session_table([row], 64, home='/home/me', redact=lambda s: s.replace('SECRET', '[REDACTED VALUE]'))
         for line in lines:
             self.assertNotIn('SECRET', line)
@@ -76,3 +79,35 @@ class SessionTableTests(unittest.TestCase):
         clipped = _table_cell('0123456789Café cafe\u0301', 7, middle=True)
         self.assertTrue(clipped.rstrip().endswith('e\u0301'))
         self.assertLessEqual(cells(clipped), 7)
+
+    def test_common_models_are_visible_at_80_columns_and_missing_model_is_supported(self):
+        rows = [self.row(), self.row(id='123456abcdef', api='mimo', model='mimo-v2.6-pro')]
+        lines = session_table(rows, 80, home='/home/me')
+        self.assertIn('API / 模型', lines[0])
+        self.assertIn('cloud / deepseek-v4-flash', lines[1])
+        self.assertIn('mimo / mimo-v2.6-pro', lines[2])
+        self.assertTrue(all(cells(line) <= 79 for line in lines))
+        line = session_table([self.row(model=None)], 80, home='/home/me')[1]
+        self.assertIn('cloud', line)
+        self.assertNotIn('None', line)
+
+    def test_help_includes_simplified_chinese_for_existing_command_syntax(self):
+        from termux_agent.cli import HELP
+        self.assertIn('显示命令帮助', HELP)
+        self.assertIn('API / 模型', HELP)
+        self.assertIn('无需调用模型', HELP)
+        for command in ('/sessions find TEXT', '/session rename-id ID NAME', '/title', '/sub', '/api'):
+            self.assertIn(command, HELP)
+
+    def test_command_line_help_has_chinese_option_descriptions_without_starting_agent(self):
+        from termux_agent import cli
+        out = io.StringIO()
+        with patch.object(cli.sys, 'argv', ['ta', '--help']), patch.object(cli.sys, 'stdout', out), \
+                patch.object(cli, 'Agent') as agent:
+            with self.assertRaises(SystemExit) as exited:
+                cli.main()
+        self.assertEqual(exited.exception.code, 0)
+        agent.assert_not_called()
+        self.assertIn('轻量原生 Termux', out.getvalue())
+        self.assertIn('TOML 配置文件路径', out.getvalue())
+        self.assertIn('--api', out.getvalue())
