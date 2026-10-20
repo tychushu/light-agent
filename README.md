@@ -240,7 +240,9 @@ context. They require session persistence; `--no-session` disables them.
 
 The status area shows the current title and refreshes after renaming or switching
 sessions. Interactive `/sessions` and title-search output use one table row per
-session: last activity time, full ID, title, API profile / model ID, working directory.
+session: last activity time, full ID, title, API profile / model ID, message count,
+working directory. The count includes all saved system, user, assistant and tool
+messages and is right-aligned; it is not a count of conversation turns.
 `*` marks the active ID. Columns adapt to terminal width with CJK-aware alignment;
 long fields use ellipses and home paths use `~`. The API/model column receives
 more space to show model identifiers (for example `cloud / deepseek-v4-flash`).

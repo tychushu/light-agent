@@ -17,7 +17,7 @@ class SessionTableTests(unittest.TestCase):
     def row(self, **overrides):
         return dict({'id': 'abcdef123456', 'updated': '2026-10-20 16:56:23',
                      'title': '稿件校对', 'api': 'cloud', 'model': 'deepseek-v4-flash',
-                     'directory': '/home/me/work/project'}, **overrides)
+                     'messages': 321, 'directory': '/home/me/work/project'}, **overrides)
 
     def test_one_line_per_session_with_requested_field_order(self):
         lines = session_table([self.row()], 120, 'abcdef123456', '/home/me')
@@ -25,18 +25,22 @@ class SessionTableTests(unittest.TestCase):
         self.assertIn('最后会话时间', lines[0])
         self.assertLess(lines[0].index('ID'), lines[0].index('title'))
         self.assertLess(lines[0].index('title'), lines[0].index('API'))
-        self.assertLess(lines[0].index('API'), lines[0].index('工作路径'))
+        self.assertLess(lines[0].index('API'), lines[0].index('消息数'))
+        self.assertLess(lines[0].index('消息数'), lines[0].index('工作路径'))
         line = lines[1]
         self.assertIn('2026-10-20 16:56', line)
         self.assertIn('*abcdef123456', line)
         self.assertLess(line.index('16:56'), line.index('abcdef123456'))
         self.assertLess(line.index('abcdef123456'), line.index('稿件校对'))
         self.assertLess(line.index('稿件校对'), line.index('cloud'))
-        self.assertLess(line.index('cloud'), line.index('~/work/project'))
+        self.assertLess(line.index('cloud'), line.index('321'))
+        self.assertLess(line.index('321'), line.index('~/work/project'))
         self.assertIn('cloud / deepseek-v4-flash', line)
+        self.assertEqual(cells(line[:line.index('321')]) + 3,
+                         cells(lines[0][:lines[0].index('消息数')]) + 6)
 
     def test_long_chinese_titles_profiles_and_paths_fit_without_changing_data(self):
-        rows = [self.row(title='很长的中文标题' * 20, api='cloud-provider-long-name',
+        rows = [self.row(title='很长的中文标题' * 20, api='cloud-provider-long-name', messages=1234567,
                          directory='/home/me/' + '深层目录/' * 20 + 'report'),
                 self.row(id='123456abcdef', api='mimo')]
         before = copy.deepcopy(rows)
@@ -49,6 +53,7 @@ class SessionTableTests(unittest.TestCase):
                     self.assertNotIn('\n', line)
                 self.assertIn('abcdef123456', lines[1])
                 self.assertIn('123456abcdef', lines[2])
+                self.assertIn('1234567', lines[1])
                 self.assertIn('…', lines[1])
         self.assertEqual(rows, before)
         self.assertTrue(session_table(rows[:1], 120, home='/home/me')[1].endswith('report'))
@@ -81,15 +86,17 @@ class SessionTableTests(unittest.TestCase):
         self.assertLessEqual(cells(clipped), 7)
 
     def test_common_models_are_visible_at_80_columns_and_missing_model_is_supported(self):
-        rows = [self.row(), self.row(id='123456abcdef', api='mimo', model='mimo-v2.6-pro')]
+        rows = [self.row(messages=0), self.row(id='123456abcdef', api='mimo', model='mimo-v2.6-pro')]
         lines = session_table(rows, 80, home='/home/me')
         self.assertIn('API / 模型', lines[0])
         self.assertIn('cloud / deepseek-v4-flash', lines[1])
+        self.assertRegex(lines[1], r'deepseek-v4-flash\s+0\s+')
         self.assertIn('mimo / mimo-v2.6-pro', lines[2])
         self.assertTrue(all(cells(line) <= 79 for line in lines))
-        line = session_table([self.row(model=None)], 80, home='/home/me')[1]
+        line = session_table([self.row(model=None, messages=None)], 80, home='/home/me')[1]
         self.assertIn('cloud', line)
         self.assertNotIn('None', line)
+        self.assertRegex(line, r'cloud\s+-\s+~/work/project$')
 
     def test_help_includes_simplified_chinese_for_existing_command_syntax(self):
         from termux_agent.cli import HELP

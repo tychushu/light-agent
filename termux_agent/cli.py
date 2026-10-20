@@ -43,7 +43,7 @@ Tab             补全命令、API 配置、会话 ID 和技能名称
 /copy [text]    复制指定文字或最后一次回答到 Android 剪贴板
 /paste          显示 Android 剪贴板文字
 !command        直接运行 Shell，不调用模型；审批规则仍生效
-/sessions [N]   列出会话：时间、ID、标题、API / 模型、路径；默认 50，最多 500
+/sessions [N]   列出会话：时间、ID、标题、API / 模型、消息数、路径；默认 50，最多 500
 /sessions find TEXT  按标题关键词查找已保存会话
 /title [NAME]   查看或修改当前会话标题，无需调用模型
 /session        查看当前会话 ID、标题和保存状态

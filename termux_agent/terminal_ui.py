@@ -73,31 +73,43 @@ def session_table(rows, width, current_id='', home='', redact=None):
 
     rows = list(rows)
     api_values = []
+    count_values = []
     for row in rows:
         profile = str(row.get('api') or '-')
         model = row.get('model') or ''
         api_values.append(clean(profile + (' / ' + str(model) if model else '')))
+        count = row.get('messages')
+        count_values.append(clean('-' if count is None else count))
     budget = max(28, int(width) - 1)  # Reserve the final column against auto-wrap.
     separator = '  ' if budget >= 79 else ' '
+    count_width = max([6 if budget >= 63 else 2, *(_cell_width(value) for value in count_values)])
+    budget = max(budget, 13 + count_width + 5 * len(separator) + 4)
     time_width = 16 if budget >= 99 else (12 if budget >= 47 else 5)
-    remaining = budget - time_width - 13 - 4 * len(separator)
+    time_width = min(time_width, budget - 13 - count_width - 5 * len(separator) - 3)
+    remaining = budget - time_width - 13 - count_width - 5 * len(separator)
     desired_api = max([10, *(_cell_width(value) for value in api_values)])
-    api_width = min(desired_api, 48, remaining - 2, max(3, remaining * 3 // 5))
+    api_width = min(desired_api, 48, remaining - 2, max(3, remaining * 2 // 3))
     title_width = min(32, max(1, (remaining - api_width) // 2))
     path_width = remaining - api_width - title_width
-    widths = (time_width, 13, title_width, api_width, path_width)
+    widths = (time_width, 13, title_width, api_width, count_width, path_width)
     headers = ('最后会话时间' if time_width >= 12 else '时间', 'ID',
                'title' if title_width >= 5 else 'T',
                'API / 模型' if api_width >= 10 else ('API/模型' if api_width >= 8 else 'API'),
+               '消息数' if count_width >= 6 else '数',
                '工作路径' if path_width >= 8 else ('路径' if path_width >= 4 else 'P'))
 
     def render(values):
-        return separator.join(_table_cell(value, size, middle=index in (3, 4), pad=index < 4)
-                              for index, (value, size) in enumerate(zip(values, widths))).rstrip()
+        cells = []
+        for index, (value, size) in enumerate(zip(values, widths)):
+            cell = _table_cell(value, size, middle=index in (3, 5), pad=index < 4)
+            if index == 4:
+                cell = ' ' * max(0, size - _cell_width(cell)) + cell
+            cells.append(cell)
+        return separator.join(cells).rstrip()
 
     result = [render(headers)]
     home = str(home).rstrip('/')
-    for row, api in zip(rows, api_values):
+    for row, api, count in zip(rows, api_values, count_values):
         updated = clean(row.get('updated') or '-')
         if len(updated) >= 16 and updated[4:5] == '-':
             updated = updated[:16] if time_width == 16 else (updated[5:16] if time_width == 12 else updated[11:16])
@@ -107,7 +119,7 @@ def session_table(rows, width, current_id='', home='', redact=None):
         marker = '*' if row.get('id') == current_id else ' '
         result.append(render((updated, marker + clean(row.get('id') or '-'),
                               clean(row.get('title') or 'New session'),
-                              api, clean(directory))))
+                              api, count, clean(directory))))
     return result
 
 
