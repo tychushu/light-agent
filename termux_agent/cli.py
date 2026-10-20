@@ -712,12 +712,7 @@ def main():
                         display(rows)
                     else:
                         display(f"{len(rows)} saved sessions" + (f" · title contains {query}" if query else ''), 'Sessions')
-                        for row in rows:
-                            marker = '*' if row['id'] == session_id else ' '
-                            title = ' '.join(str(row['title']).split()) or 'New session'
-                            display(f"{marker} {row['id']} · {title}\n"
-                                    f"{row['updated']} · {row['api']} / {row['model']}\n"
-                                    f"{row['directory']}", 'Session')
+                        formatter.sessions(rows, session_id, Path.home(), redact)
                 except (ValueError, sqlite3.Error) as exc:
                     display(f"Error: {exc}")
             elif prompt == "/history" or prompt.startswith("/history "):

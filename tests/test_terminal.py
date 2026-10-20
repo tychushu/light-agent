@@ -231,7 +231,13 @@ cli.main()
         self.assertGreaterEqual(text.count('Title=稿件审阅'), 2, text)
         self.assertIn('Title=第二会话', text)
         self.assertIn('1 saved sessions', text)
-        self.assertIn('* 111111111111 · 稿件审阅', text)
+        table_rows = [line for line in text.splitlines() if '*111111111111' in line]
+        self.assertEqual(len(table_rows), 1, text)
+        row = table_rows[0]
+        self.assertLess(row.index('111111111111'), row.index('稿件审阅'))
+        self.assertLess(row.index('稿件审阅'), row.index('default'))
+        self.assertLess(row.index('default'), row.index('~'))
+        self.assertLessEqual(len(row), 100)
         self.assertNotIn('LLM 请求失败', text)
         self.assertNotIn('Unknown command', text)
 

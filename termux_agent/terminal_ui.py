@@ -29,6 +29,80 @@ def _cells(char: str) -> int:
     return 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
 
 
+def _cell_width(text):
+    return sum(_cells(char) for char in text)
+
+
+def _take_cells(text, budget, tail=False):
+    groups = []
+    for char in text:
+        if unicodedata.combining(char):
+            if groups:
+                groups[-1] += char
+        else:
+            groups.append(char)
+    result, used = [], 0
+    for group in reversed(groups) if tail else groups:
+        cells = _cell_width(group)
+        if used + cells > budget:
+            break
+        result.append(group)
+        used += cells
+    return ''.join(reversed(result) if tail else result)
+
+
+def _table_cell(text, width, middle=False, pad=True):
+    if _cell_width(text) > width:
+        if middle:
+            left = (width - 1) // 2
+            tail = _take_cells(text, width - 1 - left, tail=True)
+            text = _take_cells(text, left) + '…' + tail
+        else:
+            text = _take_cells(text, width - 1) + '…'
+    return text + ' ' * max(0, width - _cell_width(text)) if pad else text
+
+
+def session_table(rows, width, current_id='', home='', redact=None):
+    """One terminal row per session; keep IDs intact and fit the other cells."""
+    budget = max(28, int(width) - 1)  # Reserve the final column against auto-wrap.
+    separator = '  ' if budget >= 79 else ' '
+    time_width = 16 if budget >= 99 else (12 if budget >= 47 else 5)
+    remaining = budget - time_width - 13 - 4 * len(separator)
+    api_width = min(16, max(3, remaining // 5) if remaining >= 9 else max(1, remaining // 3))
+    title_width = min(32, max(1, (remaining - api_width) // 2))
+    path_width = remaining - api_width - title_width
+    widths = (time_width, 13, title_width, api_width, path_width)
+    headers = ('最后会话时间' if time_width >= 12 else '时间', 'ID',
+               'title' if title_width >= 5 else 'T', 'API' if api_width >= 3 else 'A',
+               '工作路径' if path_width >= 8 else ('路径' if path_width >= 4 else 'P'))
+
+    def clean(value):
+        text = str(value)
+        if redact:
+            text = redact(text)
+        text = ' '.join(text.split())
+        return ''.join(c if c.isprintable() else f'\\x{ord(c):02x}' for c in text)
+
+    def render(values):
+        return separator.join(_table_cell(value, size, middle=index in (3, 4), pad=index < 4)
+                              for index, (value, size) in enumerate(zip(values, widths))).rstrip()
+
+    result = [render(headers)]
+    home = str(home).rstrip('/')
+    for row in rows:
+        updated = clean(row.get('updated') or '-')
+        if len(updated) >= 16 and updated[4:5] == '-':
+            updated = updated[:16] if time_width == 16 else (updated[5:16] if time_width == 12 else updated[11:16])
+        directory = str(row.get('directory') or '-')
+        if home and (directory == home or directory.startswith(home + '/')):
+            directory = '~' + directory[len(home):]
+        marker = '*' if row.get('id') == current_id else ' '
+        result.append(render((updated, marker + clean(row.get('id') or '-'),
+                              clean(row.get('title') or 'New session'),
+                              clean(row.get('api') or '-'), clean(directory))))
+    return result
+
+
 class Columns:
     def __init__(self, out, enabled=True, width=None, clock=None):
         self.out = out
@@ -115,6 +189,14 @@ class Columns:
             return "ta> "
         label = "You: " if self.width() < 52 else "You     │ "
         return self.clock().strftime("%H:%M") + " " + label
+
+    def sessions(self, rows, current_id='', home='', redact=None):
+        self.finish()
+        # Use full terminal width; repeated message timestamps/roles consume
+        # space needed for session IDs, API names and working directories.
+        lines = session_table(rows, self.width(), current_id, home, redact)
+        self.out.write('\n'.join(lines) + '\n')
+        self.out.flush()
 
     def continuation(self):
         if not self.enabled:

@@ -239,8 +239,13 @@ These commands make no model requests and do not add title/search text to model
 context. They require session persistence; `--no-session` disables them.
 
 The status area shows the current title and refreshes after renaming or switching
-sessions. Interactive `/sessions` output presents IDs/titles and API/directory
-metadata in wrapped rows; `*` marks the active session. Piped output retains JSON.
+sessions. Interactive `/sessions` and title-search output use one table row per
+session: last activity time, full ID, title, API profile name, working directory.
+`*` marks the active ID. Columns adapt to terminal width with CJK-aware alignment;
+long fields use ellipses and home paths use `~`. The API/path columns keep their
+beginning and end when clipped. Time is minute precision, with the year/date
+shortened in narrower terminals. Extremely narrow terminals may still wrap to
+preserve full IDs. Piped output retains the original full JSON metadata.
 Search is literal (including `%` and `_`) and ASCII case-insensitive. Renaming an
 inactive session only updates its title, without changing its payload, revision,
 last-message timestamp or the active conversation.
