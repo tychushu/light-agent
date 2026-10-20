@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+import uuid
 from typing import Any, Callable
 
 from .client import Client
-from .tools import TOOLS, execute
+from .tools import TOOLS, DELEGATE_TOOL, execute
 
 from .approval import needs_approval
 from .instructions import load_system_prompt, load_prompt_file
@@ -17,7 +19,7 @@ from .continuation import TASK_MARKERS, provider_blocked, task_status
 class Agent:
     def __init__(self, config: Any, approve: Callable[[str, dict[str, Any]], bool] | None = None,
                  event: Callable[[str, dict[str, Any]], None] | None = None, client: Any | None = None, instructions: str = "",
-                 base_system: str | None = None):
+                 base_system: str | None = None, *, allow_delegation: bool = True):
         self.config = config
         self.config.validate()
         self.approve = approve
@@ -25,6 +27,12 @@ class Agent:
         self.base_system = base_system if base_system is not None else (
             load_system_prompt() + ("\n\n" + instructions if instructions else ""))
         self.client = client or Client(config)
+        self._allow_delegation = allow_delegation
+        self.tools = TOOLS + ([DELEGATE_TOOL] if allow_delegation and config.max_subagents else [])
+        self._subagents_this_run = 0
+        self._subagent_calls_total = 0
+        self._subagent_api_calls_total = 0
+        self._subagent_tool_calls_total = 0
         self.active_skills: dict[str, str] = {}
         self.system = self.base_system
         self._direct_shell_count = 0
@@ -108,6 +116,7 @@ class Agent:
         nudge = load_prompt_file("task_continue.txt") if automatic else ""
         self._last_auto_prompt_chars = len(rules) + 2 if rules else 0
         self._approval_denied = False
+        self._subagents_this_run = 0
         self.last_run = {"status": "running", "auto": automatic, "continuations": 0}
         pauses = 0
         if hasattr(self.client, "set_control_markers"):
@@ -126,7 +135,7 @@ class Agent:
                 request_messages = [{"role": "system", "content": self.system + "\n\n" + rules},
                                     *self.messages[1:]]
             try:
-                answer = self.client.chat(request_messages, TOOLS)
+                answer = self.client.chat(request_messages, self.tools)
             except KeyboardInterrupt:
                 self._usage_history.append(None)
                 self._request_history_chars.append(self._history_chars(request_messages))
@@ -248,7 +257,8 @@ class Agent:
             else:
                 self._emit("tool_start", {"name": name, "arguments": args})
                 try:
-                    result = execute(name, args or {}, self.config.max_output_chars)
+                    result = (self._delegate(args or {}) if name == "delegate" else
+                              execute(name, args or {}, self.config.max_output_chars))
                 except KeyboardInterrupt:
                     interrupted = True
                     result = {"error": "tool execution interrupted"}
@@ -258,6 +268,74 @@ class Agent:
             self.messages.append({"role": "tool", "tool_call_id": call_id,
                                   "content": json.dumps(result, ensure_ascii=False, separators=(",", ":"))})
         return interrupted
+
+    def _delegate(self, args):
+        if not self._allow_delegation or not self.config.max_subagents:
+            return {"error": "sub-agent delegation is disabled"}
+        if set(args) - {"task", "max_steps"}:
+            return {"error": "delegate accepts only task and max_steps"}
+        task = args.get("task")
+        if not isinstance(task, str) or not task.strip() or len(task) > 16000:
+            return {"error": "task must contain 1–16000 characters"}
+        requested = args.get("max_steps", self.config.subagent_max_steps)
+        if not isinstance(requested, int) or isinstance(requested, bool) or not 1 <= requested <= 12:
+            return {"error": "max_steps must be between 1 and 12"}
+        if self._subagents_this_run >= self.config.max_subagents:
+            return {"error": "sub-agent limit reached for this task"}
+        self._subagents_this_run += 1
+        self._subagent_calls_total += 1
+        identifier = f"sub-{self._subagent_calls_total}"
+        child_config = replace(self.config, auto_continue=False,
+                               max_steps=min(requested, self.config.subagent_max_steps, self.config.max_steps))
+        base = self.base_system + "\n\n" + load_prompt_file("subagent_prompt.txt")
+        child_client = Client(child_config)
+        child_client.on_retry = lambda info: self._emit("subagent_retry", {**info, "id": identifier})
+        child = None
+        status = "error"
+        self._emit("subagent_start", {"id": identifier, "model": child_config.model,
+                                      "max_steps": child_config.max_steps})
+        try:
+            child = Agent(child_config, approve=self.approve, client=child_client,
+                          event=lambda kind, payload: self._emit(kind, {**payload, "subagent": identifier}),
+                          base_system=base, allow_delegation=False)
+            summary = child.run(task, auto_continue=False)
+            status = child.last_run["status"]
+            if child._approval_denied:
+                self._approval_denied = True
+                status = "blocked"
+            if status == "interrupted":
+                raise KeyboardInterrupt
+            cap = min(4000, self.config.max_output_chars)
+            truncated = len(summary) > cap
+            return {"id": identifier, "status": status,
+                    "summary": summary[:cap] + ("\n[TRUNCATED]" if truncated else ""),
+                    "api_calls": child._total_calls, "tool_calls": child._tool_calls_total,
+                    "usage": child.stats()["usage_totals"]}
+        finally:
+            if child is not None:
+                self._subagent_api_calls_total += child._total_calls
+                self._subagent_tool_calls_total += child._tool_calls_total
+            child_client.close()
+            self._emit("subagent_end", {"id": identifier, "status": status})
+
+    def delegate(self, task):
+        """Explicit /sub command; record a complete tool turn like model delegation."""
+        if not isinstance(task, str) or not task.strip() or len(task) > 16000:
+            raise ValueError("task must contain 1–16000 characters")
+        self._subagents_this_run = 0
+        self._approval_denied = False
+        self._conversation_count += 1
+        self.messages.append({"role": "user", "content": "/sub " + task})
+        calls = [{"id": "delegate_" + uuid.uuid4().hex[:12], "type": "function",
+                  "function": {"name": "delegate", "arguments": json.dumps({"task": task}, ensure_ascii=False)}}]
+        self.messages.append({"role": "assistant", "content": "", "tool_calls": calls})
+        interrupted = self._fill_tool_results(calls)
+        result = json.loads(self.messages[-1]["content"])
+        status = "interrupted" if interrupted else result.get("status", "blocked" if self._approval_denied else "error")
+        summary = result.get("summary", result.get("error", ""))
+        self.messages.append({"role": "assistant", "content": f"[{status}] {summary}"})
+        self.last_run = {"status": status, "auto": False, "continuations": 0}
+        return result
 
     def clear(self) -> None:
         self.messages[:] = [{"role": "system", "content": self.system}]
@@ -275,6 +353,9 @@ class Agent:
                 "http_attempts_last": getattr(self.client, "last_attempts", 0),
                 "tool_calls_total": self._tool_calls_total,
                 "direct_shell_commands": self._direct_shell_count, "active_skills": list(self.active_skills),
+                "subagents": {"calls": self._subagent_calls_total,
+                              "api_calls": self._subagent_api_calls_total,
+                              "tool_calls": self._subagent_tool_calls_total},
                 "usage_totals": totals, "last_request_usage": last_usage,
                 "usage_history": list(self._usage_history), "usage_missing_requests": missing,
                 "conversation_count": self._conversation_count,
@@ -282,14 +363,14 @@ class Agent:
                 "system_chars": len(self.system) + self._last_auto_prompt_chars,
                 "auto_prompt_chars": self._last_auto_prompt_chars,
                 "auto_continue": self.config.auto_continue, "last_run": dict(self.last_run),
-                "tool_schema_chars": len(json.dumps(TOOLS, ensure_ascii=False, separators=(",", ":"))),
+                "tool_schema_chars": len(json.dumps(self.tools, ensure_ascii=False, separators=(",", ":"))),
                 "request_history_chars": list(self._request_history_chars),
                 "current_history_chars": self._history_chars()}
 
     def debug_context(self) -> dict[str, Any]:
         request = getattr(self.client, "last_request", None)
         if not isinstance(request, dict):
-            request = {"messages": self.messages, "tools": TOOLS}
+            request = {"messages": self.messages, "tools": self.tools}
         # A user might paste the configured key into a prompt; scrub it from debug.
         key = getattr(self.config, "api_key", "")
         def redact(value: Any) -> Any:

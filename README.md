@@ -1,7 +1,8 @@
 # Light Agent
 
 A thin native Termux ↔ OpenAI-compatible API adapter. Python >=3.11, one
-runtime dependency (`httpx`), four tools, local sessions, no framework or daemon.
+runtime dependency (`httpx`), four filesystem/shell tools plus optional sub-agent
+delegation, local sessions, no framework or daemon.
 
 ## Install
 
@@ -39,7 +40,10 @@ max_output_chars = 20000
 approval_policy = "on-risk"
 timeout = 120.0 # HTTP request timeout; shell defaults to 30 seconds
 # retry_wait_budget = 20.0 # total retry wait budget, 0..60 seconds
+# retry_max_attempts = 3 # total HTTP attempts including the first; 1..6
 # retry_thinking_400 = false # opt-in for the known structured-thinking 400 response
+# max_subagents = 3 # workers per parent task; 0 disables delegation
+# subagent_max_steps = 6 # model calls per worker; 1..12, capped by max_steps
 ```
 
 `ta --config path.toml` selects another config. `ta --prompt '执行 uname -a'` runs
@@ -67,7 +71,7 @@ verification is model behavior, not a mandatory filesystem policy.
 
 No services, Android settings, root configuration or startup scripts are changed.
 Completed turns are saved locally unless `--no-session` is used. Failed calls become tool results so the model
-can recover. SSE token/reasoning/tool-call deltas stream interactively. HTTP 500/502/503/504 and connect failures retry at most twice; partial streams are never replayed. The optional `retry_thinking_400` recovery policy is off by default; see the profile guidance below. It is a recovery measure for a known upstream response, not a root-cause fix.
+can recover. SSE token/reasoning/tool-call deltas stream interactively. Transient HTTP/network failures share a bounded retry policy (three total attempts by default); accepted responses and partial streams are never replayed. The optional `retry_thinking_400` recovery policy is off by default; see the profile guidance below.
 
 ## Test / uninstall
 
@@ -118,26 +122,32 @@ key. Switching saves the previous session, reloads TOML, starts fresh conversati
 currently selected instruction file. Unknown/invalid profiles leave the current
 session intact. Nothing is sent until your next prompt.
 
+All API profiles use bounded retry waits, exponential backoff with equal jitter,
+and `Retry-After`. `retry_max_attempts` defaults to 3 total attempts, accepts 1–6
+(1 disables retries), and can be overridden per API profile. `retry_wait_budget`
+defaults to 20 seconds and accepts 0–60; a zero budget allows only the initial
+attempt. Connect failures, pre-header disconnects (`ReadError`/`RemoteProtocolError`),
+HTTP 500/502/503/504, recognized temporary HTTP 429 rate limits, and enabled
+thinking recovery all share the same attempt and wait budgets.
+
+HTTP 429 retries require a structured error whose type is `rate_limit_error`,
+`rate_limit_exceeded`, `requests`, or `tokens`, and whose code is absent/null or
+one of the supported `*_rate_limit_exceeded` codes. Unknown, malformed, HTML,
+quota/billing and content-policy errors are not inferred to be temporary.
+
 The thinking-error recovery is disabled by default. Enable it only on the affected
 named profile with `retry_thinking_400 = true`; a top-level setting applies to
-`default` but never enables named profiles. For each logical model call,
-`retry_wait_budget` defaults to 20 seconds, accepts finite values from 0 through
-60, and can be overridden per profile. With the feature enabled, that call has
-at most three total HTTP attempts
-shared across connect failures, HTTP 500/502/503/504, and the narrowly matched
-structured HTTP 400 JSON error. Its type/code must match the known
+`default` but never enables named profiles. Only a narrowly matched structured
+HTTP 400 JSON error qualifies. Its type/code must match the known
 `invalid_request_error` shape (the observed code may be null), and its message
 must match the fixed thinking echo-back sentence, such as `The
 content[].thinking in the thinking mode must be passed back to the API` or the
 known `reasoning_content` variant, allowing only known request/trace ID suffixes.
-Other 400 responses and HTTP 401/402/403/405/429/501/505 are not retried.
-HTTP 500 (including an upstream `api_error` / service temporarily unavailable)
-retries automatically for every API profile, without an extra opt-in. Existing
-connect/500/502/503/504 classification and backoff stay in effect when the
-thinking-error feature is off.
+Other 400 responses and HTTP 401/402/403/405/501/505 are not retried. No API,
+model or credential is switched during recovery.
 
-When enabled, retries use equal-jitter delays in the 0.5-to-1.0 range of
-exponential backoff based on 1 then 2 seconds, capped at 8 seconds, and send an
+Retries use equal-jitter delays in the 0.5-to-1.0 range of
+exponential backoff based on 1, 2, 4 then 8 seconds, capped at 8 seconds, and send an
 equivalent copy of the request. If a valid `Retry-After` is longer than ordinary
 backoff and exceeds the remaining wait budget, retries stop; the client does not
 retry earlier. Before a response begins, retry waits and requests are bounded
@@ -146,8 +156,8 @@ successful SSE response starts, it is never replayed and already-run tools are
 not run again. The pre-response deadline uses a temporary Unix timer in the
 main CLI thread and restores its handler before successful body reading. It
 does not replace another active process alarm; callers outside a Unix main
-thread cannot enable this policy. `/stats` exposes `http_attempts_last` alongside
-logical API calls. Retry diagnostics use `Info api_retry` and report the attempt,
+thread cannot use the client. `/stats` exposes `http_attempts_last` alongside
+logical API calls. Compact `Retry` messages report the attempt,
 status, and delay without logging the provider body. This policy
 only helps recover from the identified upstream behavior; it does not fix its
 cause or guarantee equivalent behavior in every UI.
@@ -263,12 +273,46 @@ changed and no separate input-history file is written. Restart an already-runnin
 
 ## Additional mobile and skill workflows
 
+### Sub-agents
+
+`/sub TASK` directly runs one worker, for example `/sub inspect README.md and
+report documentation gaps; do not modify files`. `/sub` displays the current
+limits. The main model can also use the `delegate(task, max_steps?)` tool for
+self-contained subtasks; include needed facts in the assignment.
+
+Workers run synchronously, one at a time, in the same process and working
+directory. Each has a fresh HTTP client and independent conversation, using the
+current API/model/key, base system prompt, scoped agent.md instructions and
+approval policy. Parent conversations and active Skills are not copied. This is
+context isolation, not filesystem isolation. No framework, daemon or extra
+runtime dependency is added, and no worker starts until delegation is requested.
+
+Top-level `max_subagents = 3` limits workers per parent task (0 disables the
+tool); `subagent_max_steps = 6` limits each worker's logical model calls and is
+also capped by the parent's `max_steps`. Both are independent of HTTP retry
+attempts. Nested delegation and automatic continuation inside workers are
+disabled. Workers return status, a summary capped at 4000 characters, call
+counts and provider usage; their full conversations are not inserted into the
+parent. Parent history persists the assignment/result; `/stats` separately
+counts sub-agent calls, model calls and tool calls. Parent token totals cover
+parent requests; child results carry their own provider usage. Interruptions stop
+the parent task. HTTP retries never restart a worker or re-execute its tools;
+failed/blocked/limited worker statuses are returned to the parent.
+
+Tool approvals are checked inside workers as usual; `never` also applies to
+workers. Delegate task payloads are hidden from tool diagnostics when silent
+writes are enabled. Worker progress uses `Sub`/`SubTool` columns and retry
+messages carry the worker ID. The worker prompt is copied on first use to
+`~/.config/termux-agent/subagent_prompt.txt` and can be edited manually; existing
+prompt files are never overwritten. Restart an existing `ta` to load the new
+tool and commands.
+
 OpenAI-compatible API profiles stream Server-Sent Events by default. Content and
 reasoning deltas display as they arrive; split tool-call names and JSON arguments
 are reassembled before entering the agent loop. `data: null`, empty choices and
-`[DONE]` frames are ignored. Transient HTTP 500/502/503/504 or connect failures retry
-at most twice with the existing backoff when the thinking-error option is off;
-no retry replays a partially received response. See the profile guidance above
+`[DONE]` frames are ignored. Transient HTTP/network failures use the bounded
+retry policy described above, independently of the thinking-error option;
+no retry replays an accepted response or partially received stream. See the profile guidance above
 for the optional structured-thinking HTTP 400 recovery.
 Set `stream = false` in TOML for providers without SSE support. Usage is reported
 when the stream ends with a usage frame. Configure a larger profile timeout for

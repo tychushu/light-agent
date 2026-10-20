@@ -4,12 +4,15 @@ model = "Qwen3.8-27B-MTPLX-Speed"
 max_steps = 16
 auto_continue = false
 max_continuations = 3
+max_subagents = 3 # per parent task; 0 disables delegation
+subagent_max_steps = 6 # each child, capped by max_steps; no recursion
 max_output_chars = 20000
 max_input_file_chars = 64000
 approval_policy = "on-risk"
 silent_writes = true
 timeout = 120.0
 retry_wait_budget = 20.0
+retry_max_attempts = 3 # includes the initial request; 1–6, per-profile override allowed
 # Defaults to false; enable only for a profile confirmed to return the known error.
 # retry_thinking_400 = false
 stream = true # set false for APIs without SSE support

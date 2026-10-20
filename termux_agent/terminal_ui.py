@@ -10,7 +10,7 @@ import unicodedata
 COMMANDS = (
     "/help", "/clear", "/stats", "/config", "/debug", "/debug-context",
     "/api", "/agent", "/skill", "/copy", "/paste", "/sessions", "/session",
-    "/history", "/silent", "/auto", "/run", "/exit",
+    "/history", "/silent", "/auto", "/run", "/sub", "/exit",
 )
 SUBCOMMANDS = {
     "/api": ("list", "add", "switch", "show", "default", "remove", "next", "prev"),

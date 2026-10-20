@@ -147,9 +147,9 @@ class StreamingTests(unittest.TestCase):
             return httpx.Response(status)
         config = Config(stream=False)
         with httpx.Client(transport=httpx.MockTransport(respond)) as http:
-            client = Client(config, http_client=http, sleeper=sleeps.append)
+            client = Client(config, http_client=http, sleeper=sleeps.append, randomizer=lambda: 0.0)
             self.assertEqual(client.chat([], [])['content'], 'ok')
-        self.assertEqual(sleeps, [0.25, 0.5])
+        self.assertEqual(sleeps, [0.5, 1.0])
 
     def test_connect_error_retries_twice_but_does_not_retry_read_error(self):
         attempts, sleeps = [], []
@@ -160,10 +160,10 @@ class StreamingTests(unittest.TestCase):
             return httpx.Response(200, json={'choices': [{'message': {'content': 'ok'}}]})
         config = Config(stream=False)
         with httpx.Client(transport=httpx.MockTransport(connect_error)) as http:
-            client = Client(config, http_client=http, sleeper=sleeps.append)
+            client = Client(config, http_client=http, sleeper=sleeps.append, randomizer=lambda: 0.0)
             self.assertEqual(client.chat([], [])['content'], 'ok')
         self.assertEqual(len(attempts), 3)
-        self.assertEqual(sleeps, [0.25, 0.5])
+        self.assertEqual(sleeps, [0.5, 1.0])
 
         class BrokenStream(httpx.SyncByteStream):
             def __iter__(self):

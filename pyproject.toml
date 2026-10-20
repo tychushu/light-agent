@@ -16,4 +16,4 @@ ta = "termux_agent.cli:main"
 include = ["termux_agent*"]
 
 [tool.setuptools.package-data]
-termux_agent = ["system_prompt.txt", "task_prompt.txt", "task_continue.txt"]
+termux_agent = ["system_prompt.txt", "task_prompt.txt", "task_continue.txt", "subagent_prompt.txt"]

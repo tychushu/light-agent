@@ -21,6 +21,9 @@ class Config:
     timeout: float = 120.0
     retry_thinking_400: bool = False
     retry_wait_budget: float = 20.0
+    retry_max_attempts: int = 3
+    max_subagents: int = 3
+    subagent_max_steps: int = 6
     api_key: str = ""
     api_key_env: str = "TERMUX_AGENT_API_KEY"
     api_profile: str = "default"
@@ -44,7 +47,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -60,7 +63,7 @@ class Config:
             for required in ("base_url", "model"):
                 if required not in entry:
                     raise ValueError(f"API profile requires {required}")
-            for key in ("base_url", "model", "timeout", "retry_wait_budget", "user_agent", "stream"):
+            for key in ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "user_agent", "stream"):
                 if key in entry:
                     setattr(config, key, entry[key])
             # Retrying the known thinking-format error is opt-in per API profile.
@@ -83,6 +86,11 @@ class Config:
         return ["default", *ProfileStore(path).entries().keys()]
 
     def validate(self) -> None:
+        for key, low, high in (("retry_max_attempts", 1, 6), ("max_subagents", 0, 8),
+                               ("subagent_max_steps", 1, 12)):
+            value = getattr(self, key)
+            if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+                raise ValueError(f"{key} must be between {low} and {high}")
         if not isinstance(self.auto_continue, bool):
             raise ValueError("auto_continue must be a boolean")
         if (not isinstance(self.max_continuations, int) or isinstance(self.max_continuations, bool)

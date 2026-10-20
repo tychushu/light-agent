@@ -10,7 +10,8 @@ import uuid
 from .config import Config
 
 COUNTERS = ('_total_calls', '_tool_calls_total', '_usage_history',
-            '_request_history_chars', '_conversation_count', '_direct_shell_count')
+            '_request_history_chars', '_conversation_count', '_direct_shell_count',
+            '_subagent_calls_total', '_subagent_api_calls_total', '_subagent_tool_calls_total')
 
 
 def new_id():

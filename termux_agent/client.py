@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 import httpx
 from .continuation import MarkerFilter
-from .retry import (RetryDeadlineError, backoff, request_deadline,
+from .retry import (RetryDeadlineError, backoff, rate_limit_error, request_deadline,
                     retry_after, thinking_echo_error)
 
 
@@ -20,7 +20,9 @@ class ClientError(RuntimeError):
 
 class Client:
     RETRYABLE_STATUS = {500, 502, 503, 504}
-    RETRYABLE_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+    # Only used while sending/receiving headers, never during successful body reads.
+    RETRYABLE_ERRORS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
+                        httpx.ReadError, httpx.RemoteProtocolError)
 
     def __init__(self, config: Any, http_client: httpx.Client | None = None,
                  sleeper: Callable[[float], None] = time.sleep, *,
@@ -59,41 +61,38 @@ class Client:
         headers = {"Content-Type": "application/json", "User-Agent": self.config.user_agent}
         if self.config.api_key:
             headers["Authorization"] = "Bearer " + self.config.api_key
-        hardened = bool(getattr(self.config, "retry_thinking_400", False))
-        deadline = self._clock() + self.config.timeout if hardened else None
+        thinking_retry = bool(getattr(self.config, "retry_thinking_400", False))
+        deadline = self._clock() + self.config.timeout
         try:
-            remaining = deadline - self._clock() if deadline is not None else None
-            if remaining is not None and remaining <= 0:
+            remaining = deadline - self._clock()
+            if remaining <= 0:
                 raise ClientError("LLM retry deadline exceeded")
             with request_deadline(remaining) as accepted:
-                return self._chat_attempts(body, url, headers, hardened, deadline, accepted)
+                return self._chat_attempts(body, url, headers, thinking_retry, deadline, accepted)
         except RetryDeadlineError as exc:
             raise ClientError(str(exc)) from None
 
-    def _chat_attempts(self, body, url, headers, hardened, deadline, accepted):
+    def _chat_attempts(self, body, url, headers, thinking_retry, deadline, accepted):
         waited = 0.0
         # Serialize once so every HTTP attempt carries the same bytes, even if
         # a caller modifies its original message objects while we are waiting.
         wire = self._http.build_request("POST", url, json=body, headers=headers).content
-        for attempt in range(3):
+        max_attempts = getattr(self.config, "retry_max_attempts", 3)
+        for attempt in range(max_attempts):
             try:
-                kwargs = {}
-                if deadline is not None:
-                    remaining = deadline - self._clock()
-                    if remaining <= 0:
-                        raise ClientError("LLM retry deadline exceeded")
-                    kwargs["timeout"] = remaining
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise ClientError("LLM retry deadline exceeded")
                 request = self._http.build_request("POST", url, content=wire,
-                                                   headers=headers, **kwargs)
+                                                   headers=headers, timeout=remaining)
                 self.last_attempts = attempt + 1
-                # Opt-in retries inspect error responses before loading their
-                # bodies, including when the model's stream option is false.
-                response = self._http.send(request, stream=body["stream"] or hardened)
+                # Inspect status/headers before reading any body, even for JSON.
+                response = self._http.send(request, stream=True)
             except self.RETRYABLE_ERRORS as exc:
                 error = f"LLM connection failed ({type(exc).__name__})"
-                if attempt < 2:
+                if attempt + 1 < max_attempts:
                     waited = self._wait_retry(attempt, error, type(exc).__name__,
-                                              None, None, hardened, deadline, waited)
+                                              None, None, deadline, waited)
                     continue
                 raise ClientError(error) from None
             except httpx.TimeoutException:
@@ -102,30 +101,34 @@ class Client:
                 host = getattr(getattr(exc, "request", None), "url", None)
                 where = f" ({host.host})" if host and host.host else ""
                 raise ClientError(f"LLM connection failed{where}") from None
-            if response.status_code in self.RETRYABLE_STATUS and attempt < 2:
+            if response.status_code in self.RETRYABLE_STATUS and attempt + 1 < max_attempts:
                 status = response.status_code
                 after = response.headers.get("Retry-After")
                 response.close()
                 error = f"LLM endpoint returned HTTP {status}"
                 waited = self._wait_retry(attempt, error, "upstream-status", status,
-                                          after, hardened, deadline, waited)
+                                          after, deadline, waited)
                 continue
             try:
-                if deadline is not None and self._clock() >= deadline:
+                if self._clock() >= deadline:
                     raise ClientError("LLM retry deadline exceeded")
-                if hardened and response.status_code == 400:
+                if (thinking_retry and response.status_code == 400) or response.status_code == 429:
                     sample = self._error_sample(response, deadline)
                     try:
                         value = json.loads(sample)
                     except ValueError:
                         value = None
                     error = self._http_error(response, sample)
+                    matched = (thinking_echo_error(value) if response.status_code == 400
+                               else rate_limit_error(value))
                     if ("text/html" not in response.headers.get("content-type", "").lower()
-                            and thinking_echo_error(value) and attempt < 2):
+                            and matched and attempt + 1 < max_attempts):
                         after = response.headers.get("Retry-After")
+                        status = response.status_code
                         response.close()
-                        waited = self._wait_retry(attempt, error, "thinking-echo", 400,
-                                                  after, True, deadline, waited)
+                        cause = "thinking-echo" if status == 400 else "rate-limit"
+                        waited = self._wait_retry(attempt, error, cause, status,
+                                                  after, deadline, waited)
                         continue
                     raise ClientError(error)
                 response.raise_for_status()
@@ -137,8 +140,7 @@ class Client:
                 if body["stream"]:
                     self.streamed = True
                     return self._read_sse(response)
-                if hardened:
-                    response.read()
+                response.read()
                 result = response.json()
                 return self._message(result)
             except httpx.HTTPStatusError as exc:
@@ -153,10 +155,7 @@ class Client:
                 response.close()
         raise ClientError("LLM request failed after retries")
 
-    def _wait_retry(self, attempt, error, cause, status, after, hardened, deadline, waited):
-        if not hardened:
-            self._sleep(0.25 * (2 ** attempt))
-            return waited
+    def _wait_retry(self, attempt, error, cause, status, after, deadline, waited):
         delay = backoff(attempt, self._randomizer())
         server_delay = retry_after(after, self._wall_clock())
         if server_delay is not None:
@@ -166,7 +165,7 @@ class Client:
         if delay > budget or delay >= remaining:
             raise ClientError(f"{error}; retry budget exhausted (required wait {delay:g}s)")
         if self.on_retry:
-            self.on_retry({"attempt": attempt + 2, "max_attempts": 3,
+            self.on_retry({"attempt": attempt + 2, "max_attempts": getattr(self.config, "retry_max_attempts", 3),
                            "status": status, "cause": cause, "wait_seconds": round(delay, 3)})
         if delay >= deadline - self._clock():
             raise ClientError(f"{error}; retry deadline exceeded")

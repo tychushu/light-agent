@@ -1,4 +1,4 @@
-"""Small, opt-in retry policy for known upstream thinking-echo errors."""
+"""Bounded transient retries and opt-in thinking-echo recovery."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -35,6 +35,16 @@ def thinking_echo_error(value) -> bool:
 
 class RetryDeadlineError(RuntimeError):
     pass
+
+
+def rate_limit_error(value) -> bool:
+    """Only explicitly temporary rate limits; never infer from error prose."""
+    error = value.get("error") if isinstance(value, dict) else None
+    if not isinstance(error, dict):
+        return False
+    return (error.get("type") in ("rate_limit_error", "rate_limit_exceeded", "requests", "tokens")
+            and error.get("code") in (None, "rate_limit_exceeded", "requests_rate_limit_exceeded",
+                                      "tokens_rate_limit_exceeded"))
 
 
 @contextmanager

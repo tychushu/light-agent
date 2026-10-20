@@ -11,6 +11,9 @@ def _size(value):
 
 
 def safe_tool_arguments(name, arguments):
+    if name == "delegate":
+        return {"task_hidden": True, "task": _size(arguments.get("task")),
+                "max_steps": arguments.get("max_steps")} if isinstance(arguments, dict) else {"task_hidden": True}
     if name not in WRITE_TOOLS:
         return arguments
     if not isinstance(arguments, dict):
@@ -35,7 +38,7 @@ def hide_write_payloads(value):
         return value
     result = {key: hide_write_payloads(item) for key, item in value.items()}
     name = value.get("name")
-    if isinstance(name, str) and name in WRITE_TOOLS and "arguments" in value:
+    if isinstance(name, str) and (name in WRITE_TOOLS or name == "delegate") and "arguments" in value:
         args = value["arguments"]
         if isinstance(args, str):
             try:

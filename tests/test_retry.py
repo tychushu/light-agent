@@ -90,7 +90,7 @@ class RetryBehaviorTests(unittest.TestCase):
             disabled.chat([], [])
         self.assertEqual(len(disabled_attempts), 1)
 
-    def test_default_off_preserves_legacy_status_backoff(self):
+    def test_default_uses_bounded_jitter_without_thinking_opt_in(self):
         attempts, sleeps = [], []
 
         def respond(request):
@@ -104,10 +104,10 @@ class RetryBehaviorTests(unittest.TestCase):
         config = Config(stream=False)
         self.assertFalse(config.retry_thinking_400)
         client = self.client(httpx.MockTransport(respond), enabled=False,
-                             sleeper=sleeps.append)
+                             sleeper=sleeps.append, randomizer=lambda: 0.0)
         self.assertEqual(client.chat([], [])["content"], "ok")
         self.assertEqual(len(attempts), 3)
-        self.assertEqual(sleeps, [0.25, 0.5])
+        self.assertEqual(sleeps, [0.5, 1.0])
 
     def test_default_off_does_not_retry_the_thinking_400(self):
         attempts = []
@@ -156,9 +156,9 @@ class RetryBehaviorTests(unittest.TestCase):
                     self.assertEqual(client.last_attempts, 2)
                     self.assertEqual(len(attempts), 2)
                     self.assertEqual(attempts[0], attempts[1])
-                    self.assertEqual(sleeps, [0.5 if enabled else 0.25])
+                    self.assertEqual(sleeps, [0.5])
                     self.assertEqual([event["status"] for event in events],
-                                     [500] if enabled else [])
+                                     [500])
                     self.assertEqual(chunks, [("content", "ok")] if stream else [])
 
     def test_persistent_http_500_stops_after_three_attempts(self):
@@ -177,7 +177,7 @@ class RetryBehaviorTests(unittest.TestCase):
                     client.chat([], [])
                 self.assertEqual(client.last_attempts, 3)
                 self.assertEqual(len(attempts), 3)
-                self.assertEqual(sleeps, [0.5, 1.0] if enabled else [0.25, 0.5])
+                self.assertEqual(sleeps, [0.5, 1.0])
                 self.assertIn("HTTP 500", str(raised.exception))
                 self.assertIn("type=api_error", str(raised.exception))
                 self.assertNotIn("private body", str(raised.exception))
@@ -550,7 +550,7 @@ class RetryBehaviorTests(unittest.TestCase):
             after_sleep.append(True)
             return success_response(request)
 
-        config = Config(stream=False, retry_thinking_400=True, timeout=0.02)
+        config = Config(stream=False, timeout=0.02)
         http = httpx.Client(transport=httpx.MockTransport(respond))
         self.addCleanup(http.close)
         client = Client(config, http_client=http)
@@ -697,6 +697,165 @@ class RetryBehaviorTests(unittest.TestCase):
         self.assertEqual(len(tool_turns), 1)
         self.assertEqual(tool_turns[0]["tool_calls"][0]["id"], "call_once")
         self.assertEqual(sum(message.get("role") == "tool" for message in history), 1)
+
+
+class EnhancedRetryTests(unittest.TestCase):
+    def test_pre_header_disconnects_retry_but_successful_body_errors_do_not(self):
+        for error_type in (httpx.ReadError, httpx.RemoteProtocolError):
+            with self.subTest(error_type=error_type.__name__):
+                requests = []
+                def respond(request):
+                    requests.append(request.content)
+                    if len(requests) == 1:
+                        raise error_type('disconnected before headers', request=request)
+                    return success_response(request)
+                with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+                    client = Client(Config(stream=False), http_client=http, sleeper=lambda _: None)
+                    self.assertEqual(client.chat([], [])["content"], "ok")
+                self.assertEqual(requests, [requests[0]] * 2)
+                requests = []
+                class BrokenBody(httpx.SyncByteStream):
+                    def __iter__(self):
+                        yield b'{"choices":'
+                        raise error_type('disconnected during body')
+                def broken(request):
+                    requests.append(request)
+                    return httpx.Response(200, stream=BrokenBody())
+                with httpx.Client(transport=httpx.MockTransport(broken)) as http:
+                    client = Client(Config(stream=False), http_client=http,
+                                    sleeper=lambda _: self.fail('must not replay accepted response'))
+                    with self.assertRaises(ClientError):
+                        client.chat([], [])
+                self.assertEqual(len(requests), 1)
+
+    def test_attempt_limit_is_configurable_and_shared_across_transient_causes(self):
+        for maximum in (1, 2, 5):
+            with self.subTest(maximum=maximum):
+                requests, events, sleeps = [], [], []
+                def respond(request):
+                    requests.append(request.content)
+                    if len(requests) == 1:
+                        return httpx.Response(429, json={"error": {"type": "rate_limit_error"}})
+                    if len(requests) == 2:
+                        raise httpx.ConnectError("offline", request=request)
+                    return httpx.Response(500)
+                with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+                    client = Client(Config(stream=False, retry_max_attempts=maximum), http_client=http,
+                                    sleeper=sleeps.append, randomizer=lambda: 0.0)
+                    client.on_retry = events.append
+                    with self.assertRaises(ClientError):
+                        client.chat([], [])
+                self.assertEqual(len(requests), maximum)
+                self.assertEqual(client.last_attempts, maximum)
+                self.assertEqual(requests, [requests[0]] * maximum)
+                self.assertEqual([event['attempt'] for event in events], list(range(2, maximum + 1)))
+                self.assertTrue(all(event['max_attempts'] == maximum for event in events))
+
+    def test_default_policy_honors_retry_after_and_reports_retries(self):
+        requests, sleeps, events = [], [], []
+        def respond(request):
+            requests.append(request)
+            return (httpx.Response(503, headers={"Retry-After": "5"}) if len(requests) == 1
+                    else success_response(request))
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            client = Client(Config(stream=False), http_client=http, sleeper=sleeps.append,
+                            randomizer=lambda: 0.0)
+            client.on_retry = events.append
+            self.assertEqual(client.chat([], [])["content"], "ok")
+        self.assertEqual(sleeps, [5.0])
+        self.assertEqual(events[0]['status'], 503)
+
+    def test_default_policy_does_not_shorten_server_wait_or_exceed_zero_budget(self):
+        for budget, server_wait in ((20, "21"), (0, None)):
+            with self.subTest(budget=budget):
+                requests = []
+                def respond(request):
+                    requests.append(request)
+                    return httpx.Response(500, headers={"Retry-After": server_wait} if server_wait else {})
+                with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+                    client = Client(Config(stream=False, retry_wait_budget=budget), http_client=http,
+                                    sleeper=lambda _: self.fail("unexpected wait"))
+                    with self.assertRaisesRegex(ClientError, "budget exhausted"):
+                        client.chat([], [])
+                self.assertEqual(len(requests), 1)
+
+    def test_only_structured_temporary_rate_limit_is_retried(self):
+        rejected = [
+            {"error": {"type": "insufficient_quota"}},
+            {"error": {"type": "rate_limit_error", "code": "insufficient_quota"}},
+            {"error": {"type": "rate_limit_error", "code": "content_blocked"}},
+            {"error": {"type": "api_error", "message": "rate limit"}},
+        ]
+        for error in rejected:
+            with self.subTest(error=error):
+                requests = []
+                def respond(request):
+                    requests.append(request)
+                    return httpx.Response(429, json=error)
+                with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+                    client = Client(Config(stream=False), http_client=http,
+                                    sleeper=lambda _: self.fail("unexpected retry"))
+                    with self.assertRaises(ClientError):
+                        client.chat([], [])
+                self.assertEqual(len(requests), 1)
+        for error_type in ('rate_limit_error', 'rate_limit_exceeded', 'tokens', 'requests'):
+            with self.subTest(error_type=error_type):
+                requests = []
+                def respond(request):
+                    requests.append(request.content)
+                    return (httpx.Response(429, json={"error": {"type": error_type, "code": "rate_limit_exceeded"}})
+                            if len(requests) == 1 else success_response(request))
+                with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+                    client = Client(Config(stream=False), http_client=http, sleeper=lambda _: None)
+                    self.assertEqual(client.chat([], [])["content"], "ok")
+                self.assertEqual(len(requests), 2)
+
+    def test_html_and_malformed_429_are_not_retried(self):
+        for body, content_type in ((b'<html>rate limit</html>', 'text/html'),
+                                   (b'not json', 'application/json')):
+            with self.subTest(content_type=content_type):
+                requests = []
+                def respond(request):
+                    requests.append(request)
+                    return httpx.Response(429, content=body, headers={'content-type': content_type})
+                with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+                    client = Client(Config(), http_client=http,
+                                    sleeper=lambda _: self.fail("unexpected retry"))
+                    with self.assertRaises(ClientError):
+                        client.chat([], [])
+                self.assertEqual(len(requests), 1)
+
+    def test_nonstream_status_retry_closes_response_without_reading_error_body(self):
+        requests, closed = [], []
+        class UnreadError(httpx.SyncByteStream):
+            def __iter__(self):
+                raise AssertionError('Must not wait for the error body')
+                yield b''
+            def close(self):
+                closed.append(True)
+        def respond(request):
+            requests.append(request)
+            return (httpx.Response(503, stream=UnreadError()) if len(requests) == 1
+                    else success_response(request))
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            client = Client(Config(stream=False), http_client=http, sleeper=lambda _: None)
+            client.on_retry = lambda info: self.assertTrue(closed)
+            self.assertEqual(client.chat([], [])["content"], "ok")
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(closed, [True])
+
+    def test_new_config_limits_and_per_profile_attempt_override(self):
+        for field, values in {'retry_max_attempts': (0, 7, True, 2.5),
+                              'max_subagents': (-1, 9, True, '3'),
+                              'subagent_max_steps': (0, 13, True, 1.5)}.items():
+            for value in values:
+                with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                    Config(**{field: value}).validate()
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / 'config.toml'
+            path.write_text('retry_max_attempts=5\n[apis.a]\nbase_url="https://example.test/v1"\nmodel="m"\nretry_max_attempts=2\n')
+            self.assertEqual(Config.load(path, 'a').retry_max_attempts, 2)
+            self.assertEqual(Config.load(path, 'default').retry_max_attempts, 5)
 
 
 if __name__ == "__main__":

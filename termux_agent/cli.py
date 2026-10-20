@@ -46,6 +46,7 @@ Tab             Complete command, API, session and Skill names
 /sessions [N]   List saved sessions (default 50, max 500)
 /session        Show ID; new, load ID, rename NAME, delete ID, fork, save
 /history [N] [skip]  Show recent messages; skip to page backward
+/sub TASK       Run one bounded sub-agent; /sub shows limits
 /exit           Save and exit
 """
 
@@ -218,6 +219,14 @@ def main():
             return False
 
     def event(kind, payload):
+        if kind in ("subagent_start", "subagent_end"):
+            detail = (f"model={payload['model']} · steps≤{payload['max_steps']}"
+                      if kind == "subagent_start" else payload["status"])
+            display(f"{payload['id']} · {detail}", "Sub")
+            return
+        if kind == "subagent_retry":
+            retry_output(payload, payload["id"])
+            return
         if kind == "continuation":
             display({"automatic_continuation": payload})
             return
@@ -225,7 +234,7 @@ def main():
         writing = name in WRITE_TOOLS
         if debug or kind == "tool_start" or (writing and kind == "tool_result"):
             visible = hide_write_payloads(payload) if config.silent_writes else payload
-            display({kind: visible}, "Tool")
+            display({kind: visible}, "SubTool" if payload.get("subagent") else "Tool")
         if kind == "tool_start":
             tool_started[payload.get("name")] = time.monotonic()
         elif kind == "tool_result":
@@ -254,6 +263,11 @@ def main():
             display(value, "Agent")
         stream_wrote = False
 
+    def retry_output(info, label="API"):
+        cause = f"HTTP {info['status']}" if info.get("status") else info["cause"]
+        display(f"{label} retry {info['attempt']}/{info['max_attempts']} · "
+                f"{cause} · wait {info['wait_seconds']:g}s", "Retry")
+
     def build_agent(next_config, text, base_system=None):
         kwargs = {"approve": approve, "event": event}
         if text:
@@ -262,7 +276,7 @@ def main():
             kwargs["base_system"] = base_system
         built = Agent(next_config, **kwargs)
         built.client.on_stream = stream_output
-        built.client.on_retry = lambda info: display({"api_retry": info})
+        built.client.on_retry = retry_output
         return built
 
     try:
@@ -620,6 +634,21 @@ def main():
                         display(result.stdout)
                 except (OSError, subprocess.SubprocessError) as exc:
                     display(f"Clipboard read failed: {exc}")
+            elif prompt == "/sub" or prompt.startswith("/sub "):
+                task = prompt[4:].strip()
+                if not task:
+                    display({"max_subagents": config.max_subagents,
+                             "subagent_max_steps": min(config.subagent_max_steps, config.max_steps),
+                             "api": config.api_profile, "execution": "synchronous; no nested delegation"}, "Sub")
+                    continue
+                read_grant = False
+                try:
+                    result = agent.delegate(task)
+                    display(f"{result.get('id', 'sub')} · {agent.last_run['status']}", "Sub")
+                    display(result.get("summary", result.get("error", "")), "Sub")
+                    save_current()
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    display(f"Sub-agent failed: {exc}", "Sub")
             elif prompt.startswith("!"):
                 command = prompt[1:].strip()
                 if command:
