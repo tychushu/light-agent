@@ -58,10 +58,95 @@ class Client:
     def set_control_markers(self, markers):
         self.control_markers = tuple(markers)
 
+    def _prepare_responses_request(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        url = self.config.base_url.rstrip("/") + "/responses"
+        def parts(content, role):
+            kind = 'output_text' if role == 'assistant' else 'input_text'
+            if content is None:
+                return []
+            if isinstance(content, str):
+                return [{'type': kind, 'text': content}]
+            if isinstance(content, list):
+                result = []
+                for part in content:
+                    text = part if isinstance(part, str) else part.get('text') if isinstance(part, dict) else None
+                    if not isinstance(text, str):
+                        raise ClientError('Responses adapter supports text message parts only')
+                    result.append({'type': kind, 'text': text})
+                return result
+            raise ClientError('Responses message content must be text')
+        resp_input = []
+        for m in messages:
+            role = m.get("role", "user")
+            if role == "tool":
+                resp_input.append({
+                    "type": "function_call_output",
+                    "call_id": m.get("tool_call_id", ""),
+                    "output": (m.get('content', '') if isinstance(m.get('content', ''), str)
+                               else json.dumps(m.get('content'), ensure_ascii=False))
+                })
+            elif role == "assistant":
+                saved = m.get('_responses_output')
+                if saved:
+                    if not isinstance(saved, list) or any(not isinstance(item, dict) for item in saved):
+                        raise ClientError('Invalid saved Responses output items')
+                    resp_input.extend(deepcopy(saved))
+                    continue
+                content = m.get("content")
+                if content:
+                    resp_input.append({
+                        "type": "message",
+                        "role": "assistant",
+                        "content": parts(content, role)
+                    })
+                for tc in m.get("tool_calls") or []:
+                    fn = tc.get("function") or {}
+                    resp_input.append({
+                        "type": "function_call",
+                        "call_id": tc.get("id", ""),
+                        "name": fn.get("name", ""),
+                        "arguments": (json.dumps(fn['arguments'], ensure_ascii=False) if isinstance(fn.get('arguments'), dict)
+                                      else fn.get("arguments", "{}"))
+                    })
+            else:
+                content = m.get("content", "")
+                resp_input.append({
+                    "type": "message",
+                    "role": role,
+                    "content": parts(content, role)
+                })
+        body: dict[str, Any] = {
+            "model": self.config.model,
+            "input": resp_input,
+            "stream": bool(getattr(self.config, "stream", True)),
+            "store": False,
+            "include": ["reasoning.encrypted_content"]
+        }
+        if tools:
+            resp_tools = []
+            for t in tools:
+                if t.get("type") == "function" and "function" in t:
+                    fn = t["function"]
+                    resp_tools.append({
+                        "type": "function",
+                        "name": fn["name"],
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {}),
+                        "strict": fn.get("strict", False)
+                    })
+                else:
+                    resp_tools.append(t)
+            body["tools"] = resp_tools
+        return url, body
+
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
-        body = {"model": self.config.model, "messages": messages, "tools": tools,
-                "tool_choice": "auto", "stream": bool(getattr(self.config, "stream", True))}
-        url = self.config.base_url.rstrip("/") + "/chat/completions"
+        if getattr(self.config, "wire_api", "chat_completions") == "responses":
+            url, body = self._prepare_responses_request(messages, tools)
+        else:
+            chat_messages = [{k: v for k, v in m.items() if k != '_responses_output'} for m in messages]
+            body = {"model": self.config.model, "messages": chat_messages, "tools": tools,
+                    "tool_choice": "auto", "stream": bool(getattr(self.config, "stream", True))}
+            url = self.config.base_url.rstrip("/") + "/chat/completions"
         self.last_request = deepcopy(body)
         self.last_attempts = 0
         self.last_usage = None
@@ -267,6 +352,9 @@ class Client:
     def _message(self, result: Any) -> dict[str, Any]:
         if not isinstance(result, dict):
             raise ClientError("LLM endpoint returned an invalid response")
+        if self.config.wire_api == "responses":
+            from .responses import message
+            return message(self, result)
         choices = result.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise ClientError("LLM response has no choices")
@@ -291,6 +379,9 @@ class Client:
             self.streamed_text = True
 
     def _read_sse(self, response: httpx.Response) -> dict[str, Any]:
+        if self.config.wire_api == "responses":
+            from .responses import read_sse
+            return read_sse(self, response)
         content, reasoning = [], []
         calls: dict[int, dict[str, Any]] = {}
         data_lines = []

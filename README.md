@@ -97,9 +97,10 @@ Configuration, if you created it, is at `~/.config/termux-agent/config.toml`.
 
 ## API profiles and scoped agent.md
 
-Cloud and local endpoints use the same OpenAI-compatible chat-completions + tools
-protocol. TLS verification remains enabled for HTTPS. Other proprietary protocols
-are not adapted. Add named profiles to `~/.config/termux-agent/config.toml`:
+Cloud and local endpoints support OpenAI-compatible Chat Completions and Responses
+text/function-call protocols. `wire_api` selects the protocol per profile; the
+default remains `chat_completions`. TLS verification remains enabled for HTTPS.
+Add named profiles to `~/.config/termux-agent/config.toml`:
 
 ```toml
 # Optional top-level default_api = "local" must appear before [apis.*] tables.
@@ -112,6 +113,8 @@ api_key_env = "TERMUX_AGENT_API_KEY"
 base_url = "https://YOUR-PROVIDER/v1"
 model = "YOUR-MODEL-ID"
 api_key_env = "CLOUD_API_KEY"
+# For an endpoint requiring /v1/responses:
+# wire_api = "responses"
 # Enable only for a profile that returns the known structured-thinking error:
 # retry_thinking_400 = true
 # retry_wait_budget = 20.0
@@ -124,6 +127,26 @@ variable; omission means no Authorization header, never reuse another profile's
 key. Switching saves the previous session, reloads TOML, starts fresh conversation/statistics, and keeps the
 currently selected instruction file. Unknown/invalid profiles leave the current
 session intact. Nothing is sent until your next prompt.
+
+For Responses, keep `base_url` at the API root (for example `https://provider/v1`)
+and set `wire_api = "responses"` in the profile. The client appends `/responses`,
+converts tool results to `function_call_output`, and supports JSON and SSE
+responses. Responses input/output token fields map to the existing `/stats`
+fields, including reasoning-token details. Optional function arguments retain
+their existing semantics with `strict = false` unless explicitly overridden.
+
+The Responses adapter sends stateless requests (`store = false`) and retains
+returned output items, including opaque reasoning state, in saved assistant
+messages for the next request. It does not replay the same function calls twice
+when those items are present. Start a new conversation when changing a profile's
+protocol: historical Chat Completions text cannot reconstruct opaque Responses
+reasoning state. A failed/incomplete Responses result or a stream without a
+terminal completion event raises an error before any returned tools can execute;
+accepted streams are never retried. Native multimodal and built-in Responses
+tools are outside this text/function-call adapter's scope. See the official
+[function calling](https://developers.openai.com/api/docs/guides/function-calling)
+and [streaming](https://developers.openai.com/api/docs/guides/streaming-responses)
+protocol documentation.
 
 All API profiles use bounded retry waits, exponential backoff with equal jitter,
 and `Retry-After`. `retry_max_attempts` defaults to 3 total attempts, accepts 1–6

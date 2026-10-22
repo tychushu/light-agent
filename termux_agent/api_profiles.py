@@ -91,13 +91,14 @@ class ProfileStore:
             kind = entry.get("kind", self.kind_for(entry.get("base_url", "")))
             env = entry.get("api_key_env", "")
             rows.append({"name": name, "kind": kind, "model": entry.get("model", ""),
+                         "wire_api": entry.get('wire_api', raw.get('wire_api', 'chat_completions')),
                          "base_url": entry.get("base_url", ""), "api_key_env": env,
                          "key_ready": bool(os.environ.get(env)) if env else True,
                          "default": name == default})
         return rows
 
     def add(self, name, base_url, model, api_key_env="", kind="auto",
-            stream=True, timeout=None, user_agent=None):
+            stream=True, timeout=None, user_agent=None, wire_api="chat_completions"):
         self.check_name(name)
         if name in self.entries():
             raise ValueError(f"API profile already exists: {name}")
@@ -122,8 +123,10 @@ class ProfileStore:
                                        not user_agent.isascii() or
                                        any(ord(c) < 32 or ord(c) == 127 for c in user_agent)):
             raise ValueError("user_agent must be single-line ASCII text")
+        if wire_api not in ("chat_completions", "responses"):
+            raise ValueError("wire_api must be chat_completions or responses")
         fields = {"base_url": base_url, "model": model, "api_key_env": api_key_env,
-                  "kind": kind, "stream": stream}
+                  "kind": kind, "stream": stream, "wire_api": wire_api}
         if timeout is not None:
             fields["timeout"] = timeout
         if user_agent is not None:

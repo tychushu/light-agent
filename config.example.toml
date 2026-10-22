@@ -19,6 +19,7 @@ retry_max_attempts = 3 # includes the initial request; 1–6, per-profile overri
 # Defaults to false; enable only for a profile confirmed to return the known error.
 # retry_thinking_400 = false
 stream = true # set false for APIs without SSE support
+wire_api = "chat_completions" # default; "responses" is also supported per profile
 
 [apis.local]
 base_url = "http://192.168.86.244:8085/v1"
@@ -31,6 +32,8 @@ model = "deepseek-v4-flash"
 api_key_env = "AGENTROUTER_API_KEY"
 user_agent = "claude-cli/2.1.119 (external, cli)"
 timeout = 300.0
+# Use for an AgentRouter model/route requiring the Responses endpoint:
+# wire_api = "responses"
 # Per-profile opt-in; uncomment only if this API returns the known error.
 # retry_thinking_400 = true
 # retry_wait_budget = 20.0

@@ -36,6 +36,7 @@ class Config:
     silent_writes: bool = True
     auto_continue: bool = False
     max_continuations: int = 3
+    wire_api: str = "chat_completions"
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -50,7 +51,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -66,7 +67,7 @@ class Config:
             for required in ("base_url", "model"):
                 if required not in entry:
                     raise ValueError(f"API profile requires {required}")
-            for key in ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "user_agent", "stream", "max_context_chars"):
+            for key in ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "user_agent", "stream", "max_context_chars", "wire_api"):
                 if key in entry:
                     setattr(config, key, entry[key])
             # Retrying the known thinking-format error is opt-in per API profile.
@@ -136,6 +137,8 @@ class Config:
             raise ValueError("max_steps must be a positive integer")
         if not isinstance(self.max_output_chars, int) or isinstance(self.max_output_chars, bool) or not 128 <= self.max_output_chars <= 20_000:
             raise ValueError("max_output_chars must be between 128 and 20000")
+        if self.wire_api not in ("chat_completions", "responses"):
+            raise ValueError("wire_api must be chat_completions or responses")
         if self.approval_policy not in {"always", "on-risk", "never"}:
             raise ValueError("approval_policy must be always, on-risk, or never")
         if not isinstance(self.timeout, (int, float)) or isinstance(self.timeout, bool) or not math.isfinite(self.timeout) or not 0 < self.timeout <= 3600:

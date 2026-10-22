@@ -167,6 +167,40 @@ class ClientTests(unittest.TestCase):
             Client(Config(stream=False), http_client=http).chat([], [])
         http.close()
 
+    def test_responses_wire_api_format_and_streaming(self):
+        seen = {}
+
+        def respond(request):
+            seen["url"] = str(request.url)
+            seen["body"] = json.loads(request.content)
+            events = [
+                'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hi"}\n\n',
+                'event: response.output_item.added\ndata: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","name":"list_files","call_id":"c1"}}\n\n',
+                'event: response.function_call_arguments.delta\ndata: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\\"a\\":1}"}\n\n',
+                'event: response.completed\ndata: {"type":"response.completed","response":{"usage":{"total_tokens":10}}}\n\n',
+            ]
+            return httpx.Response(200, headers={"Content-Type": "text/event-stream"}, text="".join(events))
+
+        cfg = Config(wire_api="responses", stream=True)
+        http = httpx.Client(transport=httpx.MockTransport(respond))
+        client = Client(cfg, http_client=http)
+        result = client.chat([
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c0", "type": "function", "function": {"name": "f0", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c0", "content": "done"}
+        ], [{"type": "function", "function": {"name": "list_files", "description": "list", "parameters": {}}}])
+        self.assertTrue(seen["url"].endswith("/responses"))
+        self.assertEqual(len(seen["body"]["input"]), 3)
+        self.assertEqual(seen["body"]["input"][0]["type"], "message")
+        self.assertEqual(seen["body"]["input"][1]["type"], "function_call")
+        self.assertEqual(seen["body"]["input"][2]["type"], "function_call_output")
+        self.assertEqual(seen["body"]["tools"][0]["name"], "list_files")
+        self.assertEqual(result["content"], "Hi")
+        self.assertEqual(result["tool_calls"][0]["function"]["name"], "list_files")
+        self.assertEqual(result["tool_calls"][0]["function"]["arguments"], '{"a":1}')
+        self.assertEqual(client.last_usage["total_tokens"], 10)
+        http.close()
+
 
 class ScriptedClient:
     def __init__(self, replies):

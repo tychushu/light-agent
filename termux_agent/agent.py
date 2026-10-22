@@ -7,7 +7,7 @@ from dataclasses import replace
 import uuid
 from typing import Any, Callable
 
-from .client import Client, ContextLengthError, EmptyResponseError
+from .client import Client, ClientError, ContextLengthError, EmptyResponseError
 from .context import context_chars
 from .tools import TOOLS, DELEGATE_TOOL, WEB_FETCH_TOOL, execute, web_fetch_available
 
@@ -162,7 +162,7 @@ class Agent:
                 return finish("interrupted", "LLM 请求已中断。")
             except Exception as exc:
                 self._usage_history.append(self._clean_usage(getattr(self.client, 'last_usage', None))
-                                           if isinstance(exc, EmptyResponseError) else None)
+                                           if isinstance(exc, ClientError) else None)
                 self._request_history_chars.append(self._history_chars(request_messages))
                 if isinstance(exc, EmptyResponseError):
                     self.messages.append({**exc.assistant_message, 'role': 'assistant'})
@@ -182,6 +182,8 @@ class Agent:
             if automatic:
                 content, status = task_status(content)
             reasoning = {"reasoning_content": answer["reasoning_content"]} if "reasoning_content" in answer else {}
+            if '_responses_output' in answer:
+                reasoning['_responses_output'] = answer['_responses_output']
             if provider_blocked(answer, getattr(self.client, "last_finish_reason", None)):
                 self.messages.append({"role": "assistant", "content": content, **reasoning})
                 self.last_run["blocked_by"] = "provider"
