@@ -88,7 +88,9 @@ class ResponsesTests(unittest.TestCase):
             with patch('termux_agent.agent.execute', return_value={'content': 'file'}) as execute:
                 self.assertEqual(agent.run('read it'), 'done')
             self.assertEqual(execute.call_count, 1)
-            self.assertEqual(seen[1]['input'][2:4], [reasoning, call])
+            expected_reasoning = {k: v for k, v in reasoning.items() if k != 'id'}
+            expected_call = {k: v for k, v in call.items() if k != 'id'}
+            self.assertEqual(seen[1]['input'][2:4], [expected_reasoning, expected_call])
             self.assertEqual(seen[1]['input'][4]['call_id'], 'call_1')
             payload = snapshot(agent, {}, checkpoint=True)
             validate_messages(payload['messages'])

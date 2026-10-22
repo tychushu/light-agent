@@ -90,7 +90,9 @@ class Client:
                 if saved:
                     if not isinstance(saved, list) or any(not isinstance(item, dict) for item in saved):
                         raise ClientError('Invalid saved Responses output items')
-                    resp_input.extend(deepcopy(saved))
+                    for item in deepcopy(saved):
+                        item.pop('id', None)
+                        resp_input.append(item)
                     continue
                 content = m.get("content")
                 if content:
