@@ -94,16 +94,44 @@ def snapshot(agent, scope, checkpoint=False):
     return scrub_keys(value, (agent.config.api_key,))
 
 
-def restore(payload, build_agent):
+class HistoryClient:
+    """Local history has no dependency on a live provider or its credentials."""
+    history_only = True
+    last_request = last_usage = last_finish_reason = None
+    streamed = streamed_text = False
+    last_attempts = 0
+
+    def __init__(self, reason):
+        self.reason = reason
+
+    def chat(self, *args, **kwargs):
+        from .client import ClientError
+        raise ClientError('历史查看模式不能调用模型；请用 /api NAME 新建可用会话。')
+
+    def close(self):
+        pass
+
+
+def restore(payload, build_agent, *, history_fallback=False):
     if payload.get('version') not in (1, 2, 3):
         raise ValueError('Unsupported session version')
     validate_messages(payload['messages'])
     scope, saved = payload['scope'], payload['config']
-    config = Config.load(scope.get('config_path'), saved['api_profile'])
-    if (config.base_url.rstrip('/'), config.model) != (saved['base_url'].rstrip('/'), saved['model']):
-        raise ValueError('API profile endpoint/model changed; restore its original config or start a new session')
+    history_reason = ''
+    try:
+        config = Config.load(scope.get('config_path'), saved['api_profile'])
+        if (config.base_url.rstrip('/'), config.model, config.wire_api) != (
+                saved['base_url'].rstrip('/'), saved['model'], saved.get('wire_api', 'chat_completions')):
+            raise ValueError('API profile endpoint/model/protocol changed; restore its original config or start a new session')
+    except (ValueError, OSError):
+        if not history_fallback:
+            raise
+        history_reason = '原 API 配置不可用，或地址、模型、协议已变更。'
+        config = Config(**{k: v for k, v in saved.items() if k in Config.__dataclass_fields__ and k != 'api_key'})
     if not Path(scope['directory']).is_dir():
-        raise ValueError('Session directory no longer exists')
+        if not history_fallback:
+            raise ValueError('Session directory no longer exists')
+        history_reason += '原工作目录已不存在，保留当前目录查看历史。'
     counters = payload['counters']
     for key in COUNTERS:
         value = counters.get(key, 0)
@@ -128,7 +156,11 @@ def restore(payload, build_agent):
             base = base.removesuffix(block)
     if not isinstance(base, str) or not base.strip():
         raise ValueError('Invalid saved system prompt')
-    agent = build_agent(config, scope['instructions'], base_system=base)
+    kwargs = {'base_system': base}
+    if history_reason:
+        config.api_key = ''
+        kwargs['client'] = HistoryClient(history_reason)
+    agent = build_agent(config, scope['instructions'], **kwargs)
     for name, content in active_skills.items():
         agent.load_skill(name, content)
     agent.messages = payload['messages']

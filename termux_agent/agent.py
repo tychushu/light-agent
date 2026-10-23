@@ -79,6 +79,10 @@ class Agent:
     def get_active_skills(self) -> dict[str, str]:
         return dict(self.active_skills)
 
+    @property
+    def history_only(self):
+        return getattr(self.client, 'history_only', False) is True
+
     def _emit(self, kind: str, payload: dict[str, Any]) -> None:
         if self.event:
             try:
@@ -106,6 +110,8 @@ class Agent:
         return value, None
 
     def _approved(self, name: str, args: dict[str, Any]) -> bool:
+        if self.history_only:
+            return False
         policy = self.config.approval_policy
         required = needs_approval(name, args, policy)
         if not required:
@@ -118,6 +124,8 @@ class Agent:
             return False
 
     def run(self, text: str, auto_continue: bool | None = None) -> str:
+        if self.history_only:
+            raise ValueError('历史查看模式不能调用模型；请用 /api NAME 新建可用会话。')
         if not isinstance(text, str) or not text.strip():
             raise ValueError("input must be a non-empty string")
         automatic = self.config.auto_continue if auto_continue is None else auto_continue
@@ -360,6 +368,8 @@ class Agent:
 
     def delegate(self, task):
         """Explicit /sub command; record a complete tool turn like model delegation."""
+        if self.history_only:
+            raise ValueError('历史查看模式不能委派任务；请用 /api NAME 新建可用会话。')
         if not isinstance(task, str) or not task.strip() or len(task) > 16000:
             raise ValueError("task must contain 1–16000 characters")
         self._subagents_this_run = 0

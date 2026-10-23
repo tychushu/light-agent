@@ -300,8 +300,20 @@ than presenting the current time as a historical timestamp.
 API/model identity, working directory, loaded agent.md text snapshot and source,
 messages (including tool IDs/results and reasoning_content), and usage counters
 are restored. Current credentials come from environment, never the database.
-A changed API profile endpoint/model prevents resuming; restore its old profile
-or start fresh. Restoring does not reread agent.md; `/agent reload` deliberately
+If the saved API profile is missing, invalid, or now points to a different
+endpoint/model/protocol, `/session load ID` and `ta --session ID` open local history
+viewing mode. `/history`, `/recall` and `/export` work without a provider client or
+credentials. Normal prompts and tools are disabled in that mode, and exiting or
+viewing does not rewrite the saved payload, revision or last activity time.
+Titles can still be renamed explicitly. If the old working directory is gone,
+history viewing keeps the current directory and reports that fallback.
+
+Use `/api NAME` to start a fresh usable conversation, including when reselecting
+the same profile name after its model changed. Archived messages are not sent to
+the new API. To resume the original conversation with its original provider,
+restore the profile's saved endpoint/model/protocol and load the session again.
+Matching profiles continue to resume normally.
+Restoring does not reread agent.md; `/agent reload` deliberately
 starts a new session with its current contents. Scope override flags cannot be
 combined with `--session`.
 

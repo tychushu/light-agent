@@ -51,7 +51,7 @@ Tab             补全命令、API 配置、会话 ID 和技能名称
 /title [NAME]   查看或修改当前会话标题，无需调用模型
 /session        查看当前会话 ID、标题和保存状态
 /session new [NAME]  新建空白会话，可指定标题
-/session load ID     保存当前会话，再恢复指定会话
+/session load ID     恢复会话；原 API 失效或变更时进入历史查看模式
 /session rename NAME  修改当前会话标题
 /session rename-id ID NAME  修改其他会话标题，不切换会话
 /session fork [NAME]  将当前对话复制为独立会话，可指定标题
@@ -301,12 +301,14 @@ def main():
         display(f"{label} retry {info['attempt']}/{info['max_attempts']} · "
                 f"{cause} · wait {info['wait_seconds']:g}s", "Retry")
 
-    def build_agent(next_config, text, base_system=None):
+    def build_agent(next_config, text, base_system=None, client=None):
         kwargs = {"approve": approve, "event": event}
         if text:
             kwargs["instructions"] = text
         if base_system is not None:
             kwargs["base_system"] = base_system
+        if client is not None:
+            kwargs['client'] = client
         built = Agent(next_config, **kwargs)
         built.client.on_stream = stream_output
         built.client.on_retry = retry_output
@@ -342,8 +344,13 @@ def main():
             _readline.parse_and_bind("set show-all-if-ambiguous off")
             _readline.parse_and_bind("tab: menu-complete")
 
+    def history_mode(current=None):
+        return getattr(agent if current is None else current, 'history_only', False) is True
+
     def save_current(force=False, checkpoint=False):
         nonlocal revision
+        if agent is not None and history_mode():
+            return
         if store and agent is not None and (force or revision or len(agent.messages) > 1):
             scope = {"directory": str(directory), "config_path": config_path,
                      "session_file": session_file, "disabled": disabled,
@@ -353,6 +360,9 @@ def main():
 
     def submit_input(value, automatic=None):
         nonlocal stream_wrote, read_grant
+        if history_mode():
+            display('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。', 'History')
+            return False
         read_grant = False
         try:
             submission = load_text_submission(value, COMMANDS, config.max_input_file_chars)
@@ -392,7 +402,7 @@ def main():
     def switch_api(name, persist=False):
         nonlocal config, agent, session_id, revision
         candidate = Config.load(config_path, name)
-        if name == config.api_profile:
+        if name == config.api_profile and not history_mode():
             if persist:
                 profile_store.set_default(name)
             return False
@@ -410,22 +420,28 @@ def main():
         nonlocal instructions, instruction_path, session_id, revision
         nonlocal registry, profile_store
         next_revision, payload = store.load(identifier)
-        next_config, replacement, scope = restore(payload, build_agent)
+        next_config, replacement, scope = restore(payload, build_agent, history_fallback=True)
+        target_directory = Path(scope['directory'])
+        if history_mode(replacement) and not target_directory.is_dir():
+            target_directory = Path.cwd()
         try:
             save_current()
-            os.chdir(scope['directory'])
+            os.chdir(target_directory)
         except Exception:
             replacement.client.close()
             raise
         if agent is not None:
             agent.client.close()
         config, agent = next_config, replacement
-        directory, config_path = Path(scope['directory']), scope['config_path']
+        directory, config_path = target_directory, scope['config_path']
         session_file, disabled = scope['session_file'], scope['disabled']
         instructions, instruction_path = scope['instructions'], scope['instruction_path']
         session_id, revision = identifier, next_revision
         registry = SkillRegistry()
         profile_store = ProfileStore(config_path)
+        if history_mode():
+            display('历史查看模式：' + agent.client.reason + '可用 /history、/recall、/export 查看；'
+                    '用 /api NAME 新建会话，原历史保持保存。', 'History')
         draft = store.draft(identifier)
         if payload.get('checkpoint') or draft:
             display('恢复了未完成任务的检查点；工具状态不明时先核实实际结果。', 'Recovery')
@@ -469,12 +485,17 @@ def main():
                 if formatter.enabled and sys.stdin.isatty():
                     session_label = session_id + (" (memory)" if store is None else "")
                     display(f"Session={session_label} | Model={config.model} | Cwd={directory}\n"
-                            f"Title={current_title()}", "Status")
+                            f"Title={current_title()}" + (' | Mode=历史查看' if history_mode() else ''), "Status")
                 prompt = read_prompt(formatter.prompt(), formatter.continuation()).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
                 break
             if not prompt:
+                continue
+            if history_mode() and prompt.split(maxsplit=1)[0] not in (
+                    '/help', '/sessions', '/session', '/history', '/stats', '/config', '/debug',
+                    '/debug-context', '/silent', '/api', '/title', '/recall', '/export', '/copy', '/paste', '/exit'):
+                display('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。', 'History')
                 continue
             try:
                 local_path = path_value(prompt, COMMANDS)
@@ -836,6 +857,8 @@ def main():
                     if not command:
                         display({"id": session_id, "title": current_title(), "saved": bool(revision)})
                     elif command in ("new", "fork"):
+                        if history_mode():
+                            raise ValueError('历史查看模式保留原快照；请用 /api NAME 新建可用会话。')
                         if command == "new":
                             save_current()
                             replacement = build_agent(config, instructions)
@@ -847,7 +870,7 @@ def main():
                             store.rename(session_id, value)
                         display({"id": session_id, "title": current_title()})
                     elif command == "load":
-                        if value != session_id:
+                        if value != session_id or history_mode():
                             load_session(value)
                         display({"id": session_id, "title": current_title(), "api": config.api_profile, "directory": str(directory)})
                     elif command == "rename":
@@ -862,7 +885,7 @@ def main():
                             display(f"{target} · {title}", 'Session')
                     elif command == "save":
                         save_current(force=True)
-                        display({"id": session_id, "saved": True})
+                        display('历史已保存；查看模式不重写原快照。' if history_mode() else {"id": session_id, "saved": True})
                     elif command == "delete":
                         target = value.removesuffix(" --yes")
                         if target == session_id:
