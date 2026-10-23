@@ -234,6 +234,37 @@ class ProviderErrorDiagnosticsTests(unittest.TestCase):
         self.assertIn("invalid_tools", diagnostic)
         self.assertIn(provider_text, diagnostic)
 
+    def test_http_message_redacts_key_before_clipping_at_300_characters(self):
+        secret = 'BOUNDARY_TEST_KEY_0123456789ABCDEFG'
+        message = 'A' * 280 + secret + 'Z' * 100
+        def respond(request):
+            return httpx.Response(403, json={'error': {'message': message}})
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            with self.assertRaises(ClientError) as caught:
+                Client(Config(stream=False, api_key=secret), http_client=http).chat([], [])
+        diagnostic = str(caught.exception)
+        self.assertIn('[REDACTED]', diagnostic)
+        self.assertNotIn('BOUNDARY_TEST_KEY', diagnostic)
+        self.assertEqual(len(diagnostic.split('message=', 1)[1][:-1]), 300)
+
+    def test_http_non_object_json_and_top_level_diagnostics_remain_readable(self):
+        cases = [(None, None, None), ([], None, None), ('not-an-object', None, None),
+                 ({'error': None, 'msg': 'top level\nmessage', 'code': 0}, 'top level message', '0'),
+                 ({'error': {'type': 'new_api_error'}, 'code': 'model_denied',
+                   'message': '该令牌无权访问模型'}, '该令牌无权访问模型', 'model_denied'),
+                 ({'error': 'plain gateway message'}, 'plain gateway message', None)]
+        for body, message, code in cases:
+            with self.subTest(body=body):
+                def respond(request):
+                    return httpx.Response(403, text=json.dumps(body), headers={'content-type': 'application/json'})
+                with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+                    with self.assertRaises(ClientError) as caught:
+                        Client(Config(stream=False), http_client=http).chat([], [])
+                diagnostic = str(caught.exception)
+                self.assertIn('HTTP 403', diagnostic)
+                if message: self.assertIn('message=' + message, diagnostic)
+                if code is not None: self.assertIn('code=' + code, diagnostic)
+
     def test_http_200_html_is_rejected_with_gateway_hint(self):
         def respond(request):
             return httpx.Response(200, text="<html><title>upstream gateway</title></html>",

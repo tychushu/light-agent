@@ -4,31 +4,17 @@ import json
 
 
 def _failure(value, label, client=None):
-    from .client import ClientError, ContextLengthError
-    error = value.get('error', value) if isinstance(value, dict) else None
-    code = error.get('code') if isinstance(error, dict) else (value.get('code') if isinstance(value, dict) else None)
+    from .client import ClientError, ContextLengthError, upstream_error_fields, upstream_error_text
+    error = upstream_error_fields(value)
+    code = error.get('code')
     if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long'):
         return ContextLengthError('上下文超过模型窗口；请使用 /compact 或 /clear。')
 
-    msg = None
-    if isinstance(error, dict):
-        msg = error.get('message') or error.get('msg')
-    elif isinstance(error, str):
-        msg = error
-    if not msg and isinstance(value, dict):
-        msg = value.get('message') or value.get('msg')
-
-    parts = []
-    if code and str(code) != 'None':
-        parts.append(str(code))
-    if msg and isinstance(msg, str) and msg.strip():
-        parts.append(' '.join(msg.strip().split()))
-
-    text = f"{label}（{': '.join(parts)}）" if parts else label
     api_key = getattr(getattr(client, 'config', None), 'api_key', '')
-    if api_key:
-        text = text.replace(api_key, '[REDACTED]')
-    return ClientError(text)
+    parts = [upstream_error_text(code, api_key, 80),
+             upstream_error_text(error.get('message', ''), api_key, 2000)]
+    detail = ': '.join(part for part in parts if part)
+    return ClientError(f'{label}（{detail}）' if detail else label)
 
 
 def message(client, result):

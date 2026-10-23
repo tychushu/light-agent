@@ -220,8 +220,15 @@ Assistant `reasoning_content` is preserved verbatim for subsequent requests,
 including tool rounds. Streaming is enabled by default for OpenAI-compatible profiles; set `stream = false` for non-stream endpoints.
 
 HTTP errors include the endpoint host/path, safe error type/code identifiers,
-and allowed methods when available. Provider error messages and response bodies
-are not echoed. HTML gateway responses and SSE streams without assistant choices
+and allowed methods when available. Structured upstream `message`/`msg` fields
+are shown after key redaction, whitespace normalization and control-character
+escaping. HTTP messages are limited to 300 characters; Responses JSON/SSE error
+messages retain up to 2000 characters with their code (up to 80 characters).
+Nested `error` objects and top-level diagnostic fields are supported. Redaction
+happens before clipping so a token crossing the cutoff is not partially exposed.
+HTTP parsing retains the existing 2048-byte error-body sample limit.
+Raw response bodies and HTML pages are not dumped. Recognized context-window
+errors retain their `/compact` guidance. HTML gateway responses and SSE streams without assistant choices
 stop the task with an error; HTTP 405 is not automatically retried.
 
 `ta --api local` and `ta --api cloud` also work directly. Private credentials

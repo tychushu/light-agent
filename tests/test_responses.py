@@ -169,6 +169,34 @@ class ResponsesTests(unittest.TestCase):
         self.assertIn('upstream rate limit hit', str(caught.exception))
         self.assertIn('rate_limit_exceeded', str(caught.exception))
 
+    def test_stream_error_redaction_and_control_escaping_happen_before_bounding(self):
+        secret = 'SSE_BOUNDARY_KEY_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        message = 'rate limited\x1b[31m\n' + 'A' * 1950 + secret + 'Z' * 3000
+        events = [{'type': 'error', 'error': {}, 'code': 'rate_limit_exceeded', 'message': message}]
+        with httpx.Client(transport=httpx.MockTransport(lambda q: httpx.Response(200, text=sse(events)))) as http:
+            with self.assertRaises(ClientError) as caught:
+                Client(Config(wire_api='responses', api_key=secret), http_client=http).chat([], [])
+        diagnostic = str(caught.exception)
+        self.assertIn('rate_limit_exceeded', diagnostic)
+        self.assertIn('[REDACTED]', diagnostic)
+        self.assertIn('\\x1b', diagnostic)
+        self.assertNotIn('\x1b', diagnostic)
+        self.assertNotIn('\n', diagnostic)
+        self.assertNotIn('SSE_BOUNDARY_KEY', diagnostic)
+        self.assertLessEqual(len(diagnostic), 2100)
+
+    def test_stream_nested_and_top_level_fields_include_numeric_codes_and_string_errors(self):
+        cases = [({'type': 'error', 'error': {'message': 'nested message'}, 'code': 'root_code'}, 'root_code', 'nested message'),
+                 ({'type': 'error', 'error': {}, 'code': 0, 'msg': 'root message'}, '0', 'root message'),
+                 ({'type': 'error', 'error': {'code': {}, 'message': False}, 'code': 403, 'msg': 'denied'}, '403', 'denied'),
+                 ({'type': 'response.failed', 'response': {'error': 'plain gateway error', 'code': 'gw'}}, 'gw', 'plain gateway error')]
+        for event, code, message in cases:
+            with self.subTest(event=event):
+                with httpx.Client(transport=httpx.MockTransport(lambda q: httpx.Response(200, text=sse([event])))) as http:
+                    with self.assertRaises(ClientError) as caught:
+                        Client(Config(wire_api='responses'), http_client=http).chat([], [])
+                self.assertIn(f'（{code}: {message}）', str(caught.exception))
+
     def test_json_incomplete_tool_calls_are_rejected_and_refusals_are_preserved(self):
         for status in ('in_progress', 'incomplete', 'failed'):
             with httpx.Client(transport=httpx.MockTransport(lambda q: httpx.Response(200, json={'status': status, 'output': []}))) as http:

@@ -14,6 +14,38 @@ from .retry import (RetryDeadlineError, backoff, rate_limit_error, request_deadl
                     retry_after, thinking_echo_error)
 
 
+def upstream_error_fields(value):
+    """Read structured diagnostic fields without dumping arbitrary response bodies."""
+    if not isinstance(value, dict):
+        return {}
+    error = value.get('error')
+    nested = error if isinstance(error, dict) else {}
+    result = {}
+    for name in ('code', 'type'):
+        for candidate in (nested.get(name), value.get(name)):
+            if isinstance(candidate, (str, int)) and not isinstance(candidate, bool) and str(candidate):
+                result[name] = candidate
+                break
+    for candidate in (nested.get('message'), nested.get('msg'), value.get('message'),
+                      value.get('msg'), error):
+        if isinstance(candidate, str) and candidate.strip():
+            result['message'] = candidate
+            break
+    return result
+
+
+def upstream_error_text(value, api_key='', limit=300):
+    if not isinstance(value, (str, int)) or isinstance(value, bool):
+        return ''
+    text = str(value)
+    # Mask the full value before shortening; otherwise a token cut in half leaks.
+    if isinstance(api_key, str) and api_key:
+        text = text.replace(api_key, '[REDACTED]')
+    text = ' '.join(text.split())
+    text = ''.join(c if c.isprintable() else f'\\x{ord(c):02x}' for c in text)
+    return text[:limit]
+
+
 class ClientError(RuntimeError):
     pass
 
@@ -295,7 +327,7 @@ class Client:
         if response.status_code in (400, 413, 422) and 'text/html' not in response.headers.get('content-type', '').lower():
             try:
                 data = json.loads(sample)
-                error = data.get('error', {}) if isinstance(data, dict) else {}
+                error = upstream_error_fields(data)
                 if isinstance(error, dict):
                     code = str(error.get('code', '')).lower()
                     text = str(error.get('message', '')).lower()
@@ -331,25 +363,14 @@ class Client:
         else:
             try:
                 result = json.loads(sample)
-                error = result.get("error", {}) if isinstance(result, dict) else {}
-                if isinstance(error, dict):
-                    msg = error.get("message") or result.get("message")
-                    if isinstance(msg, str) and msg.strip():
-                        clean_msg = " ".join(msg.strip().split())[:300]
-                        details.append(f"message={clean_msg}")
-                    for name in ("type", "code"):
-                        value = error.get(name, "")
-                        if not isinstance(value, (str, int)) or isinstance(value, bool):
-                            continue
-                        value = str(value)
-                        if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value) and not (
-                                self.config.api_key and self.config.api_key in value):
-                            details.append(f"{name}={value}")
-                elif isinstance(result, dict) and result.get("message"):
-                    msg = result["message"]
-                    if isinstance(msg, str) and msg.strip():
-                        clean_msg = " ".join(msg.strip().split())[:300]
-                        details.append(f"message={clean_msg}")
+                error = upstream_error_fields(result)
+                msg = upstream_error_text(error.get('message', ''), self.config.api_key, 300)
+                if msg:
+                    details.append(f'message={msg}')
+                for name in ('type', 'code'):
+                    value = upstream_error_text(error.get(name, ''), self.config.api_key, 81)
+                    if re.fullmatch(r'[A-Za-z0-9_.:-]{1,80}', value):
+                        details.append(f'{name}={value}')
             except ValueError:
                 pass
         methods = [m.strip().upper() for m in response.headers.get("allow", "").split(",")]
