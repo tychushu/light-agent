@@ -322,7 +322,6 @@ class Client:
         return message
 
     def _http_error(self, response: httpx.Response, sample=None) -> str:
-        # Never echo provider messages or response bodies.
         url = response.request.url
         details = [url.host + url.path]
         sample = self._error_sample(response) if sample is None else sample
@@ -334,6 +333,10 @@ class Client:
                 result = json.loads(sample)
                 error = result.get("error", {}) if isinstance(result, dict) else {}
                 if isinstance(error, dict):
+                    msg = error.get("message") or result.get("message")
+                    if isinstance(msg, str) and msg.strip():
+                        clean_msg = " ".join(msg.strip().split())[:300]
+                        details.append(f"message={clean_msg}")
                     for name in ("type", "code"):
                         value = error.get(name, "")
                         if not isinstance(value, (str, int)) or isinstance(value, bool):
@@ -342,6 +345,11 @@ class Client:
                         if re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", value) and not (
                                 self.config.api_key and self.config.api_key in value):
                             details.append(f"{name}={value}")
+                elif isinstance(result, dict) and result.get("message"):
+                    msg = result["message"]
+                    if isinstance(msg, str) and msg.strip():
+                        clean_msg = " ".join(msg.strip().split())[:300]
+                        details.append(f"message={clean_msg}")
             except ValueError:
                 pass
         methods = [m.strip().upper() for m in response.headers.get("allow", "").split(",")]

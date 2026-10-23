@@ -180,7 +180,7 @@ class RetryBehaviorTests(unittest.TestCase):
                 self.assertEqual(sleeps, [0.5, 1.0])
                 self.assertIn("HTTP 500", str(raised.exception))
                 self.assertIn("type=api_error", str(raised.exception))
-                self.assertNotIn("private body", str(raised.exception))
+                self.assertIn("message=Service temporarily unavailable private body", str(raised.exception))
 
     def test_http_500_thinking_400_and_gateway_errors_share_three_attempts(self):
         attempts, events = [], []

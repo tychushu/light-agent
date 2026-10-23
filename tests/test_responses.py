@@ -142,8 +142,8 @@ class ResponsesTests(unittest.TestCase):
     def test_failed_incomplete_and_truncated_streams_never_retry_or_execute_tools(self):
         call = {'type': 'function_call', 'name': 'shell', 'call_id': 'c', 'arguments': '{"command":"must not run"}'}
         prefix = [{'type': 'response.output_item.added', 'item': call, 'output_index': 0}]
-        tails = [[], [{'type': 'error', 'code': 'PRIVATE_KEY', 'message': 'PRIVATE_BODY'}],
-                 [{'type': 'response.failed', 'response': {'status': 'failed', 'error': {'message': 'PRIVATE_BODY'}}}],
+        tails = [[], [{'type': 'error', 'code': 'RATE_LIMIT', 'message': 'rate limit hit'}],
+                 [{'type': 'response.failed', 'response': {'status': 'failed', 'error': {'message': 'gateway error'}}}],
                  [{'type': 'response.incomplete', 'response': {'status': 'incomplete', 'output': [call],
                    'incomplete_details': {'reason': 'max_output_tokens'}, 'usage': {'output_tokens': 10}}}]]
         for tail in tails:
@@ -159,8 +159,15 @@ class ResponsesTests(unittest.TestCase):
                         error = agent.run('task')
                     execute.assert_not_called()
                     self.assertIn('LLM 请求失败', error)
-                    self.assertNotIn('PRIVATE', error)
                 self.assertEqual(len(requests), 1)
+
+    def test_stream_error_passes_through_upstream_message(self):
+        events = [{'type': 'error', 'code': 'rate_limit_exceeded', 'message': 'upstream rate limit hit'}]
+        with httpx.Client(transport=httpx.MockTransport(lambda q: httpx.Response(200, text=sse(events)))) as http:
+            with self.assertRaises(ClientError) as caught:
+                Client(Config(wire_api='responses'), http_client=http).chat([], [])
+        self.assertIn('upstream rate limit hit', str(caught.exception))
+        self.assertIn('rate_limit_exceeded', str(caught.exception))
 
     def test_json_incomplete_tool_calls_are_rejected_and_refusals_are_preserved(self):
         for status in ('in_progress', 'incomplete', 'failed'):

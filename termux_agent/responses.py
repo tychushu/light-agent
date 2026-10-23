@@ -3,14 +3,32 @@ from copy import deepcopy
 import json
 
 
-def _failure(value, label):
+def _failure(value, label, client=None):
     from .client import ClientError, ContextLengthError
     error = value.get('error', value) if isinstance(value, dict) else None
-    code = error.get('code') if isinstance(error, dict) else None
+    code = error.get('code') if isinstance(error, dict) else (value.get('code') if isinstance(value, dict) else None)
     if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long'):
         return ContextLengthError('上下文超过模型窗口；请使用 /compact 或 /clear。')
-    # Never display arbitrary provider error text or request bodies.
-    return ClientError(label)
+
+    msg = None
+    if isinstance(error, dict):
+        msg = error.get('message') or error.get('msg')
+    elif isinstance(error, str):
+        msg = error
+    if not msg and isinstance(value, dict):
+        msg = value.get('message') or value.get('msg')
+
+    parts = []
+    if code and str(code) != 'None':
+        parts.append(str(code))
+    if msg and isinstance(msg, str) and msg.strip():
+        parts.append(' '.join(msg.strip().split()))
+
+    text = f"{label}（{': '.join(parts)}）" if parts else label
+    api_key = getattr(getattr(client, 'config', None), 'api_key', '')
+    if api_key:
+        text = text.replace(api_key, '[REDACTED]')
+    return ClientError(text)
 
 
 def message(client, result):
@@ -24,7 +42,7 @@ def message(client, result):
                 client.last_usage[target] = usage[source]
     status = result.get('status', 'completed')
     if result.get('error') or status == 'failed':
-        raise _failure(result, 'Responses 请求失败')
+        raise _failure(result, 'Responses 请求失败', client=client)
     if status != 'completed':
         details = result.get('incomplete_details') or {}
         client.last_finish_reason = 'length' if isinstance(details, dict) and details.get('reason') == 'max_output_tokens' else None
@@ -84,7 +102,7 @@ def read_sse(client, response):
             return
         kind = event.get('type', '')
         if kind in ('error', 'response.failed'):
-            raise _failure(event.get('response', event), 'Responses 流式请求失败')
+            raise _failure(event.get('response', event), 'Responses 流式请求失败', client=client)
         if kind in ('response.completed', 'response.incomplete'):
             terminal = event.get('response')
             if not isinstance(terminal, dict):

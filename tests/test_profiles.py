@@ -216,13 +216,13 @@ class ProviderErrorDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("Authorization", diagnostic)
         self.assertNotIn("?", diagnostic)
 
-    def test_http_error_json_identifiers_are_shown_but_message_is_redacted(self):
-        private_text = "do-not-print-provider-message"
+    def test_http_error_json_identifiers_are_shown_and_message_is_passed_through(self):
+        provider_text = "upstream-diagnostic-message"
 
         def respond(request):
             return httpx.Response(400, json={"error": {"type": "bad_request",
                                                           "code": "invalid_tools",
-                                                          "message": private_text}},
+                                                          "message": provider_text}},
                                   request=request)
 
         with httpx.Client(transport=httpx.MockTransport(respond)) as http:
@@ -232,7 +232,7 @@ class ProviderErrorDiagnosticsTests(unittest.TestCase):
         self.assertIn("400", diagnostic)
         self.assertIn("bad_request", diagnostic)
         self.assertIn("invalid_tools", diagnostic)
-        self.assertNotIn(private_text, diagnostic)
+        self.assertIn(provider_text, diagnostic)
 
     def test_http_200_html_is_rejected_with_gateway_hint(self):
         def respond(request):
