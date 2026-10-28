@@ -12,7 +12,10 @@ from .config import Config
 
 COUNTERS = ('_total_calls', '_tool_calls_total', '_usage_history',
             '_request_history_chars', '_conversation_count', '_direct_shell_count',
-            '_subagent_calls_total', '_subagent_api_calls_total', '_subagent_tool_calls_total')
+            '_subagent_calls_total', '_subagent_api_calls_total', '_subagent_tool_calls_total',
+            '_tool_calls_executed', '_tool_calls_denied', '_tool_calls_not_run',
+            '_tool_calls_approval_denied', '_tool_calls_hard_limit_not_run', '_tool_write_unknown',
+            '_http_attempts_total', '_http_retries_total', '_context_recoveries', '_task_compactions')
 
 
 def new_id():
@@ -56,6 +59,95 @@ def validate_messages(messages):
         raise ValueError('Incomplete tool turn')
 
 
+def _safe_int(value, default=0, minimum=0):
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= minimum else default
+
+
+def _safe_float(value, default=0.0, minimum=0.0):
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            if value == value and value not in (float('inf'), float('-inf')) and value >= minimum:
+                return float(value)
+        except (OverflowError, TypeError):
+            pass
+    return float(default)
+
+
+def validate_task_state(value, config=None):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return None
+    out = dict(value)
+    out['id'] = out.get('id') if isinstance(out.get('id'), str) and out['id'] else new_id()
+    out['goal'] = out.get('goal') if isinstance(out.get('goal'), str) else ''
+    out['status'] = out.get('status') if isinstance(out.get('status'), str) else 'unknown'
+    stop_reason = out.get('stop_reason')
+    out['stop_reason'] = stop_reason if isinstance(stop_reason, str) else None
+    out['started'] = _safe_float(out.get('started'), time.time())
+    out['active_seconds'] = _safe_float(out.get('active_seconds'))
+    for key in ('segments', 'logical_calls', 'tokens', 'recovery_requests', 'compactions'):
+        out[key] = _safe_int(out.get(key))
+    defaults = {
+        'max_logical_calls': getattr(config, 'max_task_calls', 32),
+        'max_active_seconds': getattr(config, 'max_task_seconds', 600.0),
+        'max_tokens': getattr(config, 'max_task_tokens', 0),
+    }
+    for key, fallback in defaults.items():
+        out[key] = _safe_int(out.get(key), fallback) if key != 'max_active_seconds' else _safe_float(out.get(key), fallback)
+    out['token_source'] = out.get('token_source') if isinstance(out.get('token_source'), str) else 'unknown'
+    out['token_budget_exact'] = out.get('token_budget_exact') if isinstance(out.get('token_budget_exact'), bool) else True
+    evidence = out.get('progress_evidence', [])
+    out['progress_evidence'] = [dict(item) for item in evidence if isinstance(item, dict)][-32:] if isinstance(evidence, list) else []
+    return out
+
+
+def validate_last_run(value):
+    if not isinstance(value, dict):
+        return {'status': 'idle', 'stop_reason': 'idle', 'auto': False, 'continuations': 0,
+                'steps': 0, 'message': '尚无任务。', 'continue_hint': '输入任务，或用 /session load ID 恢复。'}
+    out = dict(value)
+    for key in ('status', 'message', 'continue_hint', 'stop_reason', 'blocked_by'):
+        if key in out and not isinstance(out[key], (str, type(None))):
+            out[key] = str(out[key])
+    out.setdefault('status', 'idle')
+    out.setdefault('stop_reason', out.get('status'))
+    out['auto'] = out.get('auto') if isinstance(out.get('auto'), bool) else False
+    out['can_continue'] = out.get('can_continue') if isinstance(out.get('can_continue'), bool) else True
+    out['continuations'] = _safe_int(out.get('continuations'))
+    out['steps'] = _safe_int(out.get('steps'))
+    for key in ('task_budget', 'context'):
+        out[key] = dict(out[key]) if isinstance(out.get(key), dict) else {}
+    return out
+
+
+def validate_draft(value):
+    if not isinstance(value, dict):
+        return None
+    out = dict(value)
+    for key in ('content', 'reasoning_content'):
+        out[key] = out[key] if isinstance(out.get(key), str) else ''
+    for key in ('_incomplete_tool_calls', '_responses_output'):
+        out[key] = [dict(item) for item in out[key] if isinstance(item, dict)] if isinstance(out.get(key), list) else []
+        if not out[key]:
+            out.pop(key, None)
+    if '_incomplete_output' in out and not isinstance(out['_incomplete_output'], (bool, dict, str)):
+        out.pop('_incomplete_output')
+    if out.get('truncated') is not None and not isinstance(out.get('truncated'), bool):
+        out['truncated'] = bool(out['truncated'])
+    return out
+
+
+def validate_archives(value):
+    if not isinstance(value, list):
+        return []
+    result = []
+    for item in value:
+        if isinstance(item, dict) and isinstance(item.get('id'), str) and isinstance(item.get('messages'), list):
+            result.append(copy.deepcopy(item))
+    return result[-16:]
+
+
 def scrub_keys(value, extra=()):
     keys = {v for k, v in os.environ.items() if k.endswith('_API_KEY') and v}
     keys.update(v for v in extra if v)
@@ -72,7 +164,7 @@ def scrub_keys(value, extra=()):
     return scrub(value)
 
 
-def snapshot(agent, scope, checkpoint=False):
+def snapshot(agent, scope, checkpoint=False, branch=None):
     messages = copy.deepcopy(agent.messages) if checkpoint else agent.messages
     if checkpoint:
         pending = {}
@@ -86,9 +178,14 @@ def snapshot(agent, scope, checkpoint=False):
                 'error': 'Interrupted checkpoint: tool outcome is unknown. It may have run. '
                          'Inspect actual state before retrying; do not assume success or replay automatically.'})})
     validate_messages(messages)
-    value = {'version': 3, 'config': agent.config.public_dict(), 'scope': scope,
+    value = {'version': 4, 'config': agent.config.public_dict(), 'scope': scope,
              'base_system': agent.base_system,
-             'messages': messages, 'active_skills': agent.get_active_skills(), 'counters': {k: getattr(agent, k) for k in COUNTERS}}
+             'messages': messages, 'active_skills': agent.get_active_skills(), 'counters': {k: getattr(agent, k) for k in COUNTERS},
+             'task_state': agent.task_state, 'last_run': agent.last_run,
+             'incomplete_draft': agent.incomplete_draft,
+             'in_memory_archives': agent.in_memory_archives}
+    if branch is not None:
+        value['branch'] = branch
     if checkpoint:
         value['checkpoint'] = True
     return scrub_keys(value, (agent.config.api_key,))
@@ -113,7 +210,7 @@ class HistoryClient:
 
 
 def restore(payload, build_agent, *, history_fallback=False):
-    if payload.get('version') not in (1, 2, 3):
+    if payload.get('version') not in (1, 2, 3, 4):
         raise ValueError('Unsupported session version')
     validate_messages(payload['messages'])
     scope, saved = payload['scope'], payload['config']
@@ -132,14 +229,15 @@ def restore(payload, build_agent, *, history_fallback=False):
         if not history_fallback:
             raise ValueError('Session directory no longer exists')
         history_reason += '原工作目录已不存在，保留当前目录查看历史。'
-    counters = payload['counters']
+    counters = payload.get('counters')
+    counters = counters if isinstance(counters, dict) else {}
     for key in COUNTERS:
         value = counters.get(key, 0)
         if key in ('_usage_history', '_request_history_chars'):
             if not isinstance(value, list):
-                raise ValueError('Invalid session statistics')
+                counters[key] = []
         elif not isinstance(value, int) or value < 0:
-            raise ValueError('Invalid session statistics')
+            counters[key] = 0
     active_skills = payload.get('active_skills', {})
     if not isinstance(active_skills, dict):
         raise ValueError('Invalid session skills')
@@ -167,6 +265,11 @@ def restore(payload, build_agent, *, history_fallback=False):
     agent.system = agent.messages[0]['content']
     for key in COUNTERS:
         setattr(agent, key, counters.get(key, 0))
+    agent.task_state = validate_task_state(payload.get('task_state'), config)
+    agent.last_run = validate_last_run(payload.get('last_run', agent.last_run))
+    agent.incomplete_draft = validate_draft(payload.get('incomplete_draft'))
+    agent.in_memory_archives = validate_archives(payload.get('in_memory_archives'))
+    agent._unsafe_write_fingerprints = agent._scan_unsafe_writes(agent.messages)
     return config, agent, scope
 
 
@@ -207,7 +310,7 @@ class SessionStore:
         if not re.fullmatch('[0-9a-f]{12}', identifier):
             raise ValueError('Use the exact 12-character session ID from /sessions')
 
-    def save(self, identifier, revision, payload, clear_draft=True):
+    def save(self, identifier, revision, payload, clear_draft=True, title=None):
         self.check_id(identifier)
         text = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
         if len(text.encode()) > 20 * 1024 * 1024:
@@ -215,8 +318,10 @@ class SessionStore:
         with self.db:
             if revision == 0:
                 first = next((m.get('content', '') for m in payload['messages'] if m['role'] == 'user'), '')
-                title = (' '.join(first.split())[:60] if isinstance(first, str) else '') or 'New session'
-                self.db.execute('INSERT INTO sessions VALUES (?,?,?,?,?)', (identifier, title, time.time(), 1, text))
+                saved_title = validate_title(title) if title is not None else (
+                    (' '.join(first.split())[:60] if isinstance(first, str) else '') or 'New session')
+                self.db.execute('INSERT INTO sessions VALUES (?,?,?,?,?)',
+                                (identifier, saved_title, time.time(), 1, text))
             else:
                 result = self.db.execute('UPDATE sessions SET payload=?,updated=?,revision=revision+1 WHERE id=? AND revision=?',
                                          (text, time.time(), identifier, revision))
@@ -232,7 +337,10 @@ class SessionStore:
 
     def save_draft(self, identifier, revision, draft):
         self.check_id(identifier)
-        text = json.dumps(scrub_keys(draft), ensure_ascii=False)
+        safe = validate_draft(draft)
+        if safe is None:
+            raise ValueError('Draft must be an object')
+        text = json.dumps(scrub_keys(safe), ensure_ascii=False)
         if len(text) > 256_000:
             raise ValueError('Stream draft exceeds 256000 characters')
         with self.db:
@@ -247,7 +355,12 @@ class SessionStore:
         self.check_id(identifier)
         row = self.db.execute('SELECT d.payload FROM drafts d JOIN sessions s ON s.id=d.id '
                               'AND s.revision=d.revision WHERE d.id=?', (identifier,)).fetchone()
-        return json.loads(row[0]) if row else None
+        if not row:
+            return None
+        try:
+            return validate_draft(json.loads(row[0]))
+        except (TypeError, ValueError):
+            return {'content': '', 'reasoning_content': '', 'invalid_saved_draft': True}
 
     def load(self, identifier):
         self.check_id(identifier)
@@ -350,11 +463,16 @@ class SessionStore:
             raise
         return target.resolve()
 
-    def rename(self, identifier, title):
+    def rename(self, identifier, title, revision=None):
         self.check_id(identifier)
         title = validate_title(title)
         with self.db:
-            if self.db.execute('UPDATE sessions SET title=? WHERE id=?', (title, identifier)).rowcount != 1:
+            if revision is None:
+                result = self.db.execute('UPDATE sessions SET title=? WHERE id=?', (title, identifier))
+            else:
+                result = self.db.execute('UPDATE sessions SET title=? WHERE id=? AND revision=?',
+                                         (title, identifier, revision))
+            if result.rowcount != 1:
                 raise ValueError('Session not found')
         return title
 

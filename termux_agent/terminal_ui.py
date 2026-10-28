@@ -8,7 +8,7 @@ import unicodedata
 
 
 COMMANDS = (
-    "/help", "/clear", "/compact", "/recall", "/export", "/stats", "/config", "/debug", "/debug-context",
+    "/help", "/clear", "/compact", "/continue", "/status", "/recall", "/export", "/stats", "/config", "/debug", "/debug-context",
     "/api", "/agent", "/skill", "/copy", "/paste", "/sessions", "/session", "/title",
     "/history", "/silent", "/auto", "/run", "/sub", "/exit",
 )
@@ -21,6 +21,7 @@ SUBCOMMANDS = {
     "/export": ("markdown", "json"),
     "/silent": ("on", "off"),
     "/auto": ("on", "off", "steps"),
+    "/compact": ("task",),
 }
 
 

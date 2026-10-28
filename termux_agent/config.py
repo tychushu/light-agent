@@ -37,6 +37,25 @@ class Config:
     auto_continue: bool = False
     max_continuations: int = 3
     wire_api: str = "chat_completions"
+    max_task_calls: int = 32
+    max_task_seconds: float = 600.0
+    max_task_tokens: int = 0
+    auto_extend_segments: bool = False
+    auto_compact_task: bool = False
+    auto_compact_keep_groups: int = 2
+    auto_compact_threshold: float = 0.85
+    context_recovery: bool = False
+    no_progress_detection: bool = False
+    no_progress_threshold: int = 3
+    context_window_tokens: int = 0
+    output_reserve_tokens: int = 512
+    max_output_tokens: int = 0
+    chat_include_usage: bool = False
+    chat_max_tokens_field: str = "max_completion_tokens"
+    token_count_mode: str = "estimate"
+    token_cache_ttl: int = 86_400
+    token_metadata_base_url: str = ""
+    reasoning_effort: str = ""
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -51,7 +70,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold", "context_recovery", "no_progress_detection", "no_progress_threshold", "context_window_tokens", "output_reserve_tokens", "max_output_tokens", "chat_include_usage", "chat_max_tokens_field", "token_count_mode", "token_cache_ttl", "token_metadata_base_url", "reasoning_effort"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -67,7 +86,15 @@ class Config:
             for required in ("base_url", "model"):
                 if required not in entry:
                     raise ValueError(f"API profile requires {required}")
-            for key in ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "user_agent", "stream", "max_context_chars", "wire_api"):
+            profile_keys = ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts",
+                            "user_agent", "stream", "max_context_chars", "wire_api", "max_steps",
+                            "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments",
+                            "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold",
+                            "context_recovery", "no_progress_detection", "no_progress_threshold",
+                            "context_window_tokens", "output_reserve_tokens", "max_output_tokens",
+                            "chat_include_usage", "chat_max_tokens_field", "token_count_mode",
+                                "token_cache_ttl", "token_metadata_base_url", "reasoning_effort")
+            for key in profile_keys:
                 if key in entry:
                     setattr(config, key, entry[key])
             # Retrying the known thinking-format error is opt-in per API profile.
@@ -105,6 +132,10 @@ class Config:
                 raise ValueError(f"{key} must be between {low} and {high}")
         if not isinstance(self.auto_continue, bool):
             raise ValueError("auto_continue must be a boolean")
+        for key in ("auto_extend_segments", "auto_compact_task", "context_recovery",
+                    "no_progress_detection", "chat_include_usage"):
+            if not isinstance(getattr(self, key), bool):
+                raise ValueError(f"{key} must be a boolean")
         if (not isinstance(self.max_continuations, int) or isinstance(self.max_continuations, bool)
                 or not 1 <= self.max_continuations <= 8):
             raise ValueError("max_continuations must be between 1 and 8")
@@ -135,10 +166,42 @@ class Config:
             raise ValueError("model must be a non-empty string")
         if not isinstance(self.max_steps, int) or isinstance(self.max_steps, bool) or self.max_steps < 1:
             raise ValueError("max_steps must be a positive integer")
+        for key, low, high in (("max_task_calls", 1, 1024),
+                               ("max_task_tokens", 0, 10_000_000),
+                               ("auto_compact_keep_groups", 1, 20),
+                               ("no_progress_threshold", 2, 20),
+                               ("context_window_tokens", 0, 10_000_000),
+                               ("output_reserve_tokens", 0, 1_000_000),
+                               ("max_output_tokens", 0, 1_000_000),
+                               ("token_cache_ttl", 60, 2_592_000)):
+            value = getattr(self, key)
+            if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
+                raise ValueError(f"{key} must be between {low} and {high}")
+        if (not isinstance(self.max_task_seconds, (int, float)) or isinstance(self.max_task_seconds, bool)
+                or not math.isfinite(self.max_task_seconds) or not 1 <= self.max_task_seconds <= 86_400):
+            raise ValueError("max_task_seconds must be between 1 and 86400 seconds")
+        if (not isinstance(self.auto_compact_threshold, (int, float))
+                or isinstance(self.auto_compact_threshold, bool)
+                or not math.isfinite(self.auto_compact_threshold)
+                or not 0.5 <= self.auto_compact_threshold <= 0.95):
+            raise ValueError("auto_compact_threshold must be between 0.5 and 0.95")
+        if self.context_window_tokens and self.output_reserve_tokens >= self.context_window_tokens:
+            raise ValueError("output_reserve_tokens must be smaller than context_window_tokens")
+        if self.max_output_tokens and self.output_reserve_tokens < self.max_output_tokens:
+            raise ValueError("output_reserve_tokens must be at least max_output_tokens")
+        if self.chat_max_tokens_field not in ("max_completion_tokens", "max_tokens"):
+            raise ValueError("chat_max_tokens_field must be max_completion_tokens or max_tokens")
+        if self.token_count_mode not in ("estimate", "local", "off"):
+            raise ValueError("token_count_mode must be estimate, local, or off")
+        if self.reasoning_effort not in ("", "low", "medium", "high"):
+            raise ValueError("reasoning_effort must be empty, low, medium, or high")
         if not isinstance(self.max_output_chars, int) or isinstance(self.max_output_chars, bool) or not 128 <= self.max_output_chars <= 20_000:
             raise ValueError("max_output_chars must be between 128 and 20000")
         if self.wire_api not in ("chat_completions", "responses"):
             raise ValueError("wire_api must be chat_completions or responses")
+        if (not isinstance(self.token_metadata_base_url, str)
+                or self.token_metadata_base_url and not self.token_metadata_base_url.startswith(("http://", "https://"))):
+            raise ValueError("token_metadata_base_url must be an http(s) URL or empty")
         if self.approval_policy not in {"always", "on-risk", "never"}:
             raise ValueError("approval_policy must be always, on-risk, or never")
         if not isinstance(self.timeout, (int, float)) or isinstance(self.timeout, bool) or not math.isfinite(self.timeout) or not 0 < self.timeout <= 3600:

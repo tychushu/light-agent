@@ -4,47 +4,33 @@ import json
 
 
 def _failure(value, label, client=None):
-    from .client import ClientError, ContextLengthError, upstream_error_fields, upstream_error_text
+    from .client import ProviderError, ContextLengthError, upstream_error_fields, upstream_error_text
     error = upstream_error_fields(value)
     code = error.get('code')
-    if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long'):
-        return ContextLengthError('上下文超过模型窗口；请使用 /compact 或 /clear。')
+    if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long',
+                'context_shift', 'context_shift_error'):
+        return ContextLengthError('上下文超过模型窗口；请使用 /compact task、/compact N 或 /clear。',
+                                  pre_accept=False)
 
     api_key = getattr(getattr(client, 'config', None), 'api_key', '')
     parts = [upstream_error_text(code, api_key, 80),
              upstream_error_text(error.get('message', ''), api_key, 2000)]
     detail = ': '.join(part for part in parts if part)
-    return ClientError(f'{label}（{detail}）' if detail else label)
+    return ProviderError(f'{label}（{detail}）' if detail else label)
 
 
-def message(client, result):
-    from .client import ClientError
-    usage = result.get('usage')
-    if isinstance(usage, dict):
-        client.last_usage = dict(usage)
-        for source, target in (('input_tokens', 'prompt_tokens'), ('output_tokens', 'completion_tokens'),
-                               ('output_tokens_details', 'completion_tokens_details')):
-            if source in usage:
-                client.last_usage[target] = usage[source]
-    status = result.get('status', 'completed')
-    if result.get('error') or status == 'failed':
-        raise _failure(result, 'Responses 请求失败', client=client)
-    if status != 'completed':
-        details = result.get('incomplete_details') or {}
-        client.last_finish_reason = 'length' if isinstance(details, dict) and details.get('reason') == 'max_output_tokens' else None
-        text = ('Responses 输出预算耗尽，响应未完成；未执行其中的工具调用。' if client.last_finish_reason == 'length'
-                else 'Responses 响应未完成；未执行其中的工具调用。')
-        raise ClientError(text)
-    output = result.get('output', [])
+def _decode_output(output, *, incomplete=False):
+    from .client import IncompleteOutputError, ProviderError
     if not isinstance(output, list) or any(not isinstance(item, dict) for item in output):
-        raise ClientError('Responses output must be an array of items')
-    content, reasoning, calls, refusals = [], [], [], []
+        raise ProviderError('Responses output must be an array of items')
+    content, reasoning, calls, refusals, saved = [], [], [], [], []
     for item in output:
         kind = item.get('type')
         if kind in ('message', 'reasoning'):
+            saved.append(deepcopy(item))
             parts = item.get('content') or []
             if not isinstance(parts, list):
-                raise ClientError('Invalid Responses content parts')
+                raise ProviderError('Invalid Responses content parts')
             if kind == 'reasoning':
                 parts = parts + (item.get('summary') or [])
             for part in parts:
@@ -57,17 +43,46 @@ def message(client, result):
                     if part.get('type') == 'refusal' and isinstance(part.get('refusal'), str):
                         refusals.append(part['refusal'])
         elif kind == 'function_call':
+            saved.append(deepcopy(item))
             calls.append({'id': item.get('call_id') or item.get('id', ''), 'type': 'function',
                           'function': {'name': item.get('name', ''), 'arguments': item.get('arguments', '{}')}})
-    client.last_finish_reason = 'content_filter' if refusals else 'stop'
-    answer = {'role': 'assistant', 'content': ''.join(content),
-              '_responses_output': deepcopy([i for i in output if i.get('type') in ('message', 'reasoning', 'function_call')])}
+    answer = {'role': 'assistant', 'content': ''.join(content), '_responses_output': saved}
     if reasoning:
         answer['reasoning_content'] = ''.join(reasoning)
-    if calls:
-        answer['tool_calls'] = calls
     if refusals:
         answer['refusal'] = ''.join(refusals)
+    if incomplete:
+        if calls:
+            answer['_incomplete_tool_calls'] = calls
+    elif calls:
+        answer['tool_calls'] = calls
+    return answer
+
+
+def message(client, result):
+    from .client import IncompleteOutputError
+    usage = result.get('usage')
+    if isinstance(usage, dict):
+        client.last_usage = dict(usage)
+        for source, target in (('input_tokens', 'prompt_tokens'), ('output_tokens', 'completion_tokens'),
+                               ('output_tokens_details', 'completion_tokens_details')):
+            if source in usage:
+                client.last_usage[target] = usage[source]
+    status = result.get('status', 'completed')
+    if result.get('error') or status == 'failed':
+        raise _failure(result, 'Responses 请求失败', client=client)
+    if status != 'completed':
+        details = result.get('incomplete_details') or {}
+        reason = details.get('reason') if isinstance(details, dict) else None
+        client.last_finish_reason = 'length' if reason in ('max_output_tokens', 'context_shift', 'truncated') else None
+        client.context_limited = reason in ('context_shift', 'truncated')
+        answer = _decode_output(result.get('output', []), incomplete=True)
+        text = ('Responses 输出在达到长度上限时截断；正文或工具参数只是未完成草稿，其中工具调用不会执行。'
+                if client.last_finish_reason == 'length'
+                else 'Responses 响应未完成；正文或工具参数只是草稿，工具调用不会执行。')
+        raise IncompleteOutputError(text, answer)
+    answer = _decode_output(result.get('output', []))
+    client.last_finish_reason = 'content_filter' if answer.get('refusal') else 'stop'
     return answer
 
 

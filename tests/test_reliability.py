@@ -94,7 +94,8 @@ class ReliabilityTests(unittest.TestCase):
                 self.assertIn('输出预算', agent.run('hello'))
                 self.assertEqual(agent.last_run['status'], 'empty_response')
                 self.assertEqual(agent.stats()['usage_totals']['reasoning_tokens'], 10)
-                self.assertEqual(agent.messages[-1]['reasoning_content'], 'thinking')
+                self.assertNotIn('reasoning_content', agent.messages[-1])
+                self.assertEqual(agent.incomplete_draft['reasoning_content'], 'thinking')
             self.assertEqual(len(calls), 1)
 
     def test_compaction_keeps_whole_tool_turns_and_original_is_untouched(self):

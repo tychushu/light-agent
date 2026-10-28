@@ -1,0 +1,2 @@
+[TASK_RESUME]
+Continue the same task from the existing conversation and checkpoints. Do not replay prior tool calls or assume unknown outcomes succeeded. Inspect current state before repeating any write. Finish only when the original goal and current constraints are satisfied.

@@ -52,7 +52,8 @@ class ContinuationTests(unittest.TestCase):
         agent = Agent(Config(auto_continue=True, max_steps=8), client=client)
         original_system = agent.system
         self.assertEqual(agent.run('Read both files, continue without asking.'), 'Read both.')
-        self.assertEqual(agent.last_run, {'status': 'complete', 'auto': True, 'continuations': 2})
+        self.assertEqual({k: agent.last_run[k] for k in ('status', 'auto', 'continuations')},
+                         {'status': 'complete', 'auto': True, 'continuations': 2})
         self.assertEqual(agent.stats()['api_calls_total'], 5)
         self.assertEqual(agent.stats()['tool_calls_total'], 2)
         self.assertEqual(agent.messages[0]['content'], original_system)

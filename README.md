@@ -47,12 +47,35 @@ timeout = 120.0 # HTTP request timeout; shell defaults to 30 seconds
 # retry_thinking_400 = false # opt-in for the known structured-thinking 400 response
 # max_subagents = 3 # workers per parent task; 0 disables delegation
 # subagent_max_steps = 6 # model calls per worker; 1..12, capped by max_steps
+# max_task_calls = 32
+# max_task_seconds = 600.0
+# max_task_tokens = 0
+# auto_extend_segments = false
+# auto_compact_task = false
+# auto_compact_keep_groups = 2
+# auto_compact_threshold = 0.85
+# context_recovery = false
+# no_progress_detection = false
+# no_progress_threshold = 3
+# context_window_tokens = 0
+# output_reserve_tokens = 512
+# max_output_tokens = 0
+# chat_include_usage = false
+# chat_max_tokens_field = "max_completion_tokens"
+# token_count_mode = "estimate" # estimate, local, or off
+# token_cache_ttl = 86400
+# token_metadata_base_url = ""
+# reasoning_effort = "" # empty, low, medium, or high
 ```
 
 `ta --config path.toml` selects another config. `ta --prompt '执行 uname -a'` runs
-one turn. REPL commands: `/help`, `/clear`, `/stats`, `/config`, `/debug`,
-`/debug-context`, `/skill list|info|load|unload|clear`, `/copy`, `/paste`, `/exit`. `/clear` starts a fresh session, preserving the previous conversation in local history.
-Stats include each request’s usage and character counts. Token totals may be partial when `usage_missing_requests` is nonzero. Stats use server-provided token counts; no tokenizer or estimated tokens are used.
+one turn. REPL commands: `/help`, `/clear`, `/stats`, `/status`, `/continue [N]`,
+`/compact [N]`, `/compact task [N]`, `/config`, `/debug`, `/debug-context`,
+`/skill list|info|load|unload|clear`, `/copy`, `/paste`, `/exit`. `/clear` starts a fresh session, preserving the previous conversation in local history.
+Stats include each request’s usage and character counts. Token totals may be
+partial when `usage_missing_requests` is nonzero. Provider usage totals use
+server-provided counts; context-budget token measurements are separately labeled
+as local counts or conservative estimates.
 Debug context is the last request body (messages include the system prompt), with
 the configured API key redacted. It can still contain private file/tool content.
 
@@ -75,6 +98,23 @@ verification is model behavior, not a mandatory filesystem policy.
 No services, Android settings, root configuration or startup scripts are changed.
 Completed turns are saved locally unless `--no-session` is used. Failed calls become tool results so the model
 can recover. SSE token/reasoning/tool-call deltas stream interactively. Transient HTTP/network failures share a bounded retry policy (three total attempts by default); accepted responses and partial streams are never replayed. The optional `retry_thinking_400` recovery policy is off by default; see the profile guidance below.
+
+## Task continuation, status and time budgets
+
+`/status` reports `stop_reason` together with the legacy `reason` alias, the stop
+message, continuation hint, current segment/step and persisted task budget.
+`/continue [N]` resumes the same logical task for at most `N` model requests
+(default `max_steps`, range 1–256). Unknown tool outcomes remain explicit: a
+crash checkpoint closes open calls with an unknown result, and an identical
+write is not blindly replayed.
+
+`max_task_calls` counts logical model requests in one task, including recovery
+requests. `max_task_tokens` uses server counts when available and conservative
+estimates otherwise, so `token_budget_exact` can be false. `max_task_seconds`
+accumulates active execution across segments and sessions, but is checked only
+before model requests and between tool calls. It cannot preempt an HTTP request
+or a running tool/shell process; use `timeout` and tool timeouts below the task
+budget when a hard response deadline is required.
 
 ## Test / uninstall
 
@@ -364,6 +404,37 @@ there is no extra model call. The old session remains searchable and loadable.
 One large turn can still exceed the budget; retain fewer turns or start fresh.
 `/recall keyword` searches only on demand and does not insert search results into
 model context. No full-text index or background scan is created.
+
+`/compact task [N]` compacts one task's older complete tool groups and retains
+the newest `N` groups verbatim (default 2). Automatic `auto_compact_task` uses
+the same archive-and-branch operation at `auto_compact_threshold`; the threshold
+uses the larger of the character-budget ratio and available token-window ratio.
+If deterministic compaction does not reduce the context, it creates no archive
+and no throwaway branch. A real compaction preserves the pre-compaction row as
+the archive and creates a new active branch. The original task goal, later user
+constraints, resume intent, source row metadata and recent reasoning/tool pairs
+remain in the new context; omitted raw arguments, results and reasoning remain
+in the archive. Immediate resume compaction creates and checkpoints the new
+branch before any model call or tool executes. SQLite revisions are monotonic
+CAS checks: a concurrent writer stops that save safely and is never rolled back.
+
+`max_context_chars` remains a deterministic character fallback over messages and
+tool schemas, not a token count. `token_count_mode = "estimate"` uses a
+conservative offline heuristic and always labels `exact = false`. `"local"` may
+use llama.cpp-compatible `/props`, `/slots`, `/apply-template` and `/tokenize`
+capabilities with bounded caching, falling back to the estimate if unavailable.
+`"off"` performs no token-count requests. Provider usage is recorded separately
+and can be missing for individual responses. Context budget checks reserve
+`max(output_reserve_tokens, max_output_tokens)` output tokens; the configured
+fields remain unchanged.
+
+For a local llama.cpp server, start with `token_count_mode = "local"`,
+`context_window_tokens = 0` to use discovered metadata,
+`output_reserve_tokens = 512` or the desired generation reserve,
+`auto_compact_task = true`, `auto_compact_keep_groups = 2`,
+`auto_compact_threshold = 0.85`, and `context_recovery = true`. For remote APIs,
+set a truthful `context_window_tokens` and retain the estimate label unless the
+provider supplies actual usage.
 
 The database is local plaintext, containing conversation/file/tool content, with
 known API key values redacted. This is history storage, not an automatic memory

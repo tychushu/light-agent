@@ -1,5 +1,6 @@
 """Plain terminal REPL; no terminal UI framework."""
 import argparse
+import copy
 import json
 import sys
 import os
@@ -27,6 +28,9 @@ Tab             补全命令、API 配置、会话 ID 和技能名称
 ~/path 或 /path  补全本地路径；回车将 UTF-8 文本文件内容提交给模型
 /clear          新建空白会话，保留原会话历史
 /compact [N]    归档完整会话，新会话保留最近 N 轮（默认 6），不调用模型
+/compact task [N]  压缩当前单任务工具链；保留最近 N 个完整工具组，不调用模型
+/continue [N]   从检查点继续同一任务，开始一个新的受控模型调用段
+/status         查看上次停止原因和继续方式
 /recall TEXT    在已保存会话正文和工具参数中检索，最多显示 20 个会话
 /export [ID] [markdown|json] [PATH]  导出会话；默认当前会话、Markdown、新文件
 /stats          查看模型调用、服务端 token 用量和上下文大小
@@ -201,6 +205,12 @@ def main():
     read_grant = False
     stream_draft = {}
     draft_saved_at = 0.0
+    saved_fingerprint = None
+    loaded_row = None
+    source_meta = None
+    active_branch = True
+    source_fingerprint = None
+    branch_state = {'kind': 'active'}
     formatter = Columns(sys.stdout, enabled=sys.stdout.isatty() and options.prompt is None)
 
     def redact(text):
@@ -242,6 +252,19 @@ def main():
             display(f"上下文字符预算已用 {payload['chars'] / payload['limit']:.0%}；"
                     '可用 /compact 缩短上下文（字符预算不等于模型 token 窗口）。', 'Context')
             return
+        if kind == 'step_start':
+            if debug:
+                display({"step": payload.get("step"), "segment": payload.get("segment"),
+                         "task_logical_calls": payload.get("task_logical_calls"),
+                         "max_task_logical_calls": payload.get("max_task_logical_calls")}, "Progress")
+            return
+        if kind == 'segment_extension':
+            if debug:
+                display({"segment_extension": payload}, "Progress")
+            return
+        if kind == 'task_compacted':
+            display({"task_compacted": payload}, "Context")
+            return
         if kind in ("subagent_start", "subagent_end"):
             detail = (f"model={payload['model']} · steps≤{payload['max_steps']}"
                       if kind == "subagent_start" else payload["status"])
@@ -274,7 +297,7 @@ def main():
         safe = "".join(c if c in "\n\t" or c.isprintable() else f"\\x{ord(c):02x}" for c in value)
         formatter.feed("Think" if kind == "reasoning" else "Agent", redact(safe))
         stream_wrote = True
-        if store and revision:
+        if store and revision and active_branch:
             field = 'reasoning_content' if kind == 'reasoning' else 'content'
             combined = stream_draft.get(field, '') + redact(value)
             if len(combined) > 64000:
@@ -290,8 +313,10 @@ def main():
         streamed = getattr(agent.client, "streamed", False)
         if stream_wrote:
             formatter.finish()
-        failure = value.startswith(("LLM 请求失败", "LLM 请求已中断", "已达到最大模型请求",
-                                    "自动任务", "任务因审批", "工具执行已中断"))
+        stopped = getattr(agent, 'last_run', {}).get("status") in (
+            "limit", "incomplete", "context_limit", "blocked", "stalled", "error", "empty_response")
+        failure = stopped or value.startswith(("LLM 请求失败", "LLM 请求已中断", "已达到最大模型请求",
+                                                "同一任务的硬预算", "自动任务", "任务因审批", "工具执行已中断"))
         if value and (not streamed or not getattr(agent.client, "streamed_text", False) or failure):
             display(value, "Agent")
         stream_wrote = False
@@ -313,6 +338,8 @@ def main():
         built.client.on_stream = stream_output
         built.client.on_retry = retry_output
         built.checkpoint = lambda: save_current(checkpoint=True)
+        built.branch_after_compact = lambda archive_id, messages, details: branch_after_compact(
+            archive_id, messages, details)
         return built
 
     try:
@@ -347,16 +374,85 @@ def main():
     def history_mode(current=None):
         return getattr(agent if current is None else current, 'history_only', False) is True
 
+    def current_scope():
+        return {"directory": str(directory), "config_path": config_path,
+                "session_file": session_file, "disabled": disabled,
+                "instructions": instructions, "instruction_path": instruction_path}
+
+    def payload_fingerprint(value):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+    def current_branch(archive_id=None):
+        value = dict(branch_state) if active_branch else {
+            'kind': 'active',
+            'source_session_id': session_id,
+            'source_title': source_meta.get('title') if source_meta else None,
+            'source_updated': source_meta.get('updated') if source_meta else None,
+            'source_revision': source_meta.get('revision') if source_meta else None,
+        }
+        value['kind'] = 'active'
+        if archive_id:
+            value['archive_session_id'] = archive_id
+        return value
+
+    def create_active_branch(value, title, archive_id=None, draft=None):
+        nonlocal session_id, revision, saved_fingerprint, active_branch
+        nonlocal loaded_row, source_fingerprint, branch_state, source_meta
+        identifier = new_id()
+        branch = current_branch(archive_id)
+        value['branch'] = branch
+        store.save(identifier, 0, value, title=title)
+        if draft:
+            store.save_draft(identifier, 1, draft)
+        session_id, revision = identifier, 1
+        active_branch = True
+        loaded_row = None
+        source_fingerprint = None
+        branch_state = branch
+        source_meta = {'title': branch.get('source_title'), 'updated': branch.get('source_updated'),
+                       'revision': branch.get('source_revision')}
+        saved_fingerprint = payload_fingerprint(value)
+        if agent is not None:
+            agent.archive_id = identifier
+        return identifier
+
     def save_current(force=False, checkpoint=False):
-        nonlocal revision
+        nonlocal revision, saved_fingerprint, active_branch, loaded_row, branch_state
         if agent is not None and history_mode():
             return
         if store and agent is not None and (force or revision or len(agent.messages) > 1):
-            scope = {"directory": str(directory), "config_path": config_path,
-                     "session_file": session_file, "disabled": disabled,
-                     "instructions": instructions, "instruction_path": instruction_path}
-            revision = store.save(session_id, revision, snapshot(agent, scope, checkpoint=checkpoint),
-                                  clear_draft=checkpoint and agent.last_run['status'] not in ('error', 'interrupted'))
+            value = snapshot(agent, current_scope(), checkpoint=checkpoint)
+            fingerprint = payload_fingerprint(value)
+            plain = snapshot(agent, current_scope(), checkpoint=checkpoint)
+            plain.pop('branch', None)
+            plain_fingerprint = payload_fingerprint(plain)
+            unchanged_source = not active_branch and plain_fingerprint == source_fingerprint
+            if not force and not checkpoint and (fingerprint == saved_fingerprint or unchanged_source):
+                return
+            clear_draft = checkpoint and getattr(agent, 'last_run', {}).get('status') not in ('error', 'interrupted')
+            if not active_branch:
+                branch = current_branch()
+                value['branch'] = branch
+                revision = store.save(session_id, revision, value, clear_draft=clear_draft)
+                active_branch, loaded_row = True, None
+                branch_state = branch
+            else:
+                value['branch'] = current_branch()
+                revision = store.save(session_id, revision, value, clear_draft=clear_draft)
+            saved_fingerprint = payload_fingerprint(value)
+
+    def branch_after_compact(archive_id, messages, details):
+        nonlocal session_id, revision, saved_fingerprint
+        if not store:
+            agent.in_memory_archives.append({'id': archive_id,
+                                             'messages': copy.deepcopy(agent.messages)})
+            return False
+        title = current_title()
+        value = snapshot(agent, current_scope(), branch=current_branch(archive_id))
+        value['messages'] = copy.deepcopy(messages)
+        draft = store.draft(archive_id)
+        create_active_branch(value, title[:95] + ' · compact task', archive_id=archive_id, draft=draft)
+        return True
 
     def submit_input(value, automatic=None):
         nonlocal stream_wrote, read_grant
@@ -396,11 +492,12 @@ def main():
     def rename_current(value):
         title = validate_title(value)
         save_current(force=True)
-        store.rename(session_id, title)
+        store.rename(session_id, title, revision)
         display(f"{session_id} · {title}", "Session")
 
     def switch_api(name, persist=False):
-        nonlocal config, agent, session_id, revision
+        nonlocal config, agent, session_id, revision, saved_fingerprint
+        nonlocal active_branch, loaded_row, source_fingerprint, branch_state
         candidate = Config.load(config_path, name)
         if name == config.api_profile and not history_mode():
             if persist:
@@ -410,53 +507,75 @@ def main():
         if persist:
             profile_store.set_default(name)
         replacement = build_agent(candidate, instructions)
-        agent.client.close()
+        getattr(agent, 'close', agent.client.close)()
         config, agent = candidate, replacement
         session_id, revision = new_id(), 0
+        active_branch, loaded_row, source_fingerprint = True, None, None
+        branch_state, saved_fingerprint = {'kind': 'active'}, None
+        agent.archive_id = None
         return True
 
-    def load_session(identifier):
+    def load_session(identifier, save_existing=True, active=False):
         nonlocal agent, config, directory, config_path, session_file, disabled
         nonlocal instructions, instruction_path, session_id, revision
-        nonlocal registry, profile_store
+        nonlocal registry, profile_store, saved_fingerprint, loaded_row
+        nonlocal active_branch, source_fingerprint, branch_state, source_meta
+        loaded_row = store.db.execute(
+            'SELECT title,updated,revision,payload FROM sessions WHERE id=?', (identifier,)).fetchone()
         next_revision, payload = store.load(identifier)
         next_config, replacement, scope = restore(payload, build_agent, history_fallback=True)
         target_directory = Path(scope['directory'])
         if history_mode(replacement) and not target_directory.is_dir():
             target_directory = Path.cwd()
         try:
-            save_current()
+            if save_existing:
+                save_current()
             os.chdir(target_directory)
         except Exception:
-            replacement.client.close()
+            getattr(replacement, 'close', replacement.client.close)()
             raise
         if agent is not None:
-            agent.client.close()
+            getattr(agent, 'close', agent.client.close)()
         config, agent = next_config, replacement
         directory, config_path = target_directory, scope['config_path']
         session_file, disabled = scope['session_file'], scope['disabled']
         instructions, instruction_path = scope['instructions'], scope['instruction_path']
         session_id, revision = identifier, next_revision
+        active_branch = active
+        branch_state = dict(payload.get('branch') or {'kind': 'active'})
+        if active_branch:
+            loaded_row = None
+            source_fingerprint = None
+        else:
+            source_meta = {'title': loaded_row[0], 'updated': loaded_row[1], 'revision': loaded_row[2]}
+            source_fingerprint = payload_fingerprint(snapshot(replacement, current_scope()))
+        saved_fingerprint = payload_fingerprint(snapshot(replacement, current_scope(), branch=branch_state))
+        replacement.archive_id = identifier
         registry = SkillRegistry()
         profile_store = ProfileStore(config_path)
         if history_mode():
             display('历史查看模式：' + agent.client.reason + '可用 /history、/recall、/export 查看；'
                     '用 /api NAME 新建会话，原历史保持保存。', 'History')
         draft = store.draft(identifier)
-        if payload.get('checkpoint') or draft:
+        incomplete = agent.incomplete_draft
+        if payload.get('checkpoint') or draft or incomplete:
             display('恢复了未完成任务的检查点；工具状态不明时先核实实际结果。', 'Recovery')
         if draft:
             display('上次流式草稿（未完成，未加入模型上下文；/export 可完整导出）：\n' +
                     (draft.get('content') or draft.get('reasoning_content') or '')[:4000], 'Draft')
+        if incomplete:
+            text = incomplete.get('content') or incomplete.get('reasoning_content') or ''
+            display('恢复了未完成输出草稿；未完成工具调用只保留在草稿中，未加入模型上下文：\n' +
+                    text[:4000], 'Draft')
 
     def compact_current(keep):
         from .context import compact_messages
+        nonlocal session_id, revision
         if not 1 <= keep <= 100:
             raise ValueError('Use /compact [1–100 recent user turns]')
-        save_current(force=True)
         original = session_id
         title = current_title()
-        _, payload = store.load(original)
+        payload = snapshot(agent, current_scope())
         messages, omitted = compact_messages(payload['messages'], keep, original)
         if not omitted:
             display('消息轮次未超过保留数量，无需精简。', 'Context')
@@ -465,7 +584,7 @@ def main():
         identifier = new_id()
         store.save(identifier, 0, payload)
         store.rename(identifier, title[:100] + ' · compact')
-        load_session(identifier)
+        load_session(identifier, save_existing=False, active=True)
         display(f'完整历史保留于 {original}；当前会话 {identifier} 已省略 {omitted} 条早期消息。', 'Context')
 
     try:
@@ -493,7 +612,7 @@ def main():
             if not prompt:
                 continue
             if history_mode() and prompt.split(maxsplit=1)[0] not in (
-                    '/help', '/sessions', '/session', '/history', '/stats', '/config', '/debug',
+                    '/help', '/sessions', '/session', '/history', '/stats', '/status', '/config', '/debug',
                     '/debug-context', '/silent', '/api', '/title', '/recall', '/export', '/copy', '/paste', '/exit'):
                 display('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。', 'History')
                 continue
@@ -518,19 +637,48 @@ def main():
                 try:
                     save_current()
                     replacement = build_agent(config, instructions)
-                    agent.client.close()
+                    getattr(agent, 'close', agent.client.close)()
                     agent = replacement
                     session_id, revision = new_id(), 0
+                    active_branch, loaded_row, source_fingerprint = True, None, None
+                    branch_state, saved_fingerprint = {'kind': 'active'}, None
+                    agent.archive_id = None
                     display("New session; previous conversation remains saved.")
                 except (ValueError, OSError, sqlite3.Error) as exc:
                     display(f"Error: {exc}")
             elif prompt == "/stats":
                 display(agent.stats())
+            elif prompt == '/status':
+                display(agent.stats()['stop'])
+            elif prompt == '/continue' or prompt.startswith('/continue '):
+                try:
+                    value = prompt[9:].strip()
+                    answer = agent.continue_task(int(value) if value else None)
+                    show_answer(answer); save_current()
+                except (ValueError, OSError, sqlite3.Error) as exc:
+                    display(f'Error: {exc}')
             elif prompt == '/compact' or prompt.startswith('/compact '):
                 try:
                     if not store:
                         raise ValueError('/compact 需要会话持久化，请去掉 --no-session')
-                    compact_current(int(prompt[8:].strip() or 6))
+                    value = prompt[8:].strip()
+                    if value == 'task' or value.startswith('task '):
+                        from .context import compact_task_messages
+                        keep = int(value[4:].strip() or 2)
+                        original = session_id; title = current_title()
+                        payload = snapshot(agent, current_scope())
+                        messages, details = compact_task_messages(payload['messages'], keep, original)
+                        if not details['omitted_groups'] and not details['reduced_calls']:
+                            display('当前任务没有可压缩的完整工具组。', 'Context')
+                        else:
+                            payload['messages'] = messages
+                            identifier = create_active_branch(
+                                payload, title[:95] + ' · compact task', archive_id=original,
+                                draft=store.draft(original))
+                            load_session(identifier, save_existing=False, active=True)
+                            display(f'完整任务历史保留于 {original}；当前会话 {identifier}：{details}', 'Context')
+                    else:
+                        compact_current(int(value or 6))
                 except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
                     display(f'Error: {exc}')
             elif prompt == '/recall' or prompt.startswith('/recall '):
@@ -862,7 +1010,7 @@ def main():
                         if command == "new":
                             save_current()
                             replacement = build_agent(config, instructions)
-                            agent.client.close()
+                            getattr(agent, 'close', agent.client.close)()
                             agent = replacement
                         session_id, revision = new_id(), 0
                         save_current(force=True)
@@ -916,7 +1064,7 @@ def main():
         except (ValueError, OSError, sqlite3.Error) as exc:
             display(f"Session save failed: {exc}; this turn was not saved.")
         if agent is not None:
-            agent.client.close()
+            getattr(agent, 'close', agent.client.close)()
         save_readline_history()
         if store:
             store.close()

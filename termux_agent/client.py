@@ -50,14 +50,33 @@ class ClientError(RuntimeError):
     pass
 
 
-class ContextLengthError(ClientError):
+class ProviderError(ClientError):
     pass
 
 
+class NetworkError(ClientError):
+    pass
+
+
+class ContextLengthError(ClientError):
+    def __init__(self, text, *, pre_accept=True):
+        super().__init__(text)
+        self.pre_accept = bool(pre_accept)
+
+
 class EmptyResponseError(ClientError):
-    def __init__(self, text, message):
+    def __init__(self, text, message, *, length=False, context_limited=False):
         super().__init__(text)
         self.assistant_message = message
+        self.length = bool(length)
+        self.context_limited = bool(context_limited)
+
+
+class IncompleteOutputError(ClientError):
+    def __init__(self, text, message, *, context_limited=False):
+        super().__init__(text)
+        self.assistant_message = message
+        self.context_limited = bool(context_limited)
 
 
 class Client:
@@ -84,6 +103,7 @@ class Client:
         self.streamed = False
         self.streamed_text = False
         self.last_finish_reason = None
+        self.context_limited = False
         self.control_markers = ()
         self._marker_filter = None
 
@@ -156,6 +176,10 @@ class Client:
             "store": False,
             "include": ["reasoning.encrypted_content"]
         }
+        if getattr(self.config, "max_output_tokens", 0):
+            body["max_output_tokens"] = self.config.max_output_tokens
+        if getattr(self.config, "reasoning_effort", ""):
+            body["reasoning"] = {"effort": self.config.reasoning_effort}
         if tools:
             resp_tools = []
             for t in tools:
@@ -177,14 +201,22 @@ class Client:
         if getattr(self.config, "wire_api", "chat_completions") == "responses":
             url, body = self._prepare_responses_request(messages, tools)
         else:
-            chat_messages = [{k: v for k, v in m.items() if k != '_responses_output'} for m in messages]
+            private = {'_responses_output', '_incomplete_output', '_incomplete_tool_calls'}
+            chat_messages = [{k: v for k, v in m.items() if k not in private} for m in messages]
             body = {"model": self.config.model, "messages": chat_messages, "tools": tools,
                     "tool_choice": "auto", "stream": bool(getattr(self.config, "stream", True))}
+            if getattr(self.config, "max_output_tokens", 0):
+                body[getattr(self.config, "chat_max_tokens_field", "max_completion_tokens")] = self.config.max_output_tokens
+            if getattr(self.config, "reasoning_effort", ""):
+                body["reasoning_effort"] = self.config.reasoning_effort
+            if body["stream"] and getattr(self.config, "chat_include_usage", False):
+                body["stream_options"] = {"include_usage": True}
             url = self.config.base_url.rstrip("/") + "/chat/completions"
         self.last_request = deepcopy(body)
         self.last_attempts = 0
         self.last_usage = None
         self.last_finish_reason = None
+        self.context_limited = False
         self.streamed = self.streamed_text = False
         self._marker_filter = MarkerFilter(self.control_markers) if self.control_markers else None
         headers = {"Content-Type": "application/json", "User-Agent": self.config.user_agent}
@@ -195,11 +227,11 @@ class Client:
         try:
             remaining = deadline - self._clock()
             if remaining <= 0:
-                raise ClientError("LLM retry deadline exceeded")
+                raise NetworkError("LLM retry deadline exceeded")
             with request_deadline(remaining) as accepted:
                 return self._chat_attempts(body, url, headers, thinking_retry, deadline, accepted)
         except RetryDeadlineError as exc:
-            raise ClientError(str(exc)) from None
+            raise NetworkError(str(exc)) from None
 
     def _chat_attempts(self, body, url, headers, thinking_retry, deadline, accepted):
         waited = 0.0
@@ -211,7 +243,7 @@ class Client:
             try:
                 remaining = deadline - self._clock()
                 if remaining <= 0:
-                    raise ClientError("LLM retry deadline exceeded")
+                    raise NetworkError("LLM retry deadline exceeded")
                 request = self._http.build_request("POST", url, content=wire,
                                                    headers=headers, timeout=remaining)
                 self.last_attempts = attempt + 1
@@ -223,13 +255,13 @@ class Client:
                     waited = self._wait_retry(attempt, error, type(exc).__name__,
                                               None, None, deadline, waited)
                     continue
-                raise ClientError(error) from None
+                raise NetworkError(error) from None
             except httpx.TimeoutException:
-                raise ClientError("LLM request timed out") from None
+                raise NetworkError("LLM request timed out") from None
             except httpx.RequestError as exc:
                 host = getattr(getattr(exc, "request", None), "url", None)
                 where = f" ({host.host})" if host and host.host else ""
-                raise ClientError(f"LLM connection failed{where}") from None
+                raise NetworkError(f"LLM connection failed{where}") from None
             if response.status_code in self.RETRYABLE_STATUS and attempt + 1 < max_attempts:
                 status = response.status_code
                 after = response.headers.get("Retry-After")
@@ -240,7 +272,7 @@ class Client:
                 continue
             try:
                 if self._clock() >= deadline:
-                    raise ClientError("LLM retry deadline exceeded")
+                    raise NetworkError("LLM retry deadline exceeded")
                 if (thinking_retry and response.status_code == 400) or response.status_code == 429:
                     sample = self._error_sample(response, deadline)
                     try:
@@ -265,7 +297,7 @@ class Client:
                     raise classified
                 response.raise_for_status()
                 if "text/html" in response.headers.get("content-type", "").lower():
-                    raise ClientError("LLM endpoint returned HTML instead of API data (possible gateway/WAF response)")
+                    raise ProviderError("LLM endpoint returned HTML instead of API data (possible gateway/WAF response)")
                 # Once a valid successful response is accepted, use ordinary
                 # body-read timeouts; no path below can restart the request.
                 accepted()
@@ -278,14 +310,14 @@ class Client:
             except httpx.HTTPStatusError as exc:
                 raise self._classified_error(exc.response) from None
             except httpx.TimeoutException:
-                raise ClientError("LLM response timed out") from None
+                raise NetworkError("LLM response timed out") from None
             except httpx.RequestError as exc:
-                raise ClientError(f"LLM response interrupted ({type(exc).__name__})") from None
+                raise NetworkError(f"LLM response interrupted ({type(exc).__name__})") from None
             except ValueError:
-                raise ClientError("LLM endpoint returned invalid JSON") from None
+                raise ProviderError("LLM endpoint returned invalid JSON") from None
             finally:
                 response.close()
-        raise ClientError("LLM request failed after retries")
+        raise NetworkError("LLM request failed after retries")
 
     def _wait_retry(self, attempt, error, cause, status, after, deadline, waited):
         delay = backoff(attempt, self._randomizer())
@@ -295,12 +327,12 @@ class Client:
         remaining = deadline - self._clock()
         budget = getattr(self.config, "retry_wait_budget", 20.0) - waited
         if delay > budget or delay >= remaining:
-            raise ClientError(f"{error}; retry budget exhausted (required wait {delay:g}s)")
+            raise NetworkError(f"{error}; retry budget exhausted (required wait {delay:g}s)")
         if self.on_retry:
             self.on_retry({"attempt": attempt + 2, "max_attempts": getattr(self.config, "retry_max_attempts", 3),
                            "status": status, "cause": cause, "wait_seconds": round(delay, 3)})
         if delay >= deadline - self._clock():
-            raise ClientError(f"{error}; retry deadline exceeded")
+            raise NetworkError(f"{error}; retry deadline exceeded")
         before = self._clock()
         self._sleep(delay)
         return waited + max(delay, self._clock() - before)
@@ -331,22 +363,33 @@ class Client:
                 if isinstance(error, dict):
                     code = str(error.get('code', '')).lower()
                     text = str(error.get('message', '')).lower()
-                    if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long') or any(
+                    if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long',
+                                'context_shift', 'context_shift_error') or any(
                             phrase in text for phrase in ('maximum context length', 'context length exceeded',
-                                                         'context window exceeded', 'prompt is too long')):
-                        return ContextLengthError('上下文超过模型窗口；请使用 /compact 归档并缩短上下文，或 /clear 新建会话。')
+                                                         'context window exceeded', 'prompt is too long',
+                                                         'context shift', 'input truncated to fit context')):
+                        return ContextLengthError('上下文超过模型窗口；请使用 /compact task 归档并缩短当前任务，'
+                                                  '/compact N 保留最近轮次，或 /clear 新建会话。')
             except ValueError:
                 pass
-        return ClientError(diagnostic)
+        return ProviderError(diagnostic)
 
     def _checked_message(self, message):
         content = message.get('content')
+        if self.last_finish_reason == 'length':
+            incomplete = dict(message)
+            calls = incomplete.pop('tool_calls', None)
+            if calls:
+                incomplete['_incomplete_tool_calls'] = calls
+            if content is None or isinstance(content, str) and not content.strip():
+                raise EmptyResponseError('模型输出预算已耗尽，未产生最终回答；请提高服务端输出上限或降低思考强度。',
+                                         incomplete, length=True, context_limited=self.context_limited)
+            raise IncompleteOutputError('模型输出在达到长度上限时截断；正文或工具参数只是未完成草稿，其中工具调用不会执行。',
+                                        incomplete, context_limited=self.context_limited)
         if (not message.get('tool_calls') and (content is None or isinstance(content, str) and not content.strip())
                 and not message.get('refusal')
                 and self.last_finish_reason not in ('content_filter', 'safety', 'refusal')):
-            if self.last_finish_reason == 'length':
-                text = '模型输出预算已耗尽，未产生最终回答；请提高服务端输出上限或降低思考强度。'
-            elif message.get('reasoning_content'):
+            if message.get('reasoning_content'):
                 text = '模型仅返回思考内容，未产生最终回答；请检查输出预算和模型设置。'
             else:
                 text = '模型返回空回答；请检查模型设置或稍后重试。'
@@ -394,7 +437,19 @@ class Client:
             raise ClientError("LLM response has no assistant message")
         self.last_usage = result.get("usage") if isinstance(result.get("usage"), dict) else None
         self.last_finish_reason = choices[0].get("finish_reason")
+        self._apply_local_response_flags(result, message)
         return message
+
+    def _apply_local_response_flags(self, result, message=None):
+        values = [result]
+        if isinstance(message, dict):
+            values.append(message)
+        if any(value.get('truncated') is True or value.get('context_shift') is True
+               or value.get('context_shifted') is True or value.get('input_truncated') is True
+               or value.get('stop_type') in ('context_shift', 'truncated')
+               for value in values if isinstance(value, dict)):
+            self.last_finish_reason = 'length'
+            self.context_limited = True
 
     def _emit(self, kind: str, text: str) -> None:
         if kind == "content" and self._marker_filter is not None:
@@ -418,10 +473,11 @@ class Client:
         data_lines = []
         usage = None
         finish = None
+        local_flags = False
         saw_choice = False
 
         def consume(data: str) -> None:
-            nonlocal usage, finish, saw_choice
+            nonlocal usage, finish, local_flags, saw_choice
             if not data or data.strip() in ("[DONE]", "null"):
                 return
             try:
@@ -432,6 +488,10 @@ class Client:
                 return
             if isinstance(event.get("usage"), dict):
                 usage = event["usage"]
+            local_flags = local_flags or any(
+                event.get(field) is True for field in ('truncated', 'context_shift', 'context_shifted',
+                                                        'input_truncated'))
+            local_flags = local_flags or event.get('stop_type') in ('context_shift', 'truncated')
             choices = event.get("choices") or []
             if not choices or not isinstance(choices[0], dict):
                 return
@@ -484,6 +544,9 @@ class Client:
             self._emit_visible("content", self._marker_filter.feed("", final=True))
         self.last_usage = usage
         self.last_finish_reason = finish
+        if local_flags:
+            self.last_finish_reason = 'length'
+            self.context_limited = True
         message: dict[str, Any] = {"role": "assistant", "content": "".join(content)}
         if reasoning:
             message["reasoning_content"] = "".join(reasoning)
