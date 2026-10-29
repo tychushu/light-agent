@@ -387,6 +387,15 @@ and old tool calls are never replayed automatically.
 
 ### Context budgets, compaction and retrieval
 
+These settings have different units and scopes:
+
+| Setting | Meaning |
+| --- | --- |
+| `max_output_chars` | Cap for one tool-output character payload. Default `20000`; valid range `128..1000000`, so `25000` is valid. This is not the model context window. |
+| `max_context_chars` | Character guard over serialized messages plus tool schemas. Default `500000`. |
+| `context_window_tokens` | Real model context window in tokens. `0` auto-discovers it in local mode when available; this setting does not change server capacity. |
+| `max_output_tokens` | Provider generation token cap; `0` uses the provider default. |
+
 `max_context_chars = 500000` is the default character budget for serialized
 messages plus tool schemas, and can be overridden in an API profile. It is not a
 token estimate or a claim about the model's context window. Requests warn at 80%

@@ -195,8 +195,12 @@ class Config:
             raise ValueError("token_count_mode must be estimate, local, or off")
         if self.reasoning_effort not in ("", "low", "medium", "high"):
             raise ValueError("reasoning_effort must be empty, low, medium, or high")
-        if not isinstance(self.max_output_chars, int) or isinstance(self.max_output_chars, bool) or not 128 <= self.max_output_chars <= 20_000:
-            raise ValueError("max_output_chars must be between 128 and 20000")
+        if (not isinstance(self.max_output_chars, int) or isinstance(self.max_output_chars, bool)
+                or not 128 <= self.max_output_chars <= 1_000_000):
+            raise ValueError(
+                "max_output_chars must be an integer tool-output character cap between "
+                "128 and 1000000; context_window_tokens is the model context window in tokens"
+            )
         if self.wire_api not in ("chat_completions", "responses"):
             raise ValueError("wire_api must be chat_completions or responses")
         if (not isinstance(self.token_metadata_base_url, str)
