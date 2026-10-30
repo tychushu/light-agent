@@ -250,12 +250,11 @@ before sending (oversize files produce an error, never silently truncate).
 `/stats` counts the actual combined system prompt; `/debug-context` shows the
 injected text. Without scoped instructions, the system prompt comes from the editable base prompt file (the shipped default is 163 characters).
 
-## Preconfigured phone endpoints
+## Choosing an API profile
 
-The phone defaults to `local` (Qwen3.8-27B-MTPLX-Speed at the existing LAN API).
-`/api cloud` selects AgentRouter `deepseek-v4-flash` at
-`https://agentrouter.org/v1`. Its profile sets
-`user_agent = "claude-cli/2.1.119 (external, cli)"` and a 300-second HTTP timeout.
+API profiles and the default selection come from your local configuration.
+Use `/api` to list profiles, `/api NAME` to switch, and `/config` to inspect the
+active model and endpoint without displaying API keys.
 Assistant `reasoning_content` is preserved verbatim for subsequent requests,
 including tool rounds. Streaming is enabled by default for OpenAI-compatible profiles; set `stream = false` for non-stream endpoints.
 
@@ -271,7 +270,7 @@ Raw response bodies and HTML pages are not dumped. Recognized context-window
 errors retain their `/compact` guidance. HTML gateway responses and SSE streams without assistant choices
 stop the task with an error; HTTP 405 is not automatically retried.
 
-`ta --api local` and `ta --api cloud` also work directly. Private credentials
+`ta --api NAME` selects any configured profile directly. Private credentials
 are intentionally absent from this source package. The phone launcher injects
 them via environment variables; the application still never reads keys from TOML.
 To fully remove the phone credential copy, additionally remove
