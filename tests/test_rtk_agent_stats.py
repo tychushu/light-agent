@@ -384,7 +384,7 @@ class RtkReadmeContractTests(unittest.TestCase):
         for required in (
                 "disabled by default", "rtk_enabled", "[apis.*]", "Manual",
                 "stdout_text", "stderr_text", "8 MiB", "32-file", "1 MiB",
-                "best-effort", "applied", "legacy clipping", "not actual tokenizer"):
+                "best-effort", "applied", "output clipping", "not actual tokenizer"):
             self.assertIn(required.casefold(), readme.casefold())
 
 

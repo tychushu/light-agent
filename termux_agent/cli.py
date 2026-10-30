@@ -17,7 +17,7 @@ from .config import Config
 from .sessions import SessionStore, new_id, snapshot, restore, validate_title
 from .skills import SkillRegistry
 from .api_profiles import ProfileStore
-from .terminal_ui import Columns, Completer, COMMANDS
+from .terminal_ui import Columns, Completer, COMMANDS, format_context_status
 from .local_input import load_text_submission, path_value
 from .display_privacy import WRITE_TOOLS, hide_write_payloads, safe_tool_arguments
 from .approval import reason as approval_reason
@@ -27,7 +27,7 @@ HELP = """/help           显示命令帮助（Show commands）
 Tab             补全命令、API 配置、会话 ID 和技能名称
 ~/path 或 /path  补全本地路径；回车将 UTF-8 文本文件内容提交给模型
 /clear          新建空白会话，保留原会话历史
-/compact [N]    归档完整会话，新会话保留最近 N 轮（默认 6），不调用模型
+/compact [N]    自动精简跨轮次历史，保留用户指令；指定 N 则只保留最近 N 轮
 /compact task [N]  压缩当前单任务工具链；保留最近 N 个完整工具组，不调用模型
 /continue [N]   从检查点继续同一任务，开始一个新的受控模型调用段
 /status         查看上次停止原因和继续方式
@@ -267,7 +267,9 @@ def main():
                 display({"segment_extension": payload}, "Progress")
             return
         if kind == 'task_compacted':
-            display({"task_compacted": payload}, "Context")
+            display(f"已压缩上下文 {payload['before_chars']:,} → {payload['after_chars']:,} 字符；"
+                    f"完整历史：{payload['archive']}" +
+                    ('' if payload['persistent'] else '（仅内存；退出后丢失）'), 'Context')
             return
         if kind in ("subagent_start", "subagent_end"):
             detail = (f"model={payload['model']} · steps≤{payload['max_steps']}"
@@ -668,7 +670,8 @@ def main():
                 if formatter.enabled and sys.stdin.isatty():
                     session_label = session_id + (" (memory)" if store is None else "")
                     display(f"Session={session_label} | Model={config.model} | Cwd={directory}\n"
-                            f"Title={current_title()}" + (' | Mode=历史查看' if history_mode() else ''), "Status")
+                            f"Title={current_title()}" + (' | Mode=历史查看' if history_mode() else '') +
+                            '\n' + format_context_status(agent.context_status()), "Status")
                 prompt = read_prompt(formatter.prompt(), formatter.continuation()).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
@@ -733,7 +736,8 @@ def main():
                         payload = snapshot(agent, current_scope())
                         messages, details = compact_task_messages(payload['messages'], keep, original)
                         if not details['omitted_groups'] and not details['reduced_calls']:
-                            display('当前任务没有可压缩的完整工具组。', 'Context')
+                            display('当前任务没有可压缩的完整工具组；用 /compact 精简更早的历史，'
+                                    '或 /compact 1 仅保留最近一轮。', 'Context')
                         else:
                             payload['messages'] = messages
                             identifier = create_active_branch(
@@ -742,7 +746,10 @@ def main():
                             load_session(identifier, save_existing=False, active=True)
                             display(f'完整任务历史保留于 {original}；当前会话 {identifier}：{details}', 'Context')
                     else:
-                        compact_current(int(value or 6))
+                        if value:
+                            compact_current(int(value))
+                        elif not agent._compact_for_context(force=True):
+                            display('没有可安全精简的历史；可用 /compact 1 仅保留最近一轮。', 'Context')
                 except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
                     display(f'Error: {exc}')
             elif prompt == '/recall' or prompt.startswith('/recall '):

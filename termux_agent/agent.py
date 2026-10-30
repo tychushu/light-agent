@@ -12,7 +12,7 @@ from typing import Any, Callable
 
 from .client import (Client, ClientError, ContextLengthError, EmptyResponseError,
                      IncompleteOutputError, NetworkError)
-from .context import compact_task_messages, context_chars
+from .context import compact_task_messages, compact_context_messages, context_chars
 from .token_budget import TokenCounter, estimate_text_tokens
 from .tools import TOOLS, DELEGATE_TOOL, WEB_FETCH_TOOL, execute, web_fetch_available
 from .output_compression import OutputCompressor, stable_result_payload
@@ -297,10 +297,10 @@ class Agent:
         return ([{'role': 'system', 'content': self.system + '\n\n' + rules}, *source[1:]]
                 if rules else source)
 
-    def _context_budget(self, request_messages):
+    def _context_budget(self, request_messages, *, allow_network=True):
         chars = context_chars(request_messages, self.tools)
         token = self.token_counter.measure(request_messages, self.tools,
-                                           allow_network=not self.history_only)
+                                           allow_network=allow_network and not self.history_only)
         reserve = max(self.config.output_reserve_tokens,
                       getattr(self.config, 'max_output_tokens', 0) or 0)
         window = token.get('context_window_tokens')
@@ -310,19 +310,66 @@ class Agent:
         exceeded = bool(window and token.get('prompt_tokens') is not None and token['prompt_tokens'] + reserve > window)
         return chars, token, exceeded
 
-    def _compact_for_context(self, force=False, messages=None):
-        source = self.messages if messages is None else messages
-        chars, token, exceeded = self._context_budget(self._request_messages(messages=source))
+    def _context_ratio(self, chars, token):
         ratio = chars / self.config.max_context_chars
-        window = token.get('context_window_tokens')
-        if window and token.get('prompt_tokens') is not None:
-            ratio = max(ratio, token['prompt_tokens'] / max(1, window - (token.get('output_reserve_tokens') or 0)))
-        if not force and (not self.config.auto_compact_task or ratio < self.config.auto_compact_threshold):
+        window, prompt = token.get('context_window_tokens'), token.get('prompt_tokens')
+        if window and prompt is not None:
+            ratio = max(ratio, prompt / max(1, window - token['output_reserve_tokens']))
+        return ratio
+
+    def context_status(self):
+        """Current request-sized context; no HTTP or tokenizer subprocess on redraw."""
+        rules = load_prompt_file('task_prompt.txt') if self.config.auto_continue else ''
+        chars, token, exceeded = self._context_budget(self._request_messages(rules), allow_network=False)
+        ratio = self._context_ratio(chars, token)
+        return {'chars': chars, 'limit': self.config.max_context_chars, 'tokens': token,
+                'ratio': ratio, 'state': ('已超限' if exceeded or chars > self.config.max_context_chars
+                                        else '待压缩' if ratio >= self.config.auto_compact_threshold else '正常'),
+                'auto_compact': self.config.auto_compact or self.config.auto_compact_task,
+                'threshold': self.config.auto_compact_threshold}
+
+    def _compact_for_context(self, force=False, messages=None, rules=None, budget=None):
+        if rules is None:
+            rules = load_prompt_file('task_prompt.txt') if self.config.auto_continue else ''
+        source = self.messages if messages is None else messages
+        chars, token, _ = budget or self._context_budget(self._request_messages(rules, messages=source))
+        ratio = self._context_ratio(chars, token)
+        if not force and (not (self.config.auto_compact or self.config.auto_compact_task)
+                          or ratio < self.config.auto_compact_threshold):
             return False
         archive_id = self.archive_id or 'memory-' + uuid.uuid4().hex[:12]
-        result, details = compact_task_messages(source, self.config.auto_compact_keep_groups, archive_id)
-        if details.get('skipped_no_reduction') or (not details['omitted_groups'] and not details['reduced_calls']):
+        best, best_details, best_ratio = source, None, ratio
+        # Keep a gap below the trigger to avoid branching on every subsequent call.
+        target = self.config.auto_compact_threshold * 0.75
+        starts = [m for m in source if m.get('role') == 'user' and not str(m.get('content', '')).startswith(
+            ('[Context archive:', '[Task memo:', '[TASK_RESUME]', '[TASK_CONTINUE]'))]
+        def candidates():
+            # Retain the legacy single-task memo format for existing opt-in profiles.
+            if self.config.auto_compact_task and len(starts) == 1:
+                yield compact_task_messages(source, self.config.auto_compact_keep_groups, archive_id)
+            for answers in (False, True):
+                for keep in dict.fromkeys((self.config.auto_compact_keep_groups, 1)):
+                    yield compact_context_messages(source, keep, archive_id,
+                        keep_turns=self.config.auto_compact_keep_turns, reduce_answers=answers)
+        source_chars = context_chars(source)
+        for result, details in candidates():
+            if context_chars(result) >= source_chars:
+                continue
+            after_chars, after_token, _ = self._context_budget(
+                self._request_messages(rules, messages=result),
+                allow_network=str(token.get('source', '')).startswith('llama_cpp'))
+            # Compare candidates with the same tokenizer when one was available.
+            after_token['context_window_tokens'] = token.get('context_window_tokens')
+            candidate_ratio = self._context_ratio(after_chars, after_token)
+            if candidate_ratio < best_ratio:
+                best, best_details, best_ratio = result, details, candidate_ratio
+            if best_ratio <= target:
+                break
+        if best_details is None:
             return False
+        result, details = best, best_details
+        details.update(before_chars=chars,
+                       after_chars=context_chars(self._request_messages(rules, messages=result), self.tools))
         persistent = self.branch_after_compact is not None and (
             self.branch_after_compact(archive_id, result, details) is not False)
         if not persistent:
@@ -330,7 +377,8 @@ class Agent:
                 self.in_memory_archives.append({'id': archive_id,
                                                 'messages': __import__('copy').deepcopy(source)})
         self.messages[:] = result
-        self.task_state['compactions'] += 1
+        if self.task_state is not None:
+            self.task_state['compactions'] += 1
         self._task_compactions += 1
         self._emit('task_compacted', {'archive': archive_id, 'persistent': persistent, **details})
         self._checkpoint()
@@ -410,7 +458,7 @@ class Agent:
             self.client.set_control_markers(TASK_MARKERS if automatic else ())
         if resume:
             prospective = [*__import__('copy').deepcopy(self.messages), {'role': 'user', 'content': text}]
-            compacted = self._compact_for_context(messages=prospective)
+            compacted = self._compact_for_context(messages=prospective, rules=rules)
             if not compacted:
                 self.messages.append({'role': 'user', 'content': text})
         else:
@@ -426,12 +474,16 @@ class Agent:
             if stop:
                 reason = {'time_budget': 'time_budget', 'token_budget': 'token_budget'}.get(stop, 'task_call_budget')
                 return self._finish('limit', reason, '同一任务的硬预算已用完；未执行新的调用。')
-            self._compact_for_context()
             request = self._request_messages(rules)
             chars, token, exceeded = self._context_budget(request)
+            if self._compact_for_context(rules=rules, budget=(chars, token, exceeded)):
+                request = self._request_messages(rules)
+                chars, token, exceeded = self._context_budget(request)
             self.last_run['context'] = {'chars': chars, 'tokens': token}
             if chars > self.config.max_context_chars or exceeded:
-                return self._finish('context_limit', 'context_limit', '上下文预算不足；请用 /compact task、/compact N 或 /clear。')
+                return self._finish('context_limit', 'context_limit',
+                    '上下文预算不足；保留的用户指令、近期结果或系统提示无法安全缩减。'
+                    '请用 /compact 1 仅保留最近一轮，或 /clear 新建会话；完整历史仍保留。')
             if not warned and chars >= self.config.max_context_chars * 0.8:
                 self._emit('context_warning', {'chars': chars, 'limit': self.config.max_context_chars})
                 warned = True
@@ -542,11 +594,15 @@ class Agent:
                 raise
             if self._budget_stop():
                 raise TaskBudgetExhausted(self._budget_stop()) from exc
-            if not self._compact_for_context(force=True):
+            if not self._compact_for_context(force=True, rules=rules):
+                raise
+            reduced = self._request_messages(rules)
+            chars, _, exceeded = self._context_budget(reduced)
+            if chars > self.config.max_context_chars or exceeded:
                 raise
             self.task_state['recovery_requests'] += 1
             self._context_recoveries += 1
-            return self._send_model_request(self._request_messages(rules), recovery=True)
+            return self._send_model_request(reduced, recovery=True)
 
     @staticmethod
     def _validate_calls(calls: list[Any]) -> str | None:

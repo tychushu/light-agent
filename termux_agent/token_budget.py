@@ -208,6 +208,11 @@ class TokenCounter:
         manual_window = bool(window)
         metadata_source = "manual" if manual_window else "unknown"
         output_reserve = self.effective_output_reserve_tokens
+        if mode == 'local' and self.config.api_kind == 'local' and not manual_window:
+            # Status rendering may read cached metadata, but must never probe a server.
+            metadata = self._cache_read()
+            window = int(metadata.get('context_window_tokens') or 0)
+            metadata_source = 'llama_cpp' if window else 'unknown'
         if mode == "off":
             return {"prompt_tokens": None, "source": "unknown", "context_window_tokens": window or None,
                     "context_window_source": metadata_source, "template_overhead_tokens": None,

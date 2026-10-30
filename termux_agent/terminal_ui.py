@@ -354,3 +354,19 @@ class Completer:
             self._cache_key = key
             self._matches = self.matches(line, begin, prefix)
         return self._matches[state] if state < len(self._matches) else None
+
+
+def format_context_status(status):
+    """Explicit units: character guard is not the provider's token window."""
+    chars, limit = status['chars'], status['limit']
+    parts = [f"Context={status['state']}", f"Chars={chars:,}/{limit:,} ({chars / limit:.0%})"]
+    token = status['tokens']
+    count, window = token.get('prompt_tokens'), token.get('context_window_tokens')
+    if count is None:
+        parts.append('Tokens=未计数')
+    else:
+        mark = '=' if token.get('exact') else '≈'
+        parts.append(f"Tokens{mark}{count:,}/" + (f"{window:,} ({count / window:.0%}; "
+                     f"预留{token['output_reserve_tokens']:,})" if window else '未知窗口'))
+    parts.append(f"Auto={status['threshold']:.0%}" if status['auto_compact'] else 'Auto=关闭')
+    return ' | '.join(parts)
