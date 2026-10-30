@@ -52,10 +52,12 @@ Tab             补全命令、API 配置、会话 ID 和技能名称
 !command        直接运行 Shell，不调用模型；审批规则仍生效
 /sessions [N]   列出会话：时间、ID、标题、API / 模型、消息数、路径；默认 50，最多 500
 /sessions find TEXT  按标题关键词查找已保存会话
+/resume [ID|N]  恢复会话；N 使用最后一次会话列表中的序号
+/resume         列出最近 50 个会话，TTY 中可直接选择序号或 ID
 /title [NAME]   查看或修改当前会话标题，无需调用模型
 /session        查看当前会话 ID、标题和保存状态
 /session new [NAME]  新建空白会话，可指定标题
-/session load ID     恢复会话；原 API 失效或变更时进入历史查看模式
+/session load ID|N   恢复会话；N 使用最后一次列表序号，原 API 失效时进入历史查看模式
 /session rename NAME  修改当前会话标题
 /session rename-id ID NAME  修改其他会话标题，不切换会话
 /session fork [NAME]  将当前对话复制为独立会话，可指定标题
@@ -212,6 +214,8 @@ def main():
     source_fingerprint = None
     branch_state = {'kind': 'active'}
     formatter = Columns(sys.stdout, enabled=sys.stdout.isatty() and options.prompt is None)
+    last_session_ids = ()
+    cli_commands = tuple(dict.fromkeys((*COMMANDS, "/resume")))
 
     def redact(text):
         return text.replace(config.api_key, "[REDACTED]") if config.api_key else text
@@ -362,6 +366,7 @@ def main():
             active_skills=lambda: list(agent.active_skills),
             session_ids=lambda: store.ids() if store else [],
             directory=lambda: directory,
+            session_choices=lambda: [str(i) for i in range(1, len(last_session_ids) + 1)],
         )
         _readline.set_completer_delims(" \t\n")
         _readline.set_completer(completer)
@@ -515,6 +520,65 @@ def main():
         agent.archive_id = None
         return True
 
+    def show_session_listing(limit=50, query=None, empty_text=None):
+        """Query, render and cache one exact metadata listing without loading rows."""
+        nonlocal last_session_ids
+        if not store:
+            display("Persistence disabled by --no-session.")
+            last_session_ids = ()
+            return ()
+        rows = store.listing(limit, query=query) if query is not None else store.listing(limit)
+        last_session_ids = tuple(row['id'] for row in rows)
+        if not formatter.enabled:
+            display(rows)
+            if not rows and empty_text:
+                display(empty_text)
+        else:
+            if rows:
+                display(f"{len(rows)} saved sessions" +
+                        (f" · title contains {query}" if query else ''), 'Sessions')
+            else:
+                display(empty_text, 'Sessions')
+            formatter.sessions(rows, session_id, Path.home(), redact)
+        return last_session_ids
+
+    def resolve_session_target(value):
+        value = value.strip()
+        if not value:
+            raise ValueError("Use /resume ID|N or /session load ID|N")
+        if len(value) == 12 and all(char in "0123456789abcdef" for char in value):
+            return value
+        if value.isascii() and value.isdigit():
+            if not last_session_ids:
+                raise ValueError("先用 /sessions 或 /resume 查看会话，再按序号选择。")
+            index = int(value)
+            if not 1 <= index <= len(last_session_ids):
+                raise ValueError("会话序号超出最后一次显示的列表范围。")
+            return last_session_ids[index - 1]
+        store.check_id(value)
+        return value
+
+    def resume_session(value):
+        identifier = resolve_session_target(value)
+        if identifier != session_id or history_mode():
+            load_session(identifier)
+        display({"id": session_id, "title": current_title(), "api": config.api_profile,
+                 "directory": str(directory)})
+
+    def resume_picker():
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            display("输入 /resume 序号或 ID 恢复；序号只对应上面显示的列表。")
+            return
+        try:
+            value = input("选择序号或ID（回车取消）").strip()
+        except (EOFError, KeyboardInterrupt):
+            display("已取消会话选择。")
+            return
+        if not value:
+            display("已取消会话选择。")
+            return
+        resume_session(value)
+
     def load_session(identifier, save_existing=True, active=False):
         nonlocal agent, config, directory, config_path, session_file, disabled
         nonlocal instructions, instruction_path, session_id, revision
@@ -612,12 +676,12 @@ def main():
             if not prompt:
                 continue
             if history_mode() and prompt.split(maxsplit=1)[0] not in (
-                    '/help', '/sessions', '/session', '/history', '/stats', '/status', '/config', '/debug',
+                    '/help', '/sessions', '/session', '/resume', '/history', '/stats', '/status', '/config', '/debug',
                     '/debug-context', '/silent', '/api', '/title', '/recall', '/export', '/copy', '/paste', '/exit'):
                 display('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。', 'History')
                 continue
             try:
-                local_path = path_value(prompt, COMMANDS)
+                local_path = path_value(prompt, cli_commands)
             except ValueError as exc:
                 display(f"Error: {exc}")
                 continue
@@ -972,13 +1036,22 @@ def main():
                     if not store:
                         display("Persistence disabled by --no-session.")
                         continue
-                    rows = store.listing(limit, query=query) if query is not None else store.listing(limit)
-                    if not formatter.enabled:
-                        display(rows)
-                    else:
-                        display(f"{len(rows)} saved sessions" + (f" · title contains {query}" if query else ''), 'Sessions')
-                        formatter.sessions(rows, session_id, Path.home(), redact)
+                    show_session_listing(limit, query)
                 except (ValueError, sqlite3.Error) as exc:
+                    display(f"Error: {exc}")
+            elif prompt == "/resume" or prompt.startswith("/resume "):
+                try:
+                    if not store:
+                        display("Persistence disabled by --no-session.")
+                        continue
+                    value = prompt[7:].strip()
+                    if value:
+                        resume_session(value)
+                    else:
+                        rows = show_session_listing(50, empty_text="没有已保存会话。")
+                        if rows:
+                            resume_picker()
+                except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
                     display(f"Error: {exc}")
             elif prompt == "/history" or prompt.startswith("/history "):
                 try:
@@ -1018,9 +1091,7 @@ def main():
                             store.rename(session_id, value)
                         display({"id": session_id, "title": current_title()})
                     elif command == "load":
-                        if value != session_id or history_mode():
-                            load_session(value)
-                        display({"id": session_id, "title": current_title(), "api": config.api_profile, "directory": str(directory)})
+                        resume_session(value)
                     elif command == "rename":
                         rename_current(value)
                     elif command == "rename-id":
@@ -1048,7 +1119,7 @@ def main():
                         else:
                             display("Deletion cancelled; use --yes for explicit noninteractive deletion.")
                     else:
-                        display("Use /session new|fork|load ID|rename NAME|rename-id ID NAME|delete ID|save")
+                        display("Use /session new|fork|load ID|N|rename NAME|rename-id ID NAME|delete ID|save")
                 except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
                     display(f"Error: {exc}")
             elif prompt.startswith("/"):

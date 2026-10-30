@@ -9,7 +9,7 @@ import unicodedata
 
 COMMANDS = (
     "/help", "/clear", "/compact", "/continue", "/status", "/recall", "/export", "/stats", "/config", "/debug", "/debug-context",
-    "/api", "/agent", "/skill", "/copy", "/paste", "/sessions", "/session", "/title",
+    "/api", "/agent", "/skill", "/copy", "/paste", "/sessions", "/session", "/resume", "/title",
     "/history", "/silent", "/auto", "/run", "/sub", "/exit",
 )
 SUBCOMMANDS = {
@@ -65,7 +65,7 @@ def _table_cell(text, width, middle=False, pad=True):
 
 
 def session_table(rows, width, current_id='', home='', redact=None):
-    """One terminal row per session; keep IDs intact and fit the other cells."""
+    """One numbered terminal row per session; keep IDs intact and fit other cells."""
     def clean(value):
         text = str(value)
         if redact:
@@ -74,27 +74,51 @@ def session_table(rows, width, current_id='', home='', redact=None):
         return ''.join(c if c.isprintable() else f'\\x{ord(c):02x}' for c in text)
 
     rows = list(rows)
+    home = str(home).rstrip('/')
     api_values = []
     count_values = []
+    directory_values = []
     for row in rows:
         profile = str(row.get('api') or '-')
         model = row.get('model') or ''
         api_values.append(clean(profile + (' / ' + str(model) if model else '')))
         count = row.get('messages')
         count_values.append(clean('-' if count is None else count))
+        directory = str(row.get('directory') or '-')
+        if home and (directory == home or directory.startswith(home + '/')):
+            directory = '~' + directory[len(home):]
+        directory_values.append(clean(directory))
     budget = max(28, int(width) - 1)  # Reserve the final column against auto-wrap.
-    separator = '  ' if budget >= 79 else ' '
+    separator = '  ' if budget >= 99 else ' '
+    ordinal_width = max(1, len(str(max(1, len(rows)))))
+    numbered_header = '序号' if budget >= 79 else '#'
+    if numbered_header == '序号':
+        ordinal_width = max(ordinal_width, _cell_width(numbered_header))
     count_width = max([6 if budget >= 63 else 2, *(_cell_width(value) for value in count_values)])
-    budget = max(budget, 13 + count_width + 5 * len(separator) + 4)
+    budget = max(budget, ordinal_width + 13 + count_width + 6 * len(separator) + 4)
     time_width = 16 if budget >= 99 else (12 if budget >= 47 else 5)
-    time_width = min(time_width, budget - 13 - count_width - 5 * len(separator) - 3)
-    remaining = budget - time_width - 13 - count_width - 5 * len(separator)
+    time_width = min(time_width, max(1, budget - ordinal_width - 13 - count_width - 6 * len(separator) - 3))
+    remaining = budget - ordinal_width - time_width - 13 - count_width - 6 * len(separator)
     desired_api = max([10, *(_cell_width(value) for value in api_values)])
-    api_width = min(desired_api, 48, remaining - 2, max(3, remaining * 2 // 3))
-    title_width = min(32, max(1, (remaining - api_width) // 2))
-    path_width = remaining - api_width - title_width
-    widths = (time_width, 13, title_width, api_width, count_width, path_width)
-    headers = ('最后会话时间' if time_width >= 12 else '时间', 'ID',
+    api_width = min(desired_api, 48, max(1, min(remaining - 2, remaining * 2 // 3)))
+    available = remaining - api_width
+    desired_title = max([1, *(_cell_width(clean(row.get('title') or 'New session')) for row in rows)])
+    desired_path = max([1, *(_cell_width(value) for value in directory_values)])
+    if desired_title + desired_path <= available:
+        extra = available - desired_title - desired_path
+        title_width = min(32, desired_title + extra // 2)
+        path_width = available - title_width
+    else:
+        balanced_path = max(1, (available + 1) // 2)
+        if desired_path <= balanced_path:
+            path_width = desired_path
+        elif desired_title <= available - balanced_path:
+            path_width = available - desired_title
+        else:
+            path_width = balanced_path
+        title_width = available - path_width
+    widths = (ordinal_width, time_width, 13, title_width, api_width, count_width, path_width)
+    headers = (numbered_header, '最后会话时间' if time_width >= 12 else '时间', 'ID',
                'title' if title_width >= 5 else 'T',
                'API / 模型' if api_width >= 10 else ('API/模型' if api_width >= 8 else 'API'),
                '消息数' if count_width >= 6 else '数',
@@ -103,25 +127,22 @@ def session_table(rows, width, current_id='', home='', redact=None):
     def render(values):
         cells = []
         for index, (value, size) in enumerate(zip(values, widths)):
-            cell = _table_cell(value, size, middle=index in (3, 5), pad=index < 4)
-            if index == 4:
+            cell = _table_cell(value, size, middle=index in (4, 6), pad=index < 5)
+            if index == 5:
                 cell = ' ' * max(0, size - _cell_width(cell)) + cell
             cells.append(cell)
         return separator.join(cells).rstrip()
 
     result = [render(headers)]
-    home = str(home).rstrip('/')
-    for row, api, count in zip(rows, api_values, count_values):
+    for ordinal, (row, api, count, directory) in enumerate(
+            zip(rows, api_values, count_values, directory_values), 1):
         updated = clean(row.get('updated') or '-')
         if len(updated) >= 16 and updated[4:5] == '-':
             updated = updated[:16] if time_width == 16 else (updated[5:16] if time_width == 12 else updated[11:16])
-        directory = str(row.get('directory') or '-')
-        if home and (directory == home or directory.startswith(home + '/')):
-            directory = '~' + directory[len(home):]
         marker = '*' if row.get('id') == current_id else ' '
-        result.append(render((updated, marker + clean(row.get('id') or '-'),
+        result.append(render((str(ordinal), updated, marker + clean(row.get('id') or '-'),
                               clean(row.get('title') or 'New session'),
-                              api, count, clean(directory))))
+                              api, count, directory)))
     return result
 
 
@@ -228,13 +249,14 @@ class Columns:
 
 class Completer:
     def __init__(self, readline, profiles, skills, active_skills, session_ids,
-                 directory):
+                 directory, session_choices=None):
         self.readline = readline
         self.profiles = profiles
         self.skills = skills
         self.active_skills = active_skills
         self.session_ids = session_ids
         self.directory = directory
+        self.session_choices = session_choices
         self._cache_key = None
         self._matches = []
 
@@ -295,7 +317,14 @@ class Completer:
         else:
             words = line[:begin].split()
             root = words[0] if words else ""
-            if len(words) == 1:
+            selecting_session = (
+                (root == "/resume" and len(words) == 1) or
+                (root == "/session" and len(words) == 2 and words[1] == "load")
+            )
+            if selecting_session:
+                choices = self.session_choices() if self.session_choices else ()
+                options = (*choices, *self.session_ids())
+            elif len(words) == 1:
                 options = SUBCOMMANDS.get(root, ())
                 if root == "/api":
                     options = (*options, *self.profiles())
@@ -305,7 +334,7 @@ class Completer:
                     options = (*options, *self.session_ids())
             elif root == "/api" and words[1] in ("show", "default", "remove", "switch"):
                 options = self.profiles()
-            elif root == "/session" and words[1] in ("load", "delete", "rename-id") and len(words) == 2:
+            elif root == "/session" and words[1] in ("delete", "rename-id") and len(words) == 2:
                 options = self.session_ids()
             elif root == '/export' and len(words) == 2:
                 options = ('markdown', 'json')

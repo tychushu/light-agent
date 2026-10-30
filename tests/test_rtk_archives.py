@@ -114,7 +114,8 @@ class FilterProcessTests(unittest.TestCase):
             "time.sleep(0.12)\n"
             "raise SystemExit(23)\n"
         )
-        result = run_rtk_filter(str(fixture), "pytest", b"payload\n", timeout=1.0)
+        # This checks leader completion, not interpreter startup performance.
+        result = run_rtk_filter(str(fixture), "pytest", b"payload\n", timeout=3.0)
         self.assertEqual(result.returncode, 23)
         self.assertEqual(json.loads(result.output.decode("utf-8")),
                          ["pipe", "--filter", "pytest"])

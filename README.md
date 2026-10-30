@@ -358,13 +358,15 @@ SQLite is part of the Python standard library; no new dependency or service.
 |---|---|
 | `/sessions [N]` | List up to N recent sessions (default 50, max 500) |
 | `/sessions find TEXT` | Find up to 50 saved sessions by title substring |
+| `/resume [ID\|N]` | Resume by full ID or the 1-based number from the last displayed list |
+| `/resume` | Show the latest 50 sessions and, on a TTY, offer a selection prompt |
 | `/compact [N]` | Keep the latest N user turns in a new session (default 6); preserve the complete original session |
 | `/recall TEXT` | Search saved titles, message text and tool arguments; show at most 20 matching sessions with snippets |
 | `/export [ID] [markdown\|json] [PATH]` | Export current/specified session to a new 0600 file; default Markdown under the session data directory's `exports/` |
 | `/title [NAME]` | Show or change the current session title |
 | `/session` | Show current session ID, title and saved status |
 | `/session new [title]` | Save current session, create a blank one |
-| `/session load ID` | Save current and restore the specified session |
+| `/session load ID\|N` | Save current and restore the specified session or cached list number |
 | `ta --session ID` | Resume a session after restarting ta |
 | `/session rename title` | Rename current session |
 | `/session rename-id ID title` | Rename another session without loading/switching to it |
@@ -373,8 +375,13 @@ SQLite is part of the Python standard library; no new dependency or service.
 | `/session delete ID` | Confirm and delete an inactive session |
 | `/history [N] [skip]` | View last N messages, skipping recent messages to page backward |
 
-For example, `/title 稿件校对` names the current session and `/sessions find 校对`
-finds it later. Titles are trimmed, single-line strings of 1–120 characters;
+For example, `/title 稿件校对` names the current session, `/sessions find 校对`
+finds it later, then `/resume 1` loads the first row from that displayed result.
+Numbers refer only to the most recent `/sessions`, `/sessions find`, or `/resume`
+listing, including filtered results; they never select an unseen row or intercept
+ordinary numeric chat. A 12-digit value is checked as a full session ID first, so
+numeric IDs remain valid. `/resume ID` is the concise alias for `/session load ID`.
+Titles are trimmed, single-line strings of 1–120 characters;
 names need not be unique, and loading still uses the session ID. You can name an
 empty session before its first prompt. The name survives saving, restarting and
 restoring; later conversation saves do not replace it with the first prompt.
@@ -415,7 +422,7 @@ API/model identity, working directory, loaded agent.md text snapshot and source,
 messages (including tool IDs/results and reasoning_content), and usage counters
 are restored. Current credentials come from environment, never the database.
 If the saved API profile is missing, invalid, or now points to a different
-endpoint/model/protocol, `/session load ID` and `ta --session ID` open local history
+endpoint/model/protocol, `/resume`, `/session load ID`, and `ta --session ID` open local history
 viewing mode. `/history`, `/recall` and `/export` work without a provider client or
 credentials. Normal prompts and tools are disabled in that mode, and exiting or
 viewing does not rewrite the saved payload, revision or last activity time.
@@ -697,7 +704,8 @@ no full-screen interface or redraw loop. Piped `ta --prompt` output stays plain
 text, with reasoning and answer on separate lines.
 
 Press Tab to cycle command matches. After `/api`, it also completes profile
-names; `/session load` and `/session delete` complete saved IDs; `/agent`
+names; `/resume` and `/session load` complete displayed numbers and saved IDs;
+`/session delete` completes saved IDs; `/agent`
 completes Markdown files in the current directory; and `/skill load` or
 `/skill info` completes installed Skill names. Completion only reads the Skill
 library when that Skill argument is being completed. Ordinary text and `!shell`

@@ -22,6 +22,8 @@ class SessionTableTests(unittest.TestCase):
     def test_one_line_per_session_with_requested_field_order(self):
         lines = session_table([self.row()], 120, 'abcdef123456', '/home/me')
         self.assertEqual(len(lines), 2)
+        self.assertTrue(lines[0].startswith('序号'))
+        self.assertRegex(lines[1], r'^1\s+')
         self.assertIn('最后会话时间', lines[0])
         self.assertLess(lines[0].index('ID'), lines[0].index('title'))
         self.assertLess(lines[0].index('title'), lines[0].index('API'))
@@ -36,8 +38,27 @@ class SessionTableTests(unittest.TestCase):
         self.assertLess(line.index('cloud'), line.index('321'))
         self.assertLess(line.index('321'), line.index('~/work/project'))
         self.assertIn('cloud / deepseek-v4-flash', line)
-        self.assertEqual(cells(line[:line.index('321')]) + 3,
-                         cells(lines[0][:lines[0].index('消息数')]) + 6)
+        self.assertIn('*abcdef123456', line)
+
+    def test_numbered_first_column_does_not_mutate_rows(self):
+        rows = [self.row(), self.row(id='123456abcdef', title='第二会话', api='mimo',
+                                     model='mimo-v2.6-pro', messages=0,
+                                     directory='/home/me/second')]
+        before = copy.deepcopy(rows)
+        lines = session_table(rows, 120, rows[0]['id'], '/home/me')
+        self.assertTrue(lines[0].startswith('序号'))
+        self.assertRegex(lines[1], r'^1\s+')
+        self.assertRegex(lines[2], r'^2\s+')
+        self.assertIn('abcdef123456', lines[1])
+        self.assertIn('123456abcdef', lines[2])
+        self.assertIn('*abcdef123456', lines[1])
+        self.assertNotIn('*123456abcdef', lines[2])
+        for value in ('2026-10-20 16:56', '稿件校对', 'cloud / deepseek-v4-flash',
+                      '321', '~/work/project'):
+            self.assertIn(value, lines[1])
+        for value in ('第二会话', 'mimo / mimo-v2.6-pro', '0', '~/second'):
+            self.assertIn(value, lines[2])
+        self.assertEqual(rows, before)
 
     def test_long_chinese_titles_profiles_and_paths_fit_without_changing_data(self):
         rows = [self.row(title='很长的中文标题' * 20, api='cloud-provider-long-name', messages=1234567,
@@ -51,6 +72,9 @@ class SessionTableTests(unittest.TestCase):
                 for line in lines:
                     self.assertLessEqual(cells(line), width - 1, line)
                     self.assertNotIn('\n', line)
+                self.assertTrue(lines[0].startswith('序号' if width >= 80 else '#'))
+                self.assertRegex(lines[1], r'^1\s+')
+                self.assertRegex(lines[2], r'^2\s+')
                 self.assertIn('abcdef123456', lines[1])
                 self.assertIn('123456abcdef', lines[2])
                 self.assertIn('1234567', lines[1])
@@ -97,6 +121,16 @@ class SessionTableTests(unittest.TestCase):
         self.assertIn('cloud', line)
         self.assertNotIn('None', line)
         self.assertRegex(line, r'cloud\s+-\s+~/work/project$')
+
+    def test_80_column_overflow_keeps_chinese_title_readable_without_losing_ids_or_counts(self):
+        row = self.row(title='稿件校对与会议讨论', model='deepseek-v4.1-flash-reasoner', messages=98765)
+        lines = session_table([row], 80, 'abcdef123456', '/home/me')
+        line = lines[1]
+        self.assertIn('稿件…', line)
+        self.assertIn('*abcdef123456', line)
+        self.assertRegex(line, r'\s98765\s')
+        self.assertEqual(cells(line), 79)
+        self.assertTrue(all(cells(item) <= 79 for item in lines))
 
     def test_help_includes_simplified_chinese_for_existing_command_syntax(self):
         from termux_agent.cli import HELP
