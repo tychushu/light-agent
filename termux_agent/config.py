@@ -27,6 +27,8 @@ class Config:
     subagent_max_steps: int = 6
     web_fetch_enabled: bool = False
     lightpanda_binary: str = ""
+    rtk_enabled: bool = False
+    rtk_binary: str = ""
     api_key: str = ""
     api_key_env: str = "TERMUX_AGENT_API_KEY"
     api_profile: str = "default"
@@ -70,7 +72,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold", "context_recovery", "no_progress_detection", "no_progress_threshold", "context_window_tokens", "output_reserve_tokens", "max_output_tokens", "chat_include_usage", "chat_max_tokens_field", "token_count_mode", "token_cache_ttl", "token_metadata_base_url", "reasoning_effort"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "rtk_enabled", "rtk_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold", "context_recovery", "no_progress_detection", "no_progress_threshold", "context_window_tokens", "output_reserve_tokens", "max_output_tokens", "chat_include_usage", "chat_max_tokens_field", "token_count_mode", "token_cache_ttl", "token_metadata_base_url", "reasoning_effort"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         from .api_profiles import ProfileStore
@@ -93,7 +95,8 @@ class Config:
                             "context_recovery", "no_progress_detection", "no_progress_threshold",
                             "context_window_tokens", "output_reserve_tokens", "max_output_tokens",
                             "chat_include_usage", "chat_max_tokens_field", "token_count_mode",
-                                "token_cache_ttl", "token_metadata_base_url", "reasoning_effort")
+                            "token_cache_ttl", "token_metadata_base_url", "reasoning_effort",
+                            "rtk_enabled", "rtk_binary")
             for key in profile_keys:
                 if key in entry:
                     setattr(config, key, entry[key])
@@ -122,9 +125,11 @@ class Config:
             raise ValueError('max_context_chars must be between 1000 and 20000000')
         if not isinstance(self.web_fetch_enabled, bool):
             raise ValueError("web_fetch_enabled must be a boolean")
-        if (not isinstance(self.lightpanda_binary, str) or
-                any(ord(c) < 32 or ord(c) == 127 for c in self.lightpanda_binary)):
-            raise ValueError("lightpanda_binary must be an executable name or path without control characters")
+        for key in ("lightpanda_binary", "rtk_binary"):
+            value = getattr(self, key)
+            if (not isinstance(value, str) or
+                    any(ord(c) < 32 or ord(c) == 127 for c in value)):
+                raise ValueError(f"{key} must be an executable name or path without control characters")
         for key, low, high in (("retry_max_attempts", 1, 6), ("max_subagents", 0, 8),
                                ("subagent_max_steps", 1, 12)):
             value = getattr(self, key)
@@ -133,7 +138,7 @@ class Config:
         if not isinstance(self.auto_continue, bool):
             raise ValueError("auto_continue must be a boolean")
         for key in ("auto_extend_segments", "auto_compact_task", "context_recovery",
-                    "no_progress_detection", "chat_include_usage"):
+                    "no_progress_detection", "chat_include_usage", "rtk_enabled"):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(f"{key} must be a boolean")
         if (not isinstance(self.max_continuations, int) or isinstance(self.max_continuations, bool)

@@ -5,6 +5,7 @@ import os
 import shutil
 import signal
 import selectors
+import stat
 import subprocess
 import tempfile
 import math
@@ -14,6 +15,11 @@ import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+
+from .output_compression import (MIN_ARTIFACT_BYTES, RAW_STREAM_BYTES, OutputCompressor,
+                                finalize_result_metrics, meaningful_reduction,
+                                run_rtk_filter, serialized_result_bytes,
+                                stable_raw_digest)
 
 
 TOOLS = [
@@ -210,12 +216,12 @@ DELEGATE_TOOL = {
 MAX_EDIT_BYTES = 2 * 1024 * 1024
 
 
-def _retain(sample: list, chunk: bytes, cap: int) -> None:
+def _retain(sample: list, chunk: bytes, cap: int, raw_cap: int | None = None) -> None:
     """Keep a bounded head and tail while draining the complete pipe."""
     payload_cap = max(0, cap - len("\n[TRUNCATED]\n"))
     head_cap = payload_cap // 2
     tail_cap = payload_cap - head_cap
-    head, tail, total = sample
+    head, tail, total = sample[:3]
     total += len(chunk)
     if len(head) < head_cap:
         head.extend(chunk[:head_cap - len(head)])
@@ -224,15 +230,80 @@ def _retain(sample: list, chunk: bytes, cap: int) -> None:
         if len(tail) > tail_cap:
             del tail[:-tail_cap]
     sample[2] = total
+    if raw_cap is not None:
+        raw = sample[3]
+        room = raw_cap - len(raw)
+        if room > 0:
+            raw.extend(chunk[:room])
+        if len(chunk) > room:
+            sample[4] = False
 
 
 def _clip(text: str, cap: int) -> str:
+    if cap <= 0:
+        return ""
     if len(text) <= cap:
         return text
     marker = "\n[TRUNCATED]\n"
+    if cap < len(marker):
+        return text[:cap]
     keep = max(0, cap - len(marker))
     head = keep // 2
     return text[:head] + marker + (text[-(keep-head):] if keep > head else "")
+
+
+def _bounded_candidate(out_text: str, err_text: str, cap: int) -> tuple[str, str, bool]:
+    """Bound a candidate while retaining stderr attribution and diagnostics."""
+    separator = 1 if out_text and err_text else 0
+    if len(out_text) + len(err_text) + separator <= cap:
+        return out_text, err_text, False
+
+    # Prefer retaining a complete short stderr diagnostic. If stderr itself is
+    # too large, reserve a small stdout window instead of collapsing streams.
+    minimum = min(24, cap // 3)
+    err_budget = min(len(err_text), max(minimum, cap - minimum - 1))
+    out_budget = cap - err_budget - (1 if out_text and err_budget else 0)
+    if out_budget < 0:
+        out_budget = 0
+    bounded_err = _clip(err_text, err_budget) if err_budget else ""
+    bounded_out = _clip(out_text, out_budget) if out_budget else ""
+    return bounded_out, bounded_err, True
+
+
+def _artifact_reference(artifact: Any) -> dict[str, Any] | None:
+    """Return a reference only after the published archive is readable."""
+    if not isinstance(artifact, dict):
+        return None
+    artifact_id = artifact.get("id")
+    path_value = artifact.get("path")
+    size = artifact.get("bytes")
+    if (not isinstance(artifact_id, str) or not artifact_id or
+            not isinstance(path_value, str) or not path_value or
+            isinstance(size, bool) or not isinstance(size, int) or size <= 0):
+        return None
+    try:
+        path = Path(path_value)
+        info = os.stat(path, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+            return None
+        with path.open("rb") as stream:
+            if not stream.read(1):
+                return None
+    except (OSError, ValueError):
+        return None
+    return {"id": artifact_id, "path": path_value, "bytes": size}
+
+
+def _finalize_compact_metrics(before: dict[str, Any], after: dict[str, Any]) -> None:
+    """Set final serialized byte metrics without adding savings fields."""
+    metadata = after["output_compression"]
+    before_bytes = len(serialized_result_bytes(before))
+    for _ in range(8):
+        final_bytes = len(serialized_result_bytes(after))
+        values = {"before_bytes": before_bytes, "after_bytes": final_bytes}
+        if all(metadata.get(key) == value for key, value in values.items()):
+            break
+        metadata.update(values)
 
 
 def _atomic_write(path: Path, data: bytes) -> None:
@@ -258,7 +329,7 @@ def _atomic_write(path: Path, data: bytes) -> None:
         raise
 
 
-def _shell(args: dict, cap: int) -> dict:
+def _shell(args: dict, cap: int, output_compressor: OutputCompressor | None = None) -> dict:
     command = args.get("command")
     if not isinstance(command, str) or not command.strip():
         raise ValueError("command must be a non-empty string")
@@ -273,10 +344,18 @@ def _shell(args: dict, cap: int) -> dict:
     bash = os.path.join(prefix, "bin/bash") if prefix and os.path.isfile(os.path.join(prefix, "bin/bash")) else shutil.which("bash") or "/bin/bash"
     env = os.environ.copy()
     env.update({"TERM": "dumb", "GIT_TERMINAL_PROMPT": "0", "CI": "1"})
+    if output_compressor is not None:
+        # The shell boundary owns the per-attempt reset even when plan() is
+        # supplied by a caller that does not implement the coordination field.
+        output_compressor.last_stats = None
+    plan = output_compressor.plan(command) if output_compressor is not None else None
+    active = plan is not None
     proc = subprocess.Popen([bash, "--noprofile", "--norc", "-c", command], cwd=cwd, env=env,
                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
-    samples = {"out": [bytearray(), bytearray(), 0], "err": [bytearray(), bytearray(), 0]}
+    raw_cap = RAW_STREAM_BYTES if active else None
+    samples = {"out": [bytearray(), bytearray(), 0, bytearray(), True],
+               "err": [bytearray(), bytearray(), 0, bytearray(), True]}
     budgets = {"out": cap // 2, "err": cap - cap // 2}
     selector = selectors.DefaultSelector()
     for name, pipe in (("out", proc.stdout), ("err", proc.stderr)):
@@ -307,7 +386,7 @@ def _shell(args: dict, cap: int) -> dict:
                 except BlockingIOError:
                     continue
                 if chunk:
-                    _retain(samples[key.data], chunk, budgets[key.data])
+                    _retain(samples[key.data], chunk, budgets[key.data], raw_cap)
                 else:
                     selector.unregister(key.fileobj)
                     key.fileobj.close()
@@ -337,8 +416,10 @@ def _shell(args: dict, cap: int) -> dict:
         for pipe in (proc.stdout, proc.stderr):
             if pipe and not pipe.closed:
                 pipe.close()
-    def render(sample: list, budget: int) -> str:
-        head, tail, total = sample
+    def render(sample: list, budget: int, raw: bytes | None = None) -> str:
+        head, tail, total = sample[:3]
+        if raw is not None:
+            return raw.decode("utf-8", "replace")
         retained = len(head) + len(tail)
         overlap = max(0, retained - total)
         raw = head + tail[overlap:]
@@ -346,17 +427,222 @@ def _shell(args: dict, cap: int) -> dict:
             return raw.decode("utf-8", "replace")
         marker = "\n[TRUNCATED]\n"
         return head.decode("utf-8", "replace") + marker + tail.decode("utf-8", "replace")
-    out = render(samples["out"], budgets["out"])
-    err = render(samples["err"], budgets["err"])
+    # Keep the old bounded rendering as the sole fallback. Raw streams are
+    # retained separately and never feed this legacy clipping path.
+    capture_complete = bool(active and all(item[4] and item[2] <= RAW_STREAM_BYTES
+                                           for item in samples.values()))
+    captured_out = bytes(samples["out"][3]) if active else b""
+    captured_err = bytes(samples["err"][3]) if active else b""
+    raw_out = captured_out if capture_complete else b""
+    raw_err = captured_err if capture_complete else b""
+    safe_out_raw = output_compressor.redact(raw_out) if active else raw_out
+    safe_err_raw = output_compressor.redact(raw_err) if active else raw_err
+
+    legacy_out = render(samples["out"], budgets["out"])
+    legacy_err = render(samples["err"], budgets["err"])
+    if active:
+        legacy_out = output_compressor.redact(legacy_out.encode("utf-8")).decode("utf-8", "replace")
+        legacy_err = output_compressor.redact(legacy_err.encode("utf-8")).decode("utf-8", "replace")
     if timed_out:
-        err = (err + "\n[command timed out and process group was terminated]").strip()
-    # Final character cap includes both streams and timeout text.
-    combined = out + ("\n" if out and err else "") + err
-    clipped = _clip(combined, cap)
-    if clipped != combined:
-        # Keep fields useful while guaranteeing their concatenated size is bounded.
-        out, err = clipped, ""
-    return {"exit_code": code, "stdout": out, "stderr": err}
+        legacy_err = (legacy_err + "\n[command timed out and process group was terminated]").strip()
+
+    def bounded_legacy(out_text: str, err_text: str) -> tuple[str, str, bool]:
+        # This intentionally preserves the pre-RTK output contract, including
+        # its combined final cap and stream collapse, for exact fallback.
+        combined = out_text + ("\n" if out_text and err_text else "") + err_text
+        clipped = _clip(combined, cap)
+        return (clipped, "", True) if clipped != combined else (out_text, err_text, False)
+
+    legacy_out, legacy_err, legacy_clipped = bounded_legacy(legacy_out, legacy_err)
+    legacy_result = {"exit_code": code, "stdout": legacy_out, "stderr": legacy_err}
+    if not active:
+        return legacy_result
+
+    raw_source_bytes = samples["out"][2] + samples["err"][2]
+    raw_source_chars = len((captured_out if capture_complete else samples["out"][3]).decode("utf-8", "replace")) + \
+        len((captured_err if capture_complete else samples["err"][3]).decode("utf-8", "replace"))
+    raw_digest = stable_raw_digest(safe_out_raw, safe_err_raw, code, timed_out) if capture_complete else ""
+    metadata: dict[str, Any] = {
+        "status": "oversized" if not capture_complete else "no_benefit",
+        "applied": False,
+        "omitted": bool(legacy_clipped or not capture_complete),
+        "filter": plan.format,
+        "filter_reason": "raw capture exceeded the bounded limit" if not capture_complete else "not attempted",
+        "raw_available": False,
+        "raw_capture_complete": capture_complete,
+        "filter_attempted": False,
+        "before_bytes": 0,
+        "after_bytes": 0,
+        "before_chars": 0,
+        "after_chars": 0,
+        "raw_source_bytes": raw_source_bytes,
+        "raw_source_chars": raw_source_chars,
+    }
+    if raw_digest:
+        metadata["raw_digest"] = raw_digest
+
+    def record(status: str, filter_attempted: bool, applied: bool,
+               artifact_ref: dict[str, Any] | None = None,
+               before_bytes: int = 0, after_bytes: int = 0,
+               before_chars: int = 0, after_chars: int = 0) -> None:
+        output_compressor.last_stats = {
+            "status": status,
+            "filter_attempted": bool(filter_attempted),
+            "applied": bool(applied),
+            "raw_capture_complete": bool(capture_complete),
+            "raw_available": bool(artifact_ref),
+            "raw_artifact": artifact_ref,
+            "before_bytes": int(before_bytes),
+            "after_bytes": int(after_bytes),
+            "before_chars": int(before_chars),
+            "after_chars": int(after_chars),
+            "raw_source_bytes": int(raw_source_bytes),
+            "raw_source_chars": int(raw_source_chars),
+        }
+
+    filterable = False
+    if safe_out_raw and b"\0" not in safe_out_raw:
+        try:
+            safe_out_raw.decode("utf-8")
+            filterable = True
+        except UnicodeDecodeError:
+            pass
+
+    candidate_result: dict[str, Any] | None = None
+    filter_failure = False
+    filter_reason = ""
+    filter_attempted = False
+    filtered_output: bytes | None = None
+    if capture_complete and raw_source_bytes >= MIN_ARTIFACT_BYTES and filterable:
+        filter_attempted = True
+        try:
+            filtered = run_rtk_filter(plan.binary, plan.format, safe_out_raw,
+                                      timeout=output_compressor.filter_timeout)
+        except Exception as exc:
+            filter_failure = True
+            filter_reason = output_compressor.redact(
+                f"{type(exc).__name__}: {exc}".encode("utf-8")).decode("utf-8", "replace")
+        else:
+            if (getattr(filtered, "output", None) is None or not filtered.output or
+                    getattr(filtered, "error", "") or getattr(filtered, "timed_out", False) or
+                    getattr(filtered, "output_overflow", False) or
+                    getattr(filtered, "returncode", None) != 0):
+                filter_failure = True
+                raw_detail = getattr(filtered, "error", "") or (
+                    getattr(filtered, "stderr", b"").decode("utf-8", "replace").strip()[-200:] or
+                    f"exit {getattr(filtered, 'returncode', None)}")
+                filter_reason = output_compressor.redact(str(raw_detail).encode("utf-8")).decode("utf-8", "replace")
+            else:
+                try:
+                    filtered_output = output_compressor.redact(filtered.output)
+                    filtered_text = filtered_output.decode("utf-8")
+                    if not filtered_text or b"\0" in filtered_output:
+                        raise ValueError("empty or machine output")
+                except (UnicodeDecodeError, ValueError) as exc:
+                    filter_failure = True
+                    filter_reason = output_compressor.redact(
+                        f"invalid filter output: {exc}".encode("utf-8")).decode("utf-8", "replace")
+                else:
+                    stderr_text = safe_err_raw.decode("utf-8", "replace")
+                    if timed_out:
+                        stderr_text = (stderr_text + "\n[command timed out and process group was terminated]").strip()
+                    candidate_out, candidate_err, _ = _bounded_candidate(filtered_text, stderr_text, cap)
+                    candidate_result = {"exit_code": code, "stdout": candidate_out,
+                                        "stderr": candidate_err}
+                    if timed_out:
+                        candidate_result["timed_out"] = True
+
+    if filter_failure:
+        metadata.update(status="filter_failed", filter_reason=filter_reason,
+                        filter_attempted=True)
+    elif candidate_result is not None:
+        metadata.update(status="compressed", applied=True, filter_attempted=True,
+                        filter_reason="", omitted=True)
+    elif filter_attempted:
+        metadata.update(status="no_benefit", filter_attempted=True,
+                        filter_reason="filter did not produce a usable candidate")
+    elif not capture_complete:
+        metadata.update(status="oversized")
+    elif not safe_out_raw:
+        metadata.update(status="no_benefit", filter_reason="empty output")
+    elif not filterable:
+        metadata.update(status="unsupported_output",
+                        filter_reason="NUL or invalid UTF-8 output is not filterable")
+    else:
+        metadata.update(status="no_benefit", filter_reason="output is below the artifact threshold")
+
+    # A recovery archive is useful for a candidate, a filter failure, or a
+    # legacy-clipped result. Never publish a partial capture as a complete one.
+    if candidate_result is not None and \
+            len(serialized_result_bytes(candidate_result)) >= len(serialized_result_bytes(legacy_result)):
+        candidate_result = None
+        metadata.update(status="no_benefit", applied=False,
+                        filter_reason="candidate did not reduce the captured result")
+
+    should_archive = bool(capture_complete and raw_source_bytes >= MIN_ARTIFACT_BYTES and
+                          (candidate_result is not None or filter_failure or legacy_clipped))
+    artifact_ref: dict[str, Any] | None = None
+    archive_failed = False
+    if should_archive:
+        try:
+            artifact_ref = _artifact_reference(
+                output_compressor.save_raw(raw_out, raw_err, code, timed_out))
+        except Exception:
+            artifact_ref = None
+        archive_failed = artifact_ref is None
+
+    accepted = False
+    if candidate_result is not None:
+        if archive_failed:
+            metadata.update(status="archive_failed", applied=False, filter_reason="raw artifact publication failed")
+        else:
+            assert artifact_ref is not None
+            # Result metadata carries only the evidence needed by the model;
+            # raw source measurements and diagnostics remain in last_stats.
+            candidate_metadata = {
+                "status": "compressed",
+                "applied": True,
+                "omitted": True,
+                "raw_available": True,
+                "raw_artifact": artifact_ref,
+                "raw_digest": metadata.get("raw_digest", ""),
+                "before_bytes": 0,
+                "after_bytes": 0,
+            }
+            candidate_result["output_compression"] = candidate_metadata
+            _finalize_compact_metrics(legacy_result, candidate_result)
+            if meaningful_reduction(legacy_result, candidate_result):
+                accepted = True
+                result = candidate_result
+                metrics = candidate_metadata
+            else:
+                candidate_result = None
+                metadata.update(status="no_benefit", applied=False,
+                                filter_reason="final serialized result did not materially reduce")
+
+    if not accepted:
+        if artifact_ref and (filter_failure or legacy_clipped):
+            metadata.update(raw_available=True, raw_artifact=artifact_ref)
+        elif archive_failed and candidate_result is None and not filter_failure:
+            metadata.update(status="archive_failed", filter_reason="raw artifact publication failed")
+        if metadata["status"] in {"unsupported_output", "no_benefit"} and \
+                not (artifact_ref and (filter_failure or legacy_clipped)) and not archive_failed:
+            # Tiny/no-op and unsupported results keep the exact legacy payload;
+            # their bounded metrics remain available through last_stats.
+            record(metadata["status"], filter_attempted, False, artifact_ref)
+            return legacy_result
+        result = {**legacy_result, "output_compression": metadata}
+        metrics = metadata
+
+    if accepted:
+        before_chars = len(serialized_result_bytes(legacy_result).decode("utf-8"))
+        after_chars = len(serialized_result_bytes(result).decode("utf-8"))
+    else:
+        before_chars = after_chars = 0
+    record(metrics["status"], filter_attempted, accepted, artifact_ref,
+           metrics.get("before_bytes", 0), metrics.get("after_bytes", 0),
+           before_chars, after_chars)
+    return result
 
 
 def _read_file(args: dict, cap: int) -> dict:
@@ -496,7 +782,9 @@ def _edit_file(args: dict) -> dict:
             "chars_written": len(result)}
 
 
-def execute(name: str, args: dict, max_output_chars: int = 20000, *, lightpanda_binary: str | None = None) -> dict:
+def execute(name: str, args: dict, max_output_chars: int = 20000, *,
+            lightpanda_binary: str | None = None,
+            output_compressor: OutputCompressor | None = None) -> dict:
     """Run a named tool and turn failures into compact model-readable results."""
     try:
         if not isinstance(args, dict):
@@ -505,7 +793,7 @@ def execute(name: str, args: dict, max_output_chars: int = 20000, *, lightpanda_
         if cap < len("\n[TRUNCATED]\n") + 8:
             raise ValueError("max_output_chars is too small for truncation marker")
         if name == "shell":
-            return _shell(args, cap)
+            return _shell(args, cap, output_compressor=output_compressor)
         if name == "read_file":
             return _read_file(args, cap)
         if name == "write_file":

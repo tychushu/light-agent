@@ -15,7 +15,11 @@ COUNTERS = ('_total_calls', '_tool_calls_total', '_usage_history',
             '_subagent_calls_total', '_subagent_api_calls_total', '_subagent_tool_calls_total',
             '_tool_calls_executed', '_tool_calls_denied', '_tool_calls_not_run',
             '_tool_calls_approval_denied', '_tool_calls_hard_limit_not_run', '_tool_write_unknown',
-            '_http_attempts_total', '_http_retries_total', '_context_recoveries', '_task_compactions')
+            '_http_attempts_total', '_http_retries_total', '_context_recoveries', '_task_compactions',
+            '_rtk_shell_results', '_rtk_filter_attempts', '_rtk_compressed_results',
+            '_rtk_filter_failures', '_rtk_incomplete_capture', '_rtk_raw_artifacts',
+            '_rtk_artifact_bytes', '_rtk_before_bytes', '_rtk_after_bytes',
+            '_rtk_before_chars', '_rtk_after_chars')
 
 
 def new_id():

@@ -47,6 +47,8 @@ timeout = 120.0 # HTTP request timeout; shell defaults to 30 seconds
 # retry_thinking_400 = false # opt-in for the known structured-thinking 400 response
 # max_subagents = 3 # workers per parent task; 0 disables delegation
 # subagent_max_steps = 6 # model calls per worker; 1..12, capped by max_steps
+# rtk_enabled = false # opt-in RTK reduction for supported model shell output
+# rtk_binary = "" # empty uses TERMUX_AGENT_RTK, then PATH; ~/bin/rtk is accepted
 # max_task_calls = 32
 # max_task_seconds = 600.0
 # max_task_tokens = 0
@@ -79,10 +81,76 @@ as local counts or conservative estimates.
 Debug context is the last request body (messages include the system prompt), with
 the configured API key redacted. It can still contain private file/tool content.
 
+### Optional RTK shell-output compression
+
+Install [RTK](https://github.com/rtk-ai/rtk) separately. Version `1.1.0` with
+`--no-default-features` is verified; Termux needs a native Android build. With an
+existing Rust/Clang build toolchain, one installation option is:
+
+```sh
+cargo install --git https://github.com/rtk-ai/rtk --tag v1.1.0 --locked --no-default-features rtk
+```
+
+Set `rtk_binary = "~/.cargo/bin/rtk"` if that directory is outside `PATH`.
+The agent does not install RTK or require Rust at runtime.
+
+RTK output compression is disabled by default. Set `rtk_enabled = true` globally
+to cover local and cloud profiles, or set `rtk_enabled`/`rtk_binary` inside one
+`[apis.*]` profile to override the global value. An explicit `rtk_enabled = false`
+profile remains off. `rtk_binary` accepts `~/path`; when empty, resolution uses
+`TERMUX_AGENT_RTK` and then `rtk` in `PATH`. Resolution is lazy: a disabled session
+does not scan for the executable, start a proxy, use the network, or build/install
+anything.
+
+Only approved model shell calls and child-agent shell calls are eligible. Manual
+`!command` execution, file tools, prose and API/reasoning history remain unchanged.
+The first whitelist is deliberately narrow: simple `git status`, `git log`,
+`rg`/`grep`, `pytest`, and `python -m pytest` commands with text output. Pipes,
+redirects, compound commands, heredocs, `git status --porcelain`/`--short`,
+machine JSON, NUL output and formats without a tested reducer pass through raw.
+`python -m unittest` is not reduced because the pinned upstream filter has no
+unittest reducer.
+
+The original command runs exactly once under the existing approvals, working
+directory, environment, timeout and process-group cleanup. RTK is then invoked
+as `rtk pipe --filter FORMAT` with telemetry disabled, bounded input/output and a
+two-second filter timeout. It filters captured stdout only; the original exit
+status and stderr remain authoritative. Filter errors, timeouts and non-material
+reductions fall back to the already captured output without replaying the command.
+
+For an eligible complete capture, up to 1 MiB total (512 KiB per stdout and
+stderr) is retained before the normal `max_output_chars` clip. Oversized captures
+continue draining but are marked incomplete and are never sent to RTK as complete.
+When compression, truncation or filter failure makes raw recovery useful, a JSON
+archive containing both streams, exit status and timeout status is written under
+`~/.local/share/termux-agent/output-artifacts`. UTF-8 inputs expose exact plain
+`stdout_text` and `stderr_text` fields for direct raw plaintext recovery through
+the existing `read_file` tool; truly binary inputs use base64 fields instead. The
+tool result includes the archive path.
+
+Artifacts use directory mode 0700, file mode 0600, known `API_KEY`, `API_TOKEN`,
+`_SECRET` environment-value and configured-key redaction, an 8 MiB global quota
+and 32-file retention. Quota and
+retention are enforced best-effort at capture time, and cleanup only touches
+generated `shell-raw-*.json` files. A failed archive never triggers command replay
+and never authorizes an irreversible compressed result.
+
+Compression results include a raw digest and final serialized byte/character
+measurements. `/stats` preserves filter attempt, filter failure, raw artifact and
+artifact-byte counters as diagnostics. `before_bytes`, `after_bytes`, `bytes_saved`
+and the corresponding character values aggregate **APPLIED** reductions only:
+each comparison is the final serialized legacy baseline against the final
+serialized compressed result, including metadata and the real artifact-reference
+wire overhead. Pre-existing `max_output_chars` legacy clipping is never counted as
+RTK savings. These units are UTF-8 bytes and characters, not actual tokenizer or
+provider tokens. Delegated child primitive counters are merged exactly once in a
+`finally` block, including when the child is interrupted.
+
 ## Tools and approval
 
 - `shell(command, cwd?, timeout?)`: Termux bash, noninteractive stdin, bounded
-  stdout/stderr, process-group timeout. Reuses existing git/grep/curl/patch/etc.
+  stdout/stderr, process-group timeout. Optional RTK reduction follows the policy
+  above. Reuses existing git/grep/curl/patch/etc.
 - `read_file(path, start_line?, end_line?)`: first 50 UTF-8 text lines by default; explicit line ranges are one-based/inclusive, and `offset?`/`limit?` remain available for byte windows.
 - `write_file(path, content)`: creates parent directories and writes atomically.
 - `edit_file(path, old_text, new_text, expected_replacements=1)`: exact match count

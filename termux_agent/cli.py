@@ -33,7 +33,7 @@ Tab             补全命令、API 配置、会话 ID 和技能名称
 /status         查看上次停止原因和继续方式
 /recall TEXT    在已保存会话正文和工具参数中检索，最多显示 20 个会话
 /export [ID] [markdown|json] [PATH]  导出会话；默认当前会话、Markdown、新文件
-/stats          查看模型调用、服务端 token 用量和上下文大小
+/stats          查看模型调用、RTK 应用后 UTF-8 字节/字符节省（非 token）、服务端 token 用量和上下文大小
 /config         查看当前生效配置，不显示密钥
 /debug          开关请求用量和工具结果的调试显示
 /debug-context  查看上次请求的消息和工具，密钥会脱敏

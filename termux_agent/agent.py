@@ -15,11 +15,19 @@ from .client import (Client, ClientError, ContextLengthError, EmptyResponseError
 from .context import compact_task_messages, context_chars
 from .token_budget import TokenCounter, estimate_text_tokens
 from .tools import TOOLS, DELEGATE_TOOL, WEB_FETCH_TOOL, execute, web_fetch_available
+from .output_compression import OutputCompressor, stable_result_payload
 
 from .approval import needs_approval
 from .instructions import load_system_prompt, load_prompt_file
 from .display_privacy import hide_write_payloads
 from .continuation import TASK_MARKERS, provider_blocked, task_status
+
+
+OUTPUT_COMPRESSION_COUNTERS = (
+    "shell_results", "filter_attempts", "compressed_results", "filter_failures",
+    "incomplete_capture", "raw_artifacts", "artifact_bytes", "before_bytes",
+    "after_bytes", "before_chars", "after_chars",
+)
 
 
 class TaskBudgetExhausted(RuntimeError):
@@ -44,6 +52,7 @@ class Agent:
         self.client = client or Client(config)
         self._allow_delegation = allow_delegation
         self._web_fetch_enabled = config.web_fetch_enabled and web_fetch_available(config.lightpanda_binary or None)
+        self.output_compressor = OutputCompressor(config)
         self.tools = (TOOLS + ([WEB_FETCH_TOOL] if self._web_fetch_enabled else []) +
                       ([DELEGATE_TOOL] if allow_delegation and config.max_subagents else []))
         self._subagents_this_run = 0
@@ -66,6 +75,17 @@ class Agent:
         self._http_retries_total = 0
         self._context_recoveries = 0
         self._task_compactions = 0
+        self._rtk_shell_results = 0
+        self._rtk_filter_attempts = 0
+        self._rtk_compressed_results = 0
+        self._rtk_filter_failures = 0
+        self._rtk_incomplete_capture = 0
+        self._rtk_raw_artifacts = 0
+        self._rtk_artifact_bytes = 0
+        self._rtk_before_bytes = 0
+        self._rtk_after_bytes = 0
+        self._rtk_before_chars = 0
+        self._rtk_after_chars = 0
         self._usage_history: list[dict[str, Any] | None] = []
         self._request_history_chars: list[int] = []
         self._conversation_count = 0
@@ -641,6 +661,18 @@ class Agent:
                     elif name == "web_fetch":
                         result = execute(name, args or {}, self.config.max_output_chars,
                                          lightpanda_binary=self.config.lightpanda_binary or None)
+                    elif name == "shell":
+                        self.output_compressor.last_stats = None
+                        try:
+                            if self.output_compressor.enabled:
+                                result = execute(name, args or {}, self.config.max_output_chars,
+                                                 output_compressor=self.output_compressor)
+                            else:
+                                result = execute(name, args or {}, self.config.max_output_chars)
+                        finally:
+                            self._record_output_compression(
+                                getattr(self.output_compressor, "last_stats", None))
+                            self.output_compressor.last_stats = None
                     else:
                         result = execute(name, args or {}, self.config.max_output_chars)
                 except KeyboardInterrupt:
@@ -677,7 +709,7 @@ class Agent:
                 self._emit("tool_result", {"name": name, "result": result})
             self.messages.append({"role": "tool", "tool_call_id": call_id,
                                   "content": json.dumps(result, ensure_ascii=False, separators=(",", ":"))})
-            fingerprint = hashlib.sha256(json.dumps([self._call_fingerprint(call), result], sort_keys=True,
+            fingerprint = hashlib.sha256(json.dumps([self._call_fingerprint(call), stable_result_payload(result)], sort_keys=True,
                                                      ensure_ascii=False).encode()).hexdigest()
             if self.config.no_progress_detection and fingerprint == self._last_tool_fingerprint:
                 self._same_tool_fingerprint_count += 1
@@ -699,6 +731,42 @@ class Agent:
                     del progress[:-32]
             self._checkpoint()
         return interrupted
+
+    @staticmethod
+    def _compression_count(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+    def _record_output_compression(self, metadata):
+        if not self.output_compressor.enabled or not isinstance(metadata, dict):
+            return
+        self._rtk_shell_results += 1
+        if metadata.get("filter_attempted") is True:
+            self._rtk_filter_attempts += 1
+        applied = metadata.get("applied") is True
+        self._rtk_compressed_results += int(applied)
+        self._rtk_filter_failures += int(metadata.get("status") == "filter_failed")
+        self._rtk_incomplete_capture += int(metadata.get("raw_capture_complete") is False)
+        self._rtk_raw_artifacts += int(metadata.get("raw_available") is True)
+        artifact = metadata.get("raw_artifact")
+        self._rtk_artifact_bytes += self._compression_count(
+            artifact.get("bytes", 0)) if isinstance(artifact, dict) else 0
+        # Only an accepted reduction represents saved output. These values come
+        # from last_stats as final serialized sizes, including metadata overhead.
+        if applied:
+            self._rtk_before_bytes += self._compression_count(metadata.get("before_bytes"))
+            self._rtk_after_bytes += self._compression_count(metadata.get("after_bytes"))
+            self._rtk_before_chars += self._compression_count(metadata.get("before_chars"))
+            self._rtk_after_chars += self._compression_count(metadata.get("after_chars"))
+
+    def _merge_output_compression(self, values):
+        for field in OUTPUT_COMPRESSION_COUNTERS:
+            value = values.get("_rtk_" + field, values.get(field, 0)) if isinstance(values, dict) else 0
+            setattr(self, "_rtk_" + field,
+                    getattr(self, "_rtk_" + field) + self._compression_count(value))
+
+    def _primitive_output_compression(self):
+        return {"_rtk_" + field: getattr(self, "_rtk_" + field)
+                for field in OUTPUT_COMPRESSION_COUNTERS}
 
     def _delegate(self, args):
         if not self._allow_delegation or not self.config.max_subagents:
@@ -722,6 +790,8 @@ class Agent:
         child_client = Client(child_config)
         child_client.on_retry = lambda info: self._emit("subagent_retry", {**info, "id": identifier})
         child = None
+        stats_snapshot = None
+        compression_merged = False
         status = "error"
         self._emit("subagent_start", {"id": identifier, "model": child_config.model,
                                       "max_steps": child_config.max_steps})
@@ -738,12 +808,16 @@ class Agent:
                 raise KeyboardInterrupt
             cap = min(4000, self.config.max_output_chars)
             truncated = len(summary) > cap
+            stats_snapshot = child.stats()
             return {"id": identifier, "status": status,
                     "summary": summary[:cap] + ("\n[TRUNCATED]" if truncated else ""),
                     "api_calls": child._total_calls, "tool_calls": child._tool_calls_total,
-                    "usage": child.stats()["usage_totals"]}
+                    "usage": stats_snapshot["usage_totals"]}
         finally:
             if child is not None:
+                if not compression_merged:
+                    compression_merged = True
+                    self._merge_output_compression(child._primitive_output_compression())
                 self._subagent_api_calls_total += child._total_calls
                 self._subagent_tool_calls_total += child._tool_calls_total
                 child.close()
@@ -795,6 +869,25 @@ class Agent:
             totals[field] = sum(observed) if observed else None
             missing[field] = len(self._usage_history) - len(observed)
         last_usage = self._usage_history[-1] if self._usage_history else None
+        compression = {
+            "enabled": self.config.rtk_enabled,
+            "shell_results": self._rtk_shell_results,
+            "filter_attempts": self._rtk_filter_attempts,
+            "compressed_results": self._rtk_compressed_results,
+            "filter_failures": self._rtk_filter_failures,
+            "incomplete_capture": self._rtk_incomplete_capture,
+            "raw_artifacts": self._rtk_raw_artifacts,
+            "artifact_bytes": self._rtk_artifact_bytes,
+            "before_bytes": self._rtk_before_bytes,
+            "after_bytes": self._rtk_after_bytes,
+            "bytes_saved": max(0, self._rtk_before_bytes - self._rtk_after_bytes),
+            "before_chars": self._rtk_before_chars,
+            "after_chars": self._rtk_after_chars,
+            "chars_saved": max(0, self._rtk_before_chars - self._rtk_after_chars),
+            "unit": "UTF-8 bytes and characters, not actual tokenizer or provider tokens",
+            "attribution": "applied final serialized reductions only, including metadata overhead; legacy clipping is excluded",
+            "scope": "this agent plus delegated primitive counters merged once in finally, including interrupted children",
+        }
         return {"api_calls_total": self._total_calls,
                 "model_logical_calls_total": self._total_calls,
                 "http_attempts_last": getattr(self.client, "last_attempts", 0),
@@ -806,6 +899,7 @@ class Agent:
                 "tool_calls_denied": self._tool_calls_denied,
                 "tool_calls_not_run": self._tool_calls_not_run,
                 "direct_shell_commands": self._direct_shell_count, "active_skills": list(self.active_skills),
+                "output_compression": compression,
                 "subagents": {"calls": self._subagent_calls_total,
                               "api_calls": self._subagent_api_calls_total,
                               "tool_calls": self._subagent_tool_calls_total},
