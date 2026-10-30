@@ -60,6 +60,7 @@ class Config:
     token_cache_ttl: int = 86_400
     token_metadata_base_url: str = ""
     reasoning_effort: str = ""
+    ui_language: str = "zh"
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -77,6 +78,7 @@ class Config:
         valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "rtk_enabled", "rtk_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments", "auto_compact", "auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold", "context_recovery", "no_progress_detection", "no_progress_threshold", "context_window_tokens", "output_reserve_tokens", "max_output_tokens", "chat_include_usage", "chat_max_tokens_field", "token_count_mode", "token_cache_ttl", "token_metadata_base_url", "reasoning_effort"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
+        config.ui_language = raw.get('ui_language', 'zh')
         from .api_profiles import ProfileStore
         store = ProfileStore(config_path)
         profiles = store.entries(raw)
@@ -121,7 +123,22 @@ class Config:
         from .api_profiles import ProfileStore
         return ["default", *ProfileStore(path).entries().keys()]
 
+    @staticmethod
+    def read_ui_language(path=None):
+        """Read the UI preference without profiles, credentials, or network access."""
+        source = Path(path).expanduser() if path else Path.home()/'.config/termux-agent/config.toml'
+        try:
+            raw = tomllib.loads(source.read_text(encoding='utf-8'))
+        except FileNotFoundError:
+            raw = {}
+        language = raw.get('ui_language', 'zh')
+        if language not in ('zh', 'en'):
+            raise ValueError('ui_language must be zh or en')
+        return language
+
     def validate(self) -> None:
+        if self.ui_language not in ('zh', 'en'):
+            raise ValueError('ui_language must be zh or en')
         if (isinstance(self.max_context_chars, bool) or not isinstance(self.max_context_chars, int)
                 or not 1000 <= self.max_context_chars <= 20_000_000):
             raise ValueError('max_context_chars must be between 1000 and 20000000')

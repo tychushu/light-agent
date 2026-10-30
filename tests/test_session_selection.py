@@ -275,7 +275,7 @@ class SessionSelectionTests(unittest.TestCase):
         output, _, _, restore_calls = self.run_cli(
             ['/sessions', InputHook(delete_cached), '/resume 2', '/session', '/exit'],
             args=['--session', 'aaaaaaaaaaaa'])
-        self.assertIn('Session not found', output)
+        self.assertIn('未找到会话', output)
         self.assertIn('"id": "aaaaaaaaaaaa"', output)
         self.assertEqual(len(restore_calls), 1)
 
@@ -288,7 +288,7 @@ class SessionSelectionTests(unittest.TestCase):
 
     def test_resume_without_session_persistence_is_clear(self):
         output, _, _, _ = self.run_cli(['/resume', '/exit'], args=['--no-session'])
-        self.assertIn('Persistence disabled by --no-session', output)
+        self.assertIn('--no-session 已关闭会话持久化', output)
 
 
 if __name__ == '__main__':

@@ -14,6 +14,7 @@ from .client import (Client, ClientError, ContextLengthError, EmptyResponseError
                      IncompleteOutputError, NetworkError)
 from .context import compact_task_messages, compact_context_messages, context_chars
 from .token_budget import TokenCounter, estimate_text_tokens
+from .i18n import text as ui_text
 from .tools import TOOLS, DELEGATE_TOOL, WEB_FETCH_TOOL, execute, web_fetch_available
 from .output_compression import OutputCompressor, stable_result_payload
 
@@ -105,12 +106,16 @@ class Agent:
         self._task_progress = False
         self._last_progress_evidence = None
         self._unsafe_write_fingerprints = self._scan_unsafe_writes(self.messages)
-        self.last_run = self._idle_run()
+        self.last_run = self._idle_run(config.ui_language)
+
+    def _ui(self, template, **values):
+        return ui_text(template, self.config.ui_language, **values)
 
     @staticmethod
-    def _idle_run():
+    def _idle_run(language='zh'):
         return {"status": "idle", "stop_reason": "idle", "auto": False, "continuations": 0,
-                "steps": 0, "message": "尚无任务。", "continue_hint": "输入任务，或用 /session load ID 恢复。"}
+                "steps": 0, "message": ui_text("尚无任务。", language),
+                "continue_hint": ui_text("输入任务，或用 /session load ID 恢复。", language)}
 
     def _sync_skills(self) -> None:
         self.system = self.base_system
@@ -287,8 +292,8 @@ class Agent:
         state.update(status=status, stop_reason=stop_reason)
         self.last_run.update(status=status, stop_reason=stop_reason, message=value,
                              can_continue=can_continue, task_budget=self._task_budget(),
-                             continue_hint='/continue 开始同一任务的新受控段。' if can_continue else
-                                           '此结果不能自动续跑；请修正条件后开始新任务。')
+                             continue_hint=self._ui('/continue 开始同一任务的新受控段。' if can_continue else
+                             '此结果不能自动续跑；请修正条件后开始新任务。'))
         self._checkpoint()
         return value
 
@@ -323,7 +328,7 @@ class Agent:
         chars, token, exceeded = self._context_budget(self._request_messages(rules), allow_network=False)
         ratio = self._context_ratio(chars, token)
         return {'chars': chars, 'limit': self.config.max_context_chars, 'tokens': token,
-                'ratio': ratio, 'state': ('已超限' if exceeded or chars > self.config.max_context_chars
+                'ratio': ratio, 'state': self._ui('已超限' if exceeded or chars > self.config.max_context_chars
                                         else '待压缩' if ratio >= self.config.auto_compact_threshold else '正常'),
                 'auto_compact': self.config.auto_compact or self.config.auto_compact_task,
                 'threshold': self.config.auto_compact_threshold}
@@ -386,11 +391,11 @@ class Agent:
 
     def continue_task(self, steps=None, auto_continue=None):
         if self.history_only:
-            raise ValueError('历史查看模式不能继续任务；请用 /api NAME 新建可用会话。')
+            raise ValueError(self._ui('历史查看模式不能继续任务；请用 /api NAME 新建可用会话。'))
         if not self.task_state:
             self._restore_legacy_task()
         if self.last_run.get('can_continue') is False:
-            raise ValueError('上次任务明确不可自动续跑；请修正条件后开始新任务。')
+            raise ValueError(self._ui('上次任务明确不可自动续跑；请修正条件后开始新任务。'))
         if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= 256):
             raise ValueError('continue steps must be between 1 and 256')
         return self._run_segment('[TASK_RESUME]\n' + load_prompt_file('task_resume.txt'),
@@ -399,7 +404,7 @@ class Agent:
 
     def run(self, text: str, auto_continue: bool | None = None) -> str:
         if self.history_only:
-            raise ValueError('历史查看模式不能调用模型；请用 /api NAME 新建可用会话。')
+            raise ValueError(self._ui('历史查看模式不能调用模型；请用 /api NAME 新建可用会话。'))
         if not isinstance(text, str) or not text.strip():
             raise ValueError('input must be a non-empty string')
         self._ensure_task_state(text)
@@ -453,7 +458,7 @@ class Agent:
         self._segment_started = time.monotonic()
         self.last_run = {'status': 'running', 'stop_reason': 'running', 'auto': automatic,
                          'continuations': 0, 'steps': 0, 'segment': self.task_state['segments'],
-                         'task_id': self.task_state['id'], 'message': '任务运行中。'}
+                         'task_id': self.task_state['id'], 'message': self._ui('任务运行中。')}
         if hasattr(self.client, 'set_control_markers'):
             self.client.set_control_markers(TASK_MARKERS if automatic else ())
         if resume:
@@ -473,7 +478,7 @@ class Agent:
             stop = self._budget_stop()
             if stop:
                 reason = {'time_budget': 'time_budget', 'token_budget': 'token_budget'}.get(stop, 'task_call_budget')
-                return self._finish('limit', reason, '同一任务的硬预算已用完；未执行新的调用。')
+                return self._finish('limit', reason, self._ui('同一任务的硬预算已用完；未执行新的调用。'))
             request = self._request_messages(rules)
             chars, token, exceeded = self._context_budget(request)
             if self._compact_for_context(rules=rules, budget=(chars, token, exceeded)):
@@ -482,8 +487,7 @@ class Agent:
             self.last_run['context'] = {'chars': chars, 'tokens': token}
             if chars > self.config.max_context_chars or exceeded:
                 return self._finish('context_limit', 'context_limit',
-                    '上下文预算不足；保留的用户指令、近期结果或系统提示无法安全缩减。'
-                    '请用 /compact 1 仅保留最近一轮，或 /clear 新建会话；完整历史仍保留。')
+                    self._ui('上下文预算不足；保留的用户指令、近期结果或系统提示无法安全缩减。请用 /compact 1 仅保留最近一轮，或 /clear 新建会话；完整历史仍保留。'))
             if not warned and chars >= self.config.max_context_chars * 0.8:
                 self._emit('context_warning', {'chars': chars, 'limit': self.config.max_context_chars})
                 warned = True
@@ -493,11 +497,11 @@ class Agent:
             try:
                 answer = self._chat_with_recovery(request, rules)
             except KeyboardInterrupt:
-                return self._finish('interrupted', 'interrupted', 'LLM 请求已中断。')
+                return self._finish('interrupted', 'interrupted', self._ui('LLM 请求已中断。'))
             except TaskBudgetExhausted as exc:
                 reason = {'time_budget': 'time_budget', 'token_budget': 'token_budget'}.get(
                     exc.reason, 'task_call_budget')
-                return self._finish('limit', reason, '同一任务的硬预算已用完；未执行新的调用。')
+                return self._finish('limit', reason, self._ui('同一任务的硬预算已用完；未执行新的调用。'))
             except Exception as exc:
                 if isinstance(exc, IncompleteOutputError) or (
                         isinstance(exc, EmptyResponseError) and getattr(exc, 'length', False)):
@@ -510,20 +514,20 @@ class Agent:
                                                            '_incomplete_output')}
                                              | {'role': 'assistant'})
                 if isinstance(exc, ContextLengthError):
-                    return self._finish('context_limit', 'context_limit', f'LLM 请求失败：{exc}', False)
+                    return self._finish('context_limit', 'context_limit', self._ui('LLM 请求失败：{v0}', v0=exc), False)
                 if isinstance(exc, IncompleteOutputError):
                     reason = 'context_limit' if getattr(exc, 'context_limited', False) else 'output_limit'
-                    return self._finish('incomplete', reason, f'LLM 请求失败：输出不完整：{exc}', False)
+                    return self._finish('incomplete', reason, self._ui('LLM 请求失败：输出不完整：{v0}', v0=exc), False)
                 if isinstance(exc, EmptyResponseError):
                     reason = 'output_limit' if getattr(exc, 'length', False) else 'provider_error'
-                    return self._finish('empty_response', reason, f'LLM 请求失败：{exc}', False)
-                return self._finish('error', 'network_error' if isinstance(exc, NetworkError) else 'provider_error', f'LLM 请求失败：{exc}')
+                    return self._finish('empty_response', reason, self._ui('LLM 请求失败：{v0}', v0=exc), False)
+                return self._finish('error', 'network_error' if isinstance(exc, NetworkError) else 'provider_error', self._ui('LLM 请求失败：{v0}', v0=exc))
             if not isinstance(answer, dict):
-                return self._finish('error', 'provider_error', 'LLM 响应格式错误：assistant message must be an object')
+                return self._finish('error', 'provider_error', self._ui('LLM 响应格式错误：assistant message must be an object'))
             if answer.get('_incomplete_tool_calls') or answer.get('_incomplete_output'):
                 self.incomplete_draft = deepcopy(answer)
                 reason = 'context_limit' if getattr(self.client, 'context_limited', False) else 'output_limit'
-                return self._finish('incomplete', reason, '模型输出未完成；草稿已保存，未执行其中工具。', False)
+                return self._finish('incomplete', reason, self._ui('模型输出未完成；草稿已保存，未执行其中工具。'), False)
             content = answer.get('content') if isinstance(answer.get('content'), str) else ''
             marker = None
             if automatic:
@@ -531,46 +535,46 @@ class Agent:
             keep = {k: answer[k] for k in ('reasoning_content', '_responses_output', '_incomplete_output') if k in answer}
             if provider_blocked(answer, getattr(self.client, 'last_finish_reason', None)):
                 self.messages.append({'role': 'assistant', 'content': content, **keep}); self.last_run['blocked_by'] = 'provider'
-                return self._finish('blocked', 'provider_denied', content or '模型服务拒绝了请求。', False)
+                return self._finish('blocked', 'provider_denied', content or self._ui('模型服务拒绝了请求。'), False)
             calls = answer.get('tool_calls') if isinstance(answer.get('tool_calls'), list) else []
             if not calls:
                 self.messages.append({'role': 'assistant', 'content': content, **keep})
                 if not automatic:
                     return self._finish('complete', 'complete', content)
                 if self._approval_denied:
-                    return self._finish('blocked', 'approval_denied', '任务因审批拒绝停止。', False)
+                    return self._finish('blocked', 'approval_denied', self._ui('任务因审批拒绝停止。'), False)
                 if marker == 'done': return self._finish('complete', 'complete', content)
-                if marker == 'blocked': return self._finish('blocked', 'user_blocked', content or '任务需要用户输入。')
+                if marker == 'blocked': return self._finish('blocked', 'user_blocked', content or self._ui('任务需要用户输入。'))
                 if pauses >= self.config.max_continuations:
-                    return self._finish('stalled', 'stalled', '自动任务已停止：连续多轮未执行工具或确认完成。')
+                    return self._finish('stalled', 'stalled', self._ui('自动任务已停止：连续多轮未执行工具或确认完成。'))
                 pauses += 1; self.last_run['continuations'] += 1
                 self.messages.append({'role': 'user', 'content': nudge}); self._checkpoint(); continue
             invalid = self._validate_calls(calls)
             if invalid:
                 self.messages.append({'role': 'assistant', 'content': content, **keep})
-                return self._finish('error', 'provider_error', f'模型返回了格式错误的工具调用：{invalid}')
+                return self._finish('error', 'provider_error', self._ui('模型返回了格式错误的工具调用：{v0}', v0=self._ui(invalid)))
             self.messages.append({'role': 'assistant', 'content': content, 'tool_calls': calls, **keep}); self._checkpoint()
             if self._approval_denied:
                 self._fill_tool_results(calls, disposition='denied', reason='task stopped after approval denial')
-                return self._finish('blocked', 'approval_denied', '任务因审批拒绝停止；新工具未执行。', False)
+                return self._finish('blocked', 'approval_denied', self._ui('任务因审批拒绝停止；新工具未执行。'), False)
             stop = self._budget_stop()
             if stop:
                 self._fill_tool_results(calls, disposition='not_run', reason='task hard budget reached')
                 reason = {'time_budget': 'time_budget', 'token_budget': 'token_budget'}.get(stop, 'task_call_budget')
-                return self._finish('limit', reason, '任务硬预算已用完；最后一轮工具未执行。')
+                return self._finish('limit', reason, self._ui('任务硬预算已用完；最后一轮工具未执行。'))
             may_run_last = (self.config.auto_extend_segments
                             and self._can_extend_segment(require_progress=False))
             if step == segment_steps - 1 and not may_run_last:
                 self._fill_tool_results(calls, disposition='not_run', reason='maximum API request count reached')
-                return self._finish('limit', 'step_limit', '已达到本段最大模型请求次数；最后一轮工具未执行。')
+                return self._finish('limit', 'step_limit', self._ui('已达到本段最大模型请求次数；最后一轮工具未执行。'))
             interrupted = self._fill_tool_results(calls)
             pauses = 0
-            if interrupted: return self._finish('interrupted', 'interrupted', '工具执行已中断；结果配对已保留。')
+            if interrupted: return self._finish('interrupted', 'interrupted', self._ui('工具执行已中断；结果配对已保留。'))
             if self._approval_denied and len(calls) > 1:
                 return self._finish('blocked', 'approval_denied',
-                                    '任务因审批拒绝停止；其余调用未执行。', False)
+                                    self._ui('任务因审批拒绝停止；其余调用未执行。'), False)
             if self._no_progress_stop:
-                return self._finish('stalled', 'no_progress', '连续相同调用、参数和结果达到阈值；结果已保留。')
+                return self._finish('stalled', 'no_progress', self._ui('连续相同调用、参数和结果达到阈值；结果已保留。'))
         if self.config.auto_extend_segments and self._can_extend_segment():
             self.task_state['active_seconds'] += time.monotonic() - self._segment_started
             self._segment_started = 0.0
@@ -578,7 +582,7 @@ class Agent:
             remaining = self.config.max_task_calls - self.task_state['logical_calls']
             return self._run_segment('[TASK_RESUME]\n' + load_prompt_file('task_resume.txt'), automatic=automatic,
                                      resume=True, segment_steps=max(1, min(segment_steps, remaining)))
-        return self._finish('limit', 'step_limit', '已达到最大模型请求次数；同一任务可用 /continue 开始新的受控段。')
+        return self._finish('limit', 'step_limit', self._ui('已达到最大模型请求次数；同一任务可用 /continue 开始新的受控段。'))
 
     def _can_extend_segment(self, require_progress=True):
         if self._budget_stop() or self._approval_denied or self._no_progress_stop:
@@ -884,7 +888,7 @@ class Agent:
     def delegate(self, task):
         """Explicit /sub command; record a complete tool turn like model delegation."""
         if self.history_only:
-            raise ValueError('历史查看模式不能委派任务；请用 /api NAME 新建可用会话。')
+            raise ValueError(self._ui('历史查看模式不能委派任务；请用 /api NAME 新建可用会话。'))
         if not isinstance(task, str) or not task.strip() or len(task) > 16000:
             raise ValueError("task must contain 1–16000 characters")
         if not isinstance(self.task_state, dict):

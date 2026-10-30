@@ -22,6 +22,7 @@ from .local_input import load_text_submission, path_value
 from .display_privacy import WRITE_TOOLS, hide_write_payloads, safe_tool_arguments
 from .approval import reason as approval_reason
 from .history import history_entry
+from .i18n import text as ui_text, help_text
 
 HELP = """/help           显示命令帮助（Show commands）
 Tab             补全命令、API 配置、会话 ID 和技能名称
@@ -62,7 +63,7 @@ Tab             补全命令、API 配置、会话 ID 和技能名称
 /session rename-id ID NAME  修改其他会话标题，不切换会话
 /session fork [NAME]  将当前对话复制为独立会话，可指定标题
 /session save        保存当前会话
-/session delete ID   删除非当前会话，需要确认
+/session delete [ID|N]  按列表序号或 ID 删除；不带参数进入选择，需确认
 /history [N] [skip]  查看最近 N 条消息，skip 可向前翻页
 /sub TASK       直接委派一个子任务；/sub 查看执行上限
 /exit           保存当前会话并退出
@@ -172,21 +173,36 @@ def read_prompt(prompt="ta> ", continuation="... "):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="轻量原生 Termux LLM Agent；交互命令帮助见 /help")
-    parser.add_argument("--config", help="指定 TOML 配置文件路径")
-    parser.add_argument("--prompt", help="执行一条提示词后退出")
-    parser.add_argument("--api", help="选择配置中的 API 名称")
-    parser.add_argument("--directory", default=None, help="设置工作目录，仅加载该目录的 agent.md")
-    parser.add_argument("--agent", help="指定会话指令文件，替代目录 agent.md")
-    parser.add_argument("--no-agent", action="store_true", help="不加载 agent.md 指令文件")
-    parser.add_argument("--session", help="按 ID 恢复已保存会话及其作用域")
-    parser.add_argument("--no-session", action="store_true", help="仅在内存中运行，不保存会话")
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument('--config')
+    pre.add_argument('--session')
+    preliminary, _unknown = pre.parse_known_args()
+    try:
+        language = Config.read_ui_language(preliminary.config)
+    except (ValueError, OSError) as exc:
+        if preliminary.session:
+            language = 'zh'  # An invalid API config must not prevent local history access.
+        else:
+            pre.error(str(exc))
+
+    def tr(template, **values):
+        return ui_text(template, language, **values)
+
+    parser = argparse.ArgumentParser(description=tr('轻量原生 Termux LLM Agent；交互命令帮助见 /help'))
+    parser.add_argument("--config", help=tr('指定 TOML 配置文件路径'))
+    parser.add_argument("--prompt", help=tr('执行一条提示词后退出'))
+    parser.add_argument("--api", help=tr('选择配置中的 API 名称'))
+    parser.add_argument("--directory", default=None, help=tr('设置工作目录，仅加载该目录的 agent.md'))
+    parser.add_argument("--agent", help=tr('指定会话指令文件，替代目录 agent.md'))
+    parser.add_argument("--no-agent", action="store_true", help=tr('不加载 agent.md 指令文件'))
+    parser.add_argument("--session", help=tr('按 ID 恢复已保存会话及其作用域'))
+    parser.add_argument("--no-session", action="store_true", help=tr('仅在内存中运行，不保存会话'))
     options = parser.parse_args()
     if options.prompt is None and not configure_readline(
             Path.home() / ".local/share/termux-agent/repl_history"):
-        print("Warning: Python readline is unavailable; terminal key editing may not work.", file=sys.stderr)
+        print(tr('Warning: Python readline is unavailable; terminal key editing may not work.'), file=sys.stderr)
     if options.session and (options.no_session or options.api or options.directory or options.agent or options.no_agent or options.config):
-        parser.error("--session restores its saved scope; do not combine it with scope overrides")
+        parser.error(tr('--session restores its saved scope; do not combine it with scope overrides'))
     try:
         config_path = str(Path(options.config).expanduser().resolve()) if options.config else None
         directory = Path(options.directory or ".").expanduser().resolve()
@@ -196,6 +212,7 @@ def main():
         else:
             instructions, instruction_path = load_instructions(directory, session_file, disabled)
             config = Config.load(config_path, options.api)
+        language = config.ui_language
         os.chdir(directory)
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))
@@ -232,12 +249,12 @@ def main():
             return True
         visible = safe_tool_arguments(name, args) if config.silent_writes else args
         display({"approval_required": name, "arguments": visible,
-                 "reason": approval_reason(name, args)}, "Approve")
+                 "reason": tr(approval_reason(name, args))}, "Approve")
         if not sys.stdin.isatty():
-            display("Denied: approval requires an interactive terminal.")
+            display(tr('Denied: approval requires an interactive terminal.'))
             return False
         try:
-            prompt = ("Allow this tool call? [y/N/a=all reads this task] "
+            prompt = tr("Allow this tool call? [y/N/a=all reads this task] "
                       if name == "read_file" else "Allow this tool call? [y/N] ")
             choice = input(prompt).strip().lower()
             if name == "read_file" and choice in ("a", "all"):
@@ -253,8 +270,7 @@ def main():
             stream_draft, draft_saved_at = {}, 0.0
             return
         if kind == 'context_warning':
-            display(f"上下文字符预算已用 {payload['chars'] / payload['limit']:.0%}；"
-                    '可用 /compact 缩短上下文（字符预算不等于模型 token 窗口）。', 'Context')
+            display(tr('上下文字符预算已用 {v0:.0%}；可用 /compact 缩短上下文（字符预算不等于模型 token 窗口）。', v0=payload['chars'] / payload['limit']), 'Context')
             return
         if kind == 'step_start':
             if debug:
@@ -267,9 +283,8 @@ def main():
                 display({"segment_extension": payload}, "Progress")
             return
         if kind == 'task_compacted':
-            display(f"已压缩上下文 {payload['before_chars']:,} → {payload['after_chars']:,} 字符；"
-                    f"完整历史：{payload['archive']}" +
-                    ('' if payload['persistent'] else '（仅内存；退出后丢失）'), 'Context')
+            display(tr('已压缩上下文 {v0:,} → {v1:,} 字符；完整历史：{v2}', v0=payload['before_chars'], v1=payload['after_chars'], v2=payload['archive']) +
+                    ('' if payload['persistent'] else tr('（仅内存；退出后丢失）')), 'Context')
             return
         if kind in ("subagent_start", "subagent_end"):
             detail = (f"model={payload['model']} · steps≤{payload['max_steps']}"
@@ -329,8 +344,7 @@ def main():
 
     def retry_output(info, label="API"):
         cause = f"HTTP {info['status']}" if info.get("status") else info["cause"]
-        display(f"{label} retry {info['attempt']}/{info['max_attempts']} · "
-                f"{cause} · wait {info['wait_seconds']:g}s", "Retry")
+        display(tr('{v0} retry {v1}/{v2} · {v3} · wait {v4:g}s', v0=label, v1=info['attempt'], v2=info['max_attempts'], v3=cause, v4=info['wait_seconds']), "Retry")
 
     def build_agent(next_config, text, base_system=None, client=None):
         kwargs = {"approve": approve, "event": event}
@@ -357,7 +371,7 @@ def main():
     except (OSError, sqlite3.Error) as exc:
         if agent is not None:
             agent.client.close()
-        parser.error(f'Session store unavailable: {exc}')
+        parser.error(tr('Session store unavailable: {v0}', v0=exc))
     session_id, revision = new_id(), 0
 
     if _readline:
@@ -464,7 +478,7 @@ def main():
     def submit_input(value, automatic=None):
         nonlocal stream_wrote, read_grant
         if history_mode():
-            display('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。', 'History')
+            display(tr('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。'), 'History')
             return False
         read_grant = False
         try:
@@ -481,12 +495,12 @@ def main():
             if stream_wrote:
                 formatter.finish()
                 stream_wrote = False
-            display("Interrupted.")
+            display(tr('Interrupted.'))
         except Exception as exc:
             if stream_wrote:
                 formatter.finish()
                 stream_wrote = False
-            display(f"Error: {exc}")
+            display(tr('Error: {v0}', v0=exc))
         return False
 
     def current_title():
@@ -503,6 +517,7 @@ def main():
         display(f"{session_id} · {title}", "Session")
 
     def switch_api(name, persist=False):
+        nonlocal language
         nonlocal config, agent, session_id, revision, saved_fingerprint
         nonlocal active_branch, loaded_row, source_fingerprint, branch_state
         candidate = Config.load(config_path, name)
@@ -516,6 +531,7 @@ def main():
         replacement = build_agent(candidate, instructions)
         getattr(agent, 'close', agent.client.close)()
         config, agent = candidate, replacement
+        language = config.ui_language
         session_id, revision = new_id(), 0
         active_branch, loaded_row, source_fingerprint = True, None, None
         branch_state, saved_fingerprint = {'kind': 'active'}, None
@@ -525,8 +541,9 @@ def main():
     def show_session_listing(limit=50, query=None, empty_text=None):
         """Query, render and cache one exact metadata listing without loading rows."""
         nonlocal last_session_ids
+        empty_text = tr(empty_text or '没有已保存会话。')
         if not store:
-            display("Persistence disabled by --no-session.")
+            display(tr('Persistence disabled by --no-session.'))
             last_session_ids = ()
             return ()
         rows = store.listing(limit, query=query) if query is not None else store.listing(limit)
@@ -537,25 +554,25 @@ def main():
                 display(empty_text)
         else:
             if rows:
-                display(f"{len(rows)} saved sessions" +
-                        (f" · title contains {query}" if query else ''), 'Sessions')
+                display(tr('{v0} saved sessions', v0=len(rows)) +
+                        (tr(' · title contains {v0}', v0=query) if query else ''), 'Sessions')
             else:
                 display(empty_text, 'Sessions')
-            formatter.sessions(rows, session_id, Path.home(), redact)
+            formatter.sessions(rows, session_id, Path.home(), redact, language=language)
         return last_session_ids
 
     def resolve_session_target(value):
         value = value.strip()
         if not value:
-            raise ValueError("Use /resume ID|N or /session load ID|N")
+            raise ValueError(tr('Use /resume ID|N or /session load ID|N'))
         if len(value) == 12 and all(char in "0123456789abcdef" for char in value):
             return value
         if value.isascii() and value.isdigit():
             if not last_session_ids:
-                raise ValueError("先用 /sessions 或 /resume 查看会话，再按序号选择。")
+                raise ValueError(tr('先用 /sessions 或 /resume 查看会话，再按序号选择。'))
             index = int(value)
             if not 1 <= index <= len(last_session_ids):
-                raise ValueError("会话序号超出最后一次显示的列表范围。")
+                raise ValueError(tr('会话序号超出最后一次显示的列表范围。'))
             return last_session_ids[index - 1]
         store.check_id(value)
         return value
@@ -569,19 +586,58 @@ def main():
 
     def resume_picker():
         if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            display("输入 /resume 序号或 ID 恢复；序号只对应上面显示的列表。")
+            display(tr('输入 /resume 序号或 ID 恢复；序号只对应上面显示的列表。'))
             return
         try:
-            value = input("选择序号或ID（回车取消）").strip()
+            value = input(tr('选择序号或ID（回车取消）')).strip()
         except (EOFError, KeyboardInterrupt):
-            display("已取消会话选择。")
+            display(tr('已取消会话选择。'))
             return
         if not value:
-            display("已取消会话选择。")
+            display(tr('已取消会话选择。'))
             return
         resume_session(value)
 
+    def delete_session(value):
+        parts = value.split()
+        if not parts:
+            rows = show_session_listing(50, empty_text="没有已保存会话。")
+            if not rows:
+                return
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                display(tr('用 /session delete 序号或ID 删除；非交互执行需显式添加 --yes。'))
+                return
+            try:
+                selection = input(tr('删除序号或ID（回车取消）')).strip()
+            except (EOFError, KeyboardInterrupt):
+                display(tr('已取消删除。'))
+                return
+            if not selection:
+                display(tr('已取消删除。'))
+                return
+            parts = [selection]
+        if len(parts) > 2 or parts[0] == '--yes' or (len(parts) == 2 and parts[1] != '--yes'):
+            raise ValueError(tr('Use /session delete ID|N [--yes]'))
+        target = resolve_session_target(parts[0])
+        if target == session_id:
+            raise ValueError(tr('Switch to another session before deleting the active one'))
+        metadata = store.deletion_target(target)
+        # A title is display data, not a prompt or a control sequence.
+        display({"delete_session": target, "title": metadata[0]}, "Session")
+        confirmed = len(parts) == 2
+        if not confirmed and sys.stdin.isatty():
+            try:
+                confirmed = input(tr('Delete session {v0}? [y/N] ', v0=target)).strip().lower() in ('y', 'yes')
+            except (EOFError, KeyboardInterrupt):
+                confirmed = False
+        if confirmed:
+            store.delete(target, expected=metadata)
+            display(tr('Session deleted.'))
+        else:
+            display(tr('Deletion cancelled; use --yes for explicit noninteractive deletion.'))
+
     def load_session(identifier, save_existing=True, active=False):
+        nonlocal language
         nonlocal agent, config, directory, config_path, session_file, disabled
         nonlocal instructions, instruction_path, session_id, revision
         nonlocal registry, profile_store, saved_fingerprint, loaded_row
@@ -603,6 +659,7 @@ def main():
         if agent is not None:
             getattr(agent, 'close', agent.client.close)()
         config, agent = next_config, replacement
+        language = config.ui_language
         directory, config_path = target_directory, scope['config_path']
         session_file, disabled = scope['session_file'], scope['disabled']
         instructions, instruction_path = scope['instructions'], scope['instruction_path']
@@ -620,38 +677,37 @@ def main():
         registry = SkillRegistry()
         profile_store = ProfileStore(config_path)
         if history_mode():
-            display('历史查看模式：' + agent.client.reason + '可用 /history、/recall、/export 查看；'
-                    '用 /api NAME 新建会话，原历史保持保存。', 'History')
+            display(tr('历史查看模式：') + agent.client.reason + tr('可用 /history、/recall、/export 查看；用 /api NAME 新建会话，原历史保持保存。'), 'History')
         draft = store.draft(identifier)
         incomplete = agent.incomplete_draft
         if payload.get('checkpoint') or draft or incomplete:
-            display('恢复了未完成任务的检查点；工具状态不明时先核实实际结果。', 'Recovery')
+            display(tr('恢复了未完成任务的检查点；工具状态不明时先核实实际结果。'), 'Recovery')
         if draft:
-            display('上次流式草稿（未完成，未加入模型上下文；/export 可完整导出）：\n' +
+            display(tr('上次流式草稿（未完成，未加入模型上下文；/export 可完整导出）：\n') +
                     (draft.get('content') or draft.get('reasoning_content') or '')[:4000], 'Draft')
         if incomplete:
             text = incomplete.get('content') or incomplete.get('reasoning_content') or ''
-            display('恢复了未完成输出草稿；未完成工具调用只保留在草稿中，未加入模型上下文：\n' +
+            display(tr('恢复了未完成输出草稿；未完成工具调用只保留在草稿中，未加入模型上下文：\n') +
                     text[:4000], 'Draft')
 
     def compact_current(keep):
         from .context import compact_messages
         nonlocal session_id, revision
         if not 1 <= keep <= 100:
-            raise ValueError('Use /compact [1–100 recent user turns]')
+            raise ValueError(tr('Use /compact [1–100 recent user turns]'))
         original = session_id
         title = current_title()
         payload = snapshot(agent, current_scope())
         messages, omitted = compact_messages(payload['messages'], keep, original)
         if not omitted:
-            display('消息轮次未超过保留数量，无需精简。', 'Context')
+            display(tr('消息轮次未超过保留数量，无需精简。'), 'Context')
             return
         payload['messages'] = messages
         identifier = new_id()
         store.save(identifier, 0, payload)
         store.rename(identifier, title[:100] + ' · compact')
         load_session(identifier, save_existing=False, active=True)
-        display(f'完整历史保留于 {original}；当前会话 {identifier} 已省略 {omitted} 条早期消息。', 'Context')
+        display(tr('完整历史保留于 {v0}；当前会话 {v1} 已省略 {v2} 条早期消息。', v0=original, v1=identifier, v2=omitted), 'Context')
 
     try:
         if options.session:
@@ -660,18 +716,17 @@ def main():
             if not submit_input(options.prompt):
                 raise SystemExit(1)
             return
-        display("Termux Agent — /help for commands")
+        display(tr('Termux Agent — /help for commands'))
         display({"api": config.api_profile, "directory": str(directory), "agent_file": instruction_path, "session": session_id if store else "in-memory"})
         display({"auto_continue": config.auto_continue, "max_steps": config.max_steps})
         if formatter.enabled:
-            display("Tab 补全命令和 ~/本地路径；文件路径回车提交文本。")
+            display(tr('Tab 补全命令和 ~/本地路径；文件路径回车提交文本。'))
         while True:
             try:
                 if formatter.enabled and sys.stdin.isatty():
                     session_label = session_id + (" (memory)" if store is None else "")
-                    display(f"Session={session_label} | Model={config.model} | Cwd={directory}\n"
-                            f"Title={current_title()}" + (' | Mode=历史查看' if history_mode() else '') +
-                            '\n' + format_context_status(agent.context_status()), "Status")
+                    display(tr('Session={v0} | Model={v1} | Cwd={v2}\nTitle={v3}', v0=session_label, v1=config.model, v2=directory, v3=current_title()) + (tr(' | Mode=历史查看') if history_mode() else '') +
+                            '\n' + format_context_status(agent.context_status(), language=language), "Status")
                 prompt = read_prompt(formatter.prompt(), formatter.continuation()).strip()
             except (EOFError, KeyboardInterrupt):
                 print()
@@ -681,12 +736,12 @@ def main():
             if history_mode() and prompt.split(maxsplit=1)[0] not in (
                     '/help', '/sessions', '/session', '/resume', '/history', '/stats', '/status', '/config', '/debug',
                     '/debug-context', '/silent', '/api', '/title', '/recall', '/export', '/copy', '/paste', '/exit'):
-                display('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。', 'History')
+                display(tr('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。'), 'History')
                 continue
             try:
                 local_path = path_value(prompt, cli_commands)
             except ValueError as exc:
-                display(f"Error: {exc}")
+                display(tr('Error: {v0}', v0=exc))
                 continue
             if local_path is not None:
                 submit_input(prompt)
@@ -695,11 +750,11 @@ def main():
                 try:
                     save_current()
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f"Save failed: {exc}")
+                    display(tr('Save failed: {v0}', v0=exc))
                     continue
                 break
             if prompt == "/help":
-                display(HELP)
+                display(help_text(HELP, language))
             elif prompt == "/clear":
                 try:
                     save_current()
@@ -710,9 +765,9 @@ def main():
                     active_branch, loaded_row, source_fingerprint = True, None, None
                     branch_state, saved_fingerprint = {'kind': 'active'}, None
                     agent.archive_id = None
-                    display("New session; previous conversation remains saved.")
+                    display(tr('New session; previous conversation remains saved.'))
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/stats":
                 display(agent.stats())
             elif prompt == '/status':
@@ -723,11 +778,11 @@ def main():
                     answer = agent.continue_task(int(value) if value else None)
                     show_answer(answer); save_current()
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f'Error: {exc}')
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == '/compact' or prompt.startswith('/compact '):
                 try:
                     if not store:
-                        raise ValueError('/compact 需要会话持久化，请去掉 --no-session')
+                        raise ValueError(tr('/compact 需要会话持久化，请去掉 --no-session'))
                     value = prompt[8:].strip()
                     if value == 'task' or value.startswith('task '):
                         from .context import compact_task_messages
@@ -736,59 +791,58 @@ def main():
                         payload = snapshot(agent, current_scope())
                         messages, details = compact_task_messages(payload['messages'], keep, original)
                         if not details['omitted_groups'] and not details['reduced_calls']:
-                            display('当前任务没有可压缩的完整工具组；用 /compact 精简更早的历史，'
-                                    '或 /compact 1 仅保留最近一轮。', 'Context')
+                            display(tr('当前任务没有可压缩的完整工具组；用 /compact 精简更早的历史，或 /compact 1 仅保留最近一轮。'), 'Context')
                         else:
                             payload['messages'] = messages
                             identifier = create_active_branch(
                                 payload, title[:95] + ' · compact task', archive_id=original,
                                 draft=store.draft(original))
                             load_session(identifier, save_existing=False, active=True)
-                            display(f'完整任务历史保留于 {original}；当前会话 {identifier}：{details}', 'Context')
+                            display(tr('完整任务历史保留于 {v0}；当前会话 {v1}：{v2}', v0=original, v1=identifier, v2=details), 'Context')
                     else:
                         if value:
                             compact_current(int(value))
                         elif not agent._compact_for_context(force=True):
-                            display('没有可安全精简的历史；可用 /compact 1 仅保留最近一轮。', 'Context')
+                            display(tr('没有可安全精简的历史；可用 /compact 1 仅保留最近一轮。'), 'Context')
                 except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
-                    display(f'Error: {exc}')
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == '/recall' or prompt.startswith('/recall '):
                 try:
                     if not store:
-                        raise ValueError('/recall 需要会话持久化')
+                        raise ValueError(tr('/recall 需要会话持久化'))
                     save_current()
                     rows = store.recall(prompt[7:].strip(), silent_writes=config.silent_writes)
-                    display(rows if rows else '未找到匹配会话。', 'Recall')
+                    display(rows if rows else tr('未找到匹配会话。'), 'Recall')
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f'Error: {exc}')
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == '/export' or prompt.startswith('/export '):
                 try:
                     if not store:
-                        raise ValueError('/export 需要会话持久化')
+                        raise ValueError(tr('/export 需要会话持久化'))
                     args = shlex.split(prompt)[1:]
                     target = session_id
                     if args and args[0] not in ('markdown', 'json'):
                         target = args.pop(0)
                         store.check_id(target)
                     if len(args) > 2:
-                        raise ValueError('Use /export [ID] [markdown|json] [PATH]')
+                        raise ValueError(tr('Use /export [ID] [markdown|json] [PATH]'))
                     if target == session_id:
                         save_current(force=True)
                     path = store.export(target, args[0] if args else 'markdown', args[1] if len(args) > 1 else None)
-                    display(f'已导出：{path}（本地明文，权限 0600）', 'Export')
+                    display(tr('已导出：{v0}（本地明文，权限 0600）', v0=path), 'Export')
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f'Error: {exc}')
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/config":
                 display({**config.public_dict(), "directory": str(directory), "agent_file": instruction_path})
             elif prompt == "/debug":
                 debug = not debug
-                display(f"Debug {'on' if debug else 'off'}")
+                display(tr('Debug {v0}', v0='on' if debug else 'off'))
             elif prompt == "/debug-context":
                 display(agent.debug_context())
             elif prompt == "/silent" or prompt.startswith("/silent "):
                 value = prompt[7:].strip()
                 if value not in ("", "on", "off"):
-                    display("Use /silent on or /silent off")
+                    display(tr('Use /silent on or /silent off'))
                 else:
                     if value:
                         config.silent_writes = value == "on"
@@ -801,20 +855,20 @@ def main():
                     elif value.startswith("steps "):
                         count = int(value[6:].strip())
                         if not 1 <= count <= 256:
-                            raise ValueError("Automatic request limit must be 1–256")
+                            raise ValueError(tr('Automatic request limit must be 1–256'))
                         config.max_steps = count
                     elif value:
-                        raise ValueError("Use /auto on|off|steps N")
+                        raise ValueError(tr('Use /auto on|off|steps N'))
                     display({"auto_continue": config.auto_continue, "max_steps": config.max_steps,
                              "max_continuations": config.max_continuations})
                 except ValueError as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/run" or prompt.startswith("/run "):
                 task = prompt[4:].strip()
                 if task:
                     submit_input(task, automatic=True)
                 else:
-                    display("Use /run TASK or /run ~/task-instructions.txt")
+                    display(tr('Use /run TASK or /run ~/task-instructions.txt'))
             elif prompt == "/api" or prompt.startswith("/api "):
                 value = prompt[4:].strip()
                 try:
@@ -827,7 +881,7 @@ def main():
                         flags = [part for part in parts if part.startswith("--")]
                         positional = [part for part in parts if not part.startswith("--")]
                         if not 3 <= len(positional) <= 5:
-                            raise ValueError("Use /api add NAME URL MODEL [KEY_ENV] [local|cloud]")
+                            raise ValueError(tr('Use /api add NAME URL MODEL [KEY_ENV] [local|cloud]'))
                         name, base_url, model = positional[:3]
                         extra = positional[3:]
                         key_env = ""
@@ -850,7 +904,7 @@ def main():
                             elif flag.startswith("--user-agent="):
                                 user_agent = flag.partition("=")[2]
                             else:
-                                raise ValueError(f"Unknown API option: {flag}")
+                                raise ValueError(tr('Unknown API option: {v0}', v0=flag))
                         path = profile_store.add(name, base_url, model, key_env, kind,
                                                  stream, timeout, user_agent)
                         display({"added": name, "path": str(path), "switch": f"/api {name}"})
@@ -862,11 +916,11 @@ def main():
                         elif matches:
                             display(matches[0])
                         else:
-                            raise ValueError(f"Unknown API profile: {name}")
+                            raise ValueError(tr('Unknown API profile: {v0}', v0=name))
                     elif value.startswith("remove "):
                         name = value[7:].strip()
                         if name == config.api_profile:
-                            raise ValueError("Switch to another API before removing the active profile")
+                            raise ValueError(tr('Switch to another API before removing the active profile'))
                         backup = profile_store.remove(name)
                         display({"removed": name, "backup": str(backup)})
                     else:
@@ -875,20 +929,20 @@ def main():
                         name = value[8:].strip() if persist else value.removeprefix("switch ").strip()
                         if name in ("next", "prev"):
                             if not names:
-                                raise ValueError("No named API profiles configured")
+                                raise ValueError(tr('No named API profiles configured'))
                             index = names.index(config.api_profile) if config.api_profile in names else (
                                 -1 if name == "next" else 0)
                             name = names[(index + (1 if name == "next" else -1)) % len(names)]
                         elif name.isdigit():
                             number = int(name)
                             if not 1 <= number <= len(names):
-                                raise ValueError("API number is not in /api list")
+                                raise ValueError(tr('API number is not in /api list'))
                             name = names[number - 1]
                         switched = switch_api(name, persist)
                         display({"api": name, "switched": switched,
                                  "default": profile_store.get_default()})
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/agent" or prompt.startswith("/agent "):
                 value = prompt[6:].strip()
                 if not value:
@@ -912,7 +966,7 @@ def main():
                     session_file, disabled = next_file, next_disabled
                     display({"agent_file": source, "chars": len(text), "new_conversation": True})
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/skill" or prompt.startswith("/skill "):
                 try:
                     parts = prompt.split(maxsplit=2)
@@ -937,10 +991,10 @@ def main():
                             for active_name, content in previous.items():
                                 agent.load_skill(active_name, content)
                             raise
-                        display(f"Loaded {skill.name} into this session.")
+                        display(tr('Loaded {v0} into this session.', v0=skill.name))
                     elif action in ("unload", "clear"):
                         if action == "unload" and not name:
-                            raise ValueError("Use /skill unload NAME")
+                            raise ValueError(tr('Use /skill unload NAME'))
                         previous = agent.get_active_skills()
                         if action == "clear":
                             agent.clear_skills()
@@ -953,11 +1007,11 @@ def main():
                             for active_name, content in previous.items():
                                 agent.load_skill(active_name, content)
                             raise
-                        display("Active skills cleared." if action == "clear" else f"Unloaded {name}.")
+                        display(tr('Active skills cleared.') if action == "clear" else tr('Unloaded {v0}.', v0=name))
                     else:
-                        display("Use /skill list|info NAME|load NAME|unload NAME|clear")
+                        display(tr('Use /skill list|info NAME|load NAME|unload NAME|clear'))
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt.startswith("/copy"):
                 try:
                     text = prompt[5:].lstrip()
@@ -970,22 +1024,22 @@ def main():
                     result = subprocess.run([command], input=text, text=True, capture_output=True, timeout=10)
                     if result.returncode:
                         raise RuntimeError(result.stderr.strip() or "clipboard write failed")
-                    display("Copied to Android clipboard." if text else "Nothing to copy.")
+                    display(tr('Copied to Android clipboard.') if text else tr('Nothing to copy.'))
                 except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/paste":
                 command = shutil.which("termux-clipboard-get")
                 if not command:
-                    display("termux-clipboard-get is unavailable; install Termux:API")
+                    display(tr('termux-clipboard-get is unavailable; install Termux:API'))
                     continue
                 try:
                     result = subprocess.run([command], text=True, capture_output=True, timeout=10, check=True)
                     if len(result.stdout) > config.max_output_chars:
-                        display(result.stdout[:config.max_output_chars] + "\n[TRUNCATED]")
+                        display(result.stdout[:config.max_output_chars] + tr('\n[TRUNCATED]'))
                     else:
                         display(result.stdout)
                 except (OSError, subprocess.SubprocessError) as exc:
-                    display(f"Clipboard read failed: {exc}")
+                    display(tr('Clipboard read failed: {v0}', v0=exc))
             elif prompt == "/sub" or prompt.startswith("/sub "):
                 task = prompt[4:].strip()
                 if not task:
@@ -1000,7 +1054,7 @@ def main():
                     display(result.get("summary", result.get("error", "")), "Sub")
                     save_current()
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f"Sub-agent failed: {exc}", "Sub")
+                    display(tr('Sub-agent failed: {v0}', v0=exc), "Sub")
             elif prompt.startswith("!"):
                 command = prompt[1:].strip()
                 if command:
@@ -1012,12 +1066,12 @@ def main():
                         try:
                             save_current()
                         except (ValueError, OSError, sqlite3.Error) as exc:
-                            display(f"Session save failed: {exc}")
+                            display(tr('Session save failed: {v0}', v0=exc))
                     else:
-                        display("Shell command denied or approval unavailable.")
+                        display(tr('Shell command denied or approval unavailable.'))
             elif prompt == "/title" or prompt.startswith("/title "):
                 if not store:
-                    display("Persistence disabled by --no-session.")
+                    display(tr('Persistence disabled by --no-session.'))
                     continue
                 try:
                     value = prompt[6:].strip()
@@ -1026,30 +1080,30 @@ def main():
                     else:
                         display(f"{session_id} · {current_title()}", "Session")
                 except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/sessions" or prompt.startswith("/sessions "):
                 try:
                     value = prompt[9:].strip()
                     query = None
                     if value == "find" or value.startswith("find "):
                         if not value[4:].strip():
-                            raise ValueError("Use /sessions find TEXT")
+                            raise ValueError(tr('Use /sessions find TEXT'))
                         query = validate_title(value[4:].strip())
                         limit = 50
                     else:
                         limit = int(value or 50)
                     if not 1 <= limit <= 500:
-                        raise ValueError("Session count must be 1–500")
+                        raise ValueError(tr('Session count must be 1–500'))
                     if not store:
-                        display("Persistence disabled by --no-session.")
+                        display(tr('Persistence disabled by --no-session.'))
                         continue
                     show_session_listing(limit, query)
                 except (ValueError, sqlite3.Error) as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/resume" or prompt.startswith("/resume "):
                 try:
                     if not store:
-                        display("Persistence disabled by --no-session.")
+                        display(tr('Persistence disabled by --no-session.'))
                         continue
                     value = prompt[7:].strip()
                     if value:
@@ -1059,26 +1113,25 @@ def main():
                         if rows:
                             resume_picker()
                 except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/history" or prompt.startswith("/history "):
                 try:
                     parts = prompt[8:].split()
                     count, skip = int(parts[0]) if parts else 20, int(parts[1]) if len(parts) > 1 else 0
                     if not 1 <= count <= 100 or skip < 0 or len(parts) > 2:
-                        raise ValueError("Use /history [1–100] [non-negative skip]")
+                        raise ValueError(tr('Use /history [1–100] [non-negative skip]'))
                     history = agent.messages[1:]
                     end = max(0, len(history) - skip)
                     start = max(0, end-count)
-                    display(f"History {start + 1 if start < end else 0}–{end} / {len(history)}"
-                            " · --:-- = time not recorded")
+                    display(tr('History {v0}–{v1} / {v2} · --:-- = time not recorded', v0=start + 1 if start < end else 0, v1=end, v2=len(history)))
                     for message in history[start:end]:
                         role, rendered = history_entry(message, config.silent_writes)
                         display(rendered, role, stamp="--:--")
                 except ValueError as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt == "/session" or prompt.startswith("/session "):
                 if not store:
-                    display("Persistence disabled by --no-session.")
+                    display(tr('Persistence disabled by --no-session.'))
                     continue
                 command, _, value = prompt[8:].strip().partition(" ")
                 try:
@@ -1086,7 +1139,7 @@ def main():
                         display({"id": session_id, "title": current_title(), "saved": bool(revision)})
                     elif command in ("new", "fork"):
                         if history_mode():
-                            raise ValueError('历史查看模式保留原快照；请用 /api NAME 新建可用会话。')
+                            raise ValueError(tr('历史查看模式保留原快照；请用 /api NAME 新建可用会话。'))
                         if command == "new":
                             save_current()
                             replacement = build_agent(config, instructions)
@@ -1111,36 +1164,25 @@ def main():
                             display(f"{target} · {title}", 'Session')
                     elif command == "save":
                         save_current(force=True)
-                        display('历史已保存；查看模式不重写原快照。' if history_mode() else {"id": session_id, "saved": True})
+                        display(tr('历史已保存；查看模式不重写原快照。') if history_mode() else {"id": session_id, "saved": True})
                     elif command == "delete":
-                        target = value.removesuffix(" --yes")
-                        if target == session_id:
-                            raise ValueError("Switch to another session before deleting the active one")
-                        store.load(target)
-                        confirmed = value.endswith(" --yes")
-                        if not confirmed and sys.stdin.isatty():
-                            confirmed = input(f"Delete session {target}? [y/N] ").strip().lower() in ('y', 'yes')
-                        if confirmed:
-                            store.delete(target)
-                            display("Session deleted.")
-                        else:
-                            display("Deletion cancelled; use --yes for explicit noninteractive deletion.")
+                        delete_session(value)
                     else:
-                        display("Use /session new|fork|load ID|N|rename NAME|rename-id ID NAME|delete ID|save")
+                        display(tr('Use /session new|fork|load ID|N|rename NAME|rename-id ID NAME|delete ID|save'))
                 except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
-                    display(f"Error: {exc}")
+                    display(tr('Error: {v0}', v0=exc))
             elif prompt.startswith("/"):
-                display("Unknown command; use /help.")
+                display(tr('Unknown command; use /help.'))
             else:
                 submit_input(prompt)
     except Exception as exc:
-        display(f"Error: {exc}")
+        display(tr('Error: {v0}', v0=exc))
         raise SystemExit(1) from None
     finally:
         try:
             save_current()
         except (ValueError, OSError, sqlite3.Error) as exc:
-            display(f"Session save failed: {exc}; this turn was not saved.")
+            display(tr('Session save failed: {v0}; this turn was not saved.', v0=exc))
         if agent is not None:
             getattr(agent, 'close', agent.client.close)()
         save_readline_history()

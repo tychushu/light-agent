@@ -129,14 +129,14 @@ class TitleTests(unittest.TestCase):
 
     def test_title_in_memory_mode_does_not_create_a_saved_session(self):
         output = self.run_cli(['/title 测试', '/title', '/exit'], ['--no-session'])
-        self.assertIn('Persistence disabled', output)
+        self.assertIn('已关闭会话持久化', output)
         self.assertEqual(self.store.listing(), [])
 
     def test_temporarily_unavailable_title_lookup_does_not_break_cli(self):
         with patch.object(SessionStore, 'title', side_effect=sqlite3.OperationalError('busy')):
             output = self.run_cli(['/title 已保存', '/title', '/sessions find', '/exit'])
         self.assertIn('[unavailable]', output)
-        self.assertIn('Use /sessions find TEXT', output)
+        self.assertIn('用法：/sessions find TEXT', output)
         self.assertEqual(self.store.listing()[0]['title'], '已保存')
 
     def test_title_and_search_commands_and_rename_id_are_completable(self):

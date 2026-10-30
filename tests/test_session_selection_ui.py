@@ -56,13 +56,14 @@ class SessionSelectionUI(unittest.TestCase):
             ['1', '10', '123456abcdef'])
         self.assertEqual(calls, ['choices', 'ids'])
 
-    def test_delete_and_rename_id_keep_id_only_completion(self):
+    def test_delete_completes_numbers_but_rename_id_keeps_id_only_completion(self):
         completer, calls = self.completer('.')
         self.assertCountEqual(
             completer.matches('/session delete ab', 16, 'ab'), ['abcdef123456'])
         self.assertCountEqual(
             completer.matches('/session rename-id 1', 19, '1'), ['123456abcdef'])
-        self.assertEqual(calls, ['ids', 'ids'])
+        self.assertEqual(calls, ['choices', 'ids', 'ids'])
+        self.assertIn('10', completer.matches('/session delete 1', 16, '1'))
 
     def test_selection_callbacks_are_not_used_for_subcommands_or_paths(self):
         with tempfile.TemporaryDirectory() as td:

@@ -85,7 +85,7 @@ class HistoryTests(unittest.TestCase):
                     cli.main()
         finally:
             os.chdir(original)
-        history = out.getvalue().split('History 3–3 / 4', 1)[1]
+        history = out.getvalue().split('历史 3–3 / 4', 1)[1]
         self.assertIn('\ntwo\n', history)
         self.assertNotIn('"role"', history)
         self.assertNotIn('reply', history)

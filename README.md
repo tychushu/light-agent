@@ -36,6 +36,7 @@ Create `~/.config/termux-agent/config.toml`. Global settings go **before** any
 
 ```toml
 default_api = "local"
+ui_language = "zh" # "zh" for Simplified Chinese, "en" for English
 approval_policy = "on-risk"
 max_steps = 16
 max_output_chars = 20000
@@ -127,6 +128,12 @@ length. `output_reserve_tokens` must cover `max_output_tokens` when set.
 
 ## Sessions and commands
 
+Set the top-level `ui_language = "zh"` or `ui_language = "en"` in config.toml,
+then restart `ta`. This selects help, notices, confirmations, session-table headers,
+context states and controller messages. Commands, compact role labels, JSON field
+names, model replies, provider error details and saved conversation data retain
+their original text. The preference is global, not per API or saved session.
+
 Sessions are stored privately in SQLite under
 `~/.local/share/termux-agent/sessions.sqlite3`, with revision checks and durable
 tool checkpoints. Interrupted tools have unknown outcomes; they are not replayed
@@ -142,7 +149,7 @@ session storage.
 | `/session load ID` or `/session load N` | Restore using the same displayed numbers or a full ID |
 | `/title NAME`, `/session rename-id ID NAME` | Rename current or saved session |
 | `/session new`, `/clear`, `/session fork [NAME]` | New conversation or independent copy |
-| `/session save`, `/session delete ID` | Save or explicitly delete a session |
+| `/session save`, `/session delete [ID/N]` | Save or select a session to delete (ID or displayed number) |
 | `/history [N] [skip]`, `/recall TEXT` | Formatted history or saved-content search |
 | `/export [ID] [FORMAT] [PATH]` (markdown or json) | Export without overwriting an existing file |
 | `/stats`, `/status` | Usage, budgets, stop reason and continuation hint |
@@ -151,6 +158,15 @@ session storage.
 Numbers are tied to the last displayed list, including filtered lists; autosave
 or a reordered database does not change their meaning. Tab completes commands,
 profile names, displayed session numbers/IDs, scoped instruction files and Skills.
+
+`/session delete` opens a numbered picker in a TTY; `/session delete 3` uses the
+last displayed list directly. Both show the target ID/title and require `y`/`yes`.
+Blank input, Ctrl-C or Ctrl-D cancels selection/confirmation. The active session
+cannot be deleted; a concurrently changed target requires a fresh confirmation.
+Deletion leaves the displayed numbering fixed until the next list. Scripts must
+explicitly use `/session delete ID --yes` (or a displayed number); without it,
+noninteractive input is never consumed as a confirmation. This deletes a session
+and its draft, not project files.
 
 ## Tools, task execution and terminal input
 

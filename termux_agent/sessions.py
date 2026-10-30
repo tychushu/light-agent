@@ -9,6 +9,7 @@ import time
 import uuid
 
 from .config import Config
+from .i18n import text as ui_text
 
 COUNTERS = ('_total_calls', '_tool_calls_total', '_usage_history',
             '_request_history_chars', '_conversation_count', '_direct_shell_count',
@@ -229,6 +230,14 @@ def restore(payload, build_agent, *, history_fallback=False):
             raise
         history_reason = '原 API 配置不可用，或地址、模型、协议已变更。'
         config = Config(**{k: v for k, v in saved.items() if k in Config.__dataclass_fields__ and k != 'api_key'})
+        # UI preferences belong to the current machine, not an old API snapshot.
+        try:
+            config.ui_language = Config.read_ui_language(scope.get('config_path'))
+        except (ValueError, OSError):
+            try:
+                config.ui_language = Config.read_ui_language()
+            except (ValueError, OSError):
+                config.ui_language = saved.get('ui_language', 'zh')
     if not Path(scope['directory']).is_dir():
         if not history_fallback:
             raise ValueError('Session directory no longer exists')
@@ -261,6 +270,9 @@ def restore(payload, build_agent, *, history_fallback=False):
     kwargs = {'base_system': base}
     if history_reason:
         config.api_key = ''
+        for source in ('原 API 配置不可用，或地址、模型、协议已变更。',
+                       '原工作目录已不存在，保留当前目录查看历史。'):
+            history_reason = history_reason.replace(source, ui_text(source, config.ui_language))
         kwargs['client'] = HistoryClient(history_reason)
     agent = build_agent(config, scope['instructions'], **kwargs)
     for name, content in active_skills.items():
@@ -485,11 +497,27 @@ class SessionStore:
         row = self.db.execute('SELECT title FROM sessions WHERE id=?', (identifier,)).fetchone()
         return row[0] if row is not None else None
 
-    def delete(self, identifier):
+    def deletion_target(self, identifier):
+        """Metadata-only confirmation; do not decode a private conversation."""
+        self.check_id(identifier)
+        row = self.db.execute('SELECT title,updated,revision FROM sessions WHERE id=?', (identifier,)).fetchone()
+        if row is None:
+            raise ValueError('Session not found')
+        return tuple(row)
+
+    def delete(self, identifier, *, expected=None):
         self.check_id(identifier)
         with self.db:
-            if self.db.execute('DELETE FROM sessions WHERE id=?', (identifier,)).rowcount != 1:
-                raise ValueError('Session not found')
+            if expected is None:
+                result = self.db.execute('DELETE FROM sessions WHERE id=?', (identifier,))
+            else:
+                title, updated, revision = expected
+                result = self.db.execute('DELETE FROM sessions WHERE id=? AND title IS ? '
+                                         'AND updated=? AND revision=?',
+                                         (identifier, title, updated, revision))
+            if result.rowcount != 1:
+                raise ValueError('Session changed or deleted; list sessions and confirm again' if expected is not None
+                                 else 'Session not found')
             self.db.execute('DELETE FROM drafts WHERE id=?', (identifier,))
 
     def close(self):

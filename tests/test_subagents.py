@@ -216,6 +216,6 @@ class SubagentTests(unittest.TestCase):
             os.chdir(previous)
         self.assertIn('worker finding', out.getvalue())
         self.assertIn('sub-1 · complete', out.getvalue())
-        self.assertIn('History 1–4 / 4', out.getvalue())
+        self.assertIn('历史 1–4 / 4', out.getvalue())
         self.assertEqual(root_client.requests, [])
         self.assertTrue(child_client.closed)

@@ -81,6 +81,6 @@ class SkillTests(unittest.TestCase):
                 os.chdir(original)
             self.assertIn('test skill',rendered)
             self.assertIn('SKILL_SENTINEL',rendered)
-            self.assertIn('Loaded demo',rendered)
-            self.assertIn('Unloaded demo',rendered)
+            self.assertIn('已将 demo 加载到当前会话',rendered)
+            self.assertIn('已卸载 demo',rendered)
             self.assertNotIn('active skills',rendered.lower())

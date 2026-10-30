@@ -231,7 +231,7 @@ cli.main()
                                     (prompt, b'/exit\n')], setup=setup, columns=100)
         self.assertGreaterEqual(text.count('Title=稿件审阅'), 2, text)
         self.assertIn('Title=第二会话', text)
-        self.assertIn('1 saved sessions', text)
+        self.assertIn('1 个已保存会话', text)
         table_rows = [line for line in text.splitlines() if '*111111111111' in line]
         self.assertEqual(len(table_rows), 1, text)
         row = table_rows[0]

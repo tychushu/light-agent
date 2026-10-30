@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 import shutil
 import unicodedata
+from .i18n import text as ui_text
 
 
 COMMANDS = (
@@ -64,7 +65,7 @@ def _table_cell(text, width, middle=False, pad=True):
     return text + ' ' * max(0, width - _cell_width(text)) if pad else text
 
 
-def session_table(rows, width, current_id='', home='', redact=None):
+def session_table(rows, width, current_id='', home='', redact=None, language='zh'):
     """One numbered terminal row per session; keep IDs intact and fit other cells."""
     def clean(value):
         text = str(value)
@@ -91,7 +92,7 @@ def session_table(rows, width, current_id='', home='', redact=None):
     budget = max(28, int(width) - 1)  # Reserve the final column against auto-wrap.
     separator = '  ' if budget >= 99 else ' '
     ordinal_width = max(1, len(str(max(1, len(rows)))))
-    numbered_header = '序号' if budget >= 79 else '#'
+    numbered_header = '序号' if budget >= 79 and language == 'zh' else '#'
     if numbered_header == '序号':
         ordinal_width = max(ordinal_width, _cell_width(numbered_header))
     count_width = max([6 if budget >= 63 else 2, *(_cell_width(value) for value in count_values)])
@@ -123,6 +124,10 @@ def session_table(rows, width, current_id='', home='', redact=None):
                'API / 模型' if api_width >= 10 else ('API/模型' if api_width >= 8 else 'API'),
                '消息数' if count_width >= 6 else '数',
                '工作路径' if path_width >= 8 else ('路径' if path_width >= 4 else 'P'))
+    if language == 'en':
+        headers = (numbered_header, 'Updated' if time_width >= 12 else 'Time', 'ID',
+                   'Title' if title_width >= 5 else 'T', 'API/model' if api_width >= 9 else 'API',
+                   'Msgs' if count_width >= 4 else 'N', 'Cwd' if path_width >= 3 else 'P')
 
     def render(values):
         cells = []
@@ -233,11 +238,11 @@ class Columns:
         label = "You: " if self.width() < 52 else "You     │ "
         return self.clock().strftime("%H:%M") + " " + label
 
-    def sessions(self, rows, current_id='', home='', redact=None):
+    def sessions(self, rows, current_id='', home='', redact=None, language='zh'):
         self.finish()
         # Use full terminal width; repeated message timestamps/roles consume
         # space needed for session IDs, API names and working directories.
-        lines = session_table(rows, self.width(), current_id, home, redact)
+        lines = session_table(rows, self.width(), current_id, home, redact, language=language)
         self.out.write('\n'.join(lines) + '\n')
         self.out.flush()
 
@@ -319,7 +324,7 @@ class Completer:
             root = words[0] if words else ""
             selecting_session = (
                 (root == "/resume" and len(words) == 1) or
-                (root == "/session" and len(words) == 2 and words[1] == "load")
+                (root == "/session" and len(words) == 2 and words[1] in ("load", "delete"))
             )
             if selecting_session:
                 choices = self.session_choices() if self.session_choices else ()
@@ -334,7 +339,7 @@ class Completer:
                     options = (*options, *self.session_ids())
             elif root == "/api" and words[1] in ("show", "default", "remove", "switch"):
                 options = self.profiles()
-            elif root == "/session" and words[1] in ("delete", "rename-id") and len(words) == 2:
+            elif root == "/session" and words[1] == "rename-id" and len(words) == 2:
                 options = self.session_ids()
             elif root == '/export' and len(words) == 2:
                 options = ('markdown', 'json')
@@ -356,17 +361,17 @@ class Completer:
         return self._matches[state] if state < len(self._matches) else None
 
 
-def format_context_status(status):
+def format_context_status(status, language='zh'):
     """Explicit units: character guard is not the provider's token window."""
     chars, limit = status['chars'], status['limit']
-    parts = [f"Context={status['state']}", f"Chars={chars:,}/{limit:,} ({chars / limit:.0%})"]
+    parts = [f"Context={ui_text(status['state'], language)}", f"Chars={chars:,}/{limit:,} ({chars / limit:.0%})"]
     token = status['tokens']
     count, window = token.get('prompt_tokens'), token.get('context_window_tokens')
     if count is None:
-        parts.append('Tokens=未计数')
+        parts.append('Tokens=' + ui_text('未计数', language))
     else:
         mark = '=' if token.get('exact') else '≈'
         parts.append(f"Tokens{mark}{count:,}/" + (f"{window:,} ({count / window:.0%}; "
-                     f"预留{token['output_reserve_tokens']:,})" if window else '未知窗口'))
-    parts.append(f"Auto={status['threshold']:.0%}" if status['auto_compact'] else 'Auto=关闭')
+                     f"{ui_text('预留', language)} {token['output_reserve_tokens']:,})" if window else ui_text('未知窗口', language)))
+    parts.append(f"Auto={status['threshold']:.0%}" if status['auto_compact'] else 'Auto=' + ui_text('关闭', language))
     return ' | '.join(parts)

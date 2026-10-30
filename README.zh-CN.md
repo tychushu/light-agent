@@ -34,6 +34,7 @@ ta --prompt '检查当前目录'
 
 ```toml
 default_api = "local"
+ui_language = "zh" # 简体中文 zh；英文 en
 approval_policy = "on-risk"
 max_steps = 16
 max_output_chars = 20000
@@ -117,6 +118,10 @@ Context=正常 | Chars=120,000/500,000 (24%) | Tokens≈40,000/未知窗口 | Au
 
 ## 会话与历史管理
 
+在 config.toml 顶层设置 `ui_language = "zh"` 或 `ui_language = "en"`，重启 `ta` 后切换
+帮助、操作提示、确认框、会话表头、上下文状态和程序控制消息。命令、简短角色标签、JSON
+字段名、模型回复、上游错误详情和会话正文保持原文。这是全局界面设置，不随 API 或旧会话切换。
+
 会话保存在 `~/.local/share/termux-agent/sessions.sqlite3`，采用 SQLite、修订号校验及持久化
 工具检查点。中断工具的结果标记为未知，不自动重放。原 API 失效或配置变更时仍可进入只读
 历史模式，无需网络客户端。`--no-session` 仅使用内存，退出后压缩归档丢失；手动持久化压缩需启用会话存储。
@@ -129,7 +134,7 @@ Context=正常 | Chars=120,000/500,000 (24%) | Tokens≈40,000/未知窗口 | Au
 | `/session load ID`、`/session load N` | 直接恢复会话 |
 | `/title NAME`、`/session rename-id ID NAME` | 修改当前或指定会话标题 |
 | `/session new`、`/clear`、`/session fork [NAME]` | 新建空白会话或独立副本 |
-| `/session save`、`/session delete ID` | 保存或明确删除会话 |
+| `/session save`、`/session delete [ID/N]` | 保存，或按完整 ID / 上次列表序号删除 |
 | `/history [N] [skip]`、`/recall TEXT` | 格式化查看历史、翻页或检索 |
 | `/export [ID] [markdown/json] [PATH]` | 导出会话，不覆盖已有文件；格式参数二选一 |
 | `/stats`、`/status` | 查看用量、预算、停止原因和继续方式 |
@@ -137,6 +142,12 @@ Context=正常 | Chars=120,000/500,000 (24%) | Tokens≈40,000/未知窗口 | Au
 
 序号始终对应最后一次显示的列表，包括筛选结果；自动保存或排序变化不会改变映射。
 Tab 可补全命令、API、列表序号/会话 ID、局部指令文件及技能名称。
+
+`/session delete` 在交互终端列出会话并进入选择；`/session delete 3` 直接使用上次列表的
+序号。确认前显示目标 ID 和标题，输入 `y` / `yes` 才删除；空输入、Ctrl-C、Ctrl-D 取消
+选择或确认。当前会话不能删除，目标若被其他进程修改需重新确认。删除后沿用原列表序号，
+直到再次列出会话。脚本需显式使用 `/session delete ID --yes`，也可使用已显示的序号；
+不会把后续管道输入当作确认。删除范围仅为该会话及草稿，不涉及工作目录文件。
 
 ## 工具、连续任务与终端输入
 
