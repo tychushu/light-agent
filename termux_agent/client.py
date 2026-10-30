@@ -370,6 +370,11 @@ class Client:
                                                          'context shift', 'input truncated to fit context')):
                         return ContextLengthError('上下文超过模型窗口；请使用 /compact task 归档并缩短当前任务，'
                                                   '/compact N 保留最近轮次，或 /clear 新建会话。')
+                    if code == 'content-blocked' or 'content-blocked' in text:
+                        return ProviderError(
+                            f"{diagnostic}（提示：上游网关安全规则拦截；类似'阅读 guide.md'的'动词+带后缀文件名'结构"
+                            f"易被网关误判为外链引流。可改写为'阅读文件 guide.md'、'请阅读 guide.md'或'read guide.md'重试）"
+                        )
             except ValueError:
                 pass
         return ProviderError(diagnostic)

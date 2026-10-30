@@ -75,6 +75,20 @@ class ReliabilityTests(unittest.TestCase):
                     Client(Config(stream=False), http_client=http).chat([], [])
                 self.assertNotIsInstance(caught.exception, ContextLengthError)
 
+    def test_content_blocked_error_includes_guidance(self):
+        response = httpx.Response(400, json={
+            'error': {
+                'code': 'content-blocked',
+                'message': 'content-blocked (request id: test-req-id)',
+                'type': 'agent_router_api_error'
+            }
+        })
+        with httpx.Client(transport=httpx.MockTransport(lambda r: response)) as http:
+            with self.assertRaises(ClientError) as caught:
+                Client(Config(stream=False), http_client=http).chat([], [])
+            self.assertIn('content-blocked', str(caught.exception))
+            self.assertIn('阅读文件 guide.md', str(caught.exception))
+
     def test_empty_reasoning_answer_keeps_usage_and_never_retries_json_or_sse(self):
         usage = {'completion_tokens': 10, 'completion_tokens_details': {'reasoning_tokens': 10}}
         for stream in (False, True):
