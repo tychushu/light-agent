@@ -215,6 +215,7 @@ class HistoryClient:
 
 
 def restore(payload, build_agent, *, history_fallback=False):
+    payload = copy.deepcopy(payload)
     if payload.get('version') not in (1, 2, 3, 4):
         raise ValueError('Unsupported session version')
     validate_messages(payload['messages'])
@@ -286,6 +287,9 @@ def restore(payload, build_agent, *, history_fallback=False):
     agent.incomplete_draft = validate_draft(payload.get('incomplete_draft'))
     agent.in_memory_archives = validate_archives(payload.get('in_memory_archives'))
     agent._unsafe_write_fingerprints = agent._scan_unsafe_writes(agent.messages)
+    if agent.last_run.get('status') == 'running':
+        agent._mark_interrupted(ui_text('恢复了未完成的运行检查点；请核实未知工具结果后再继续。', config.ui_language))
+        agent.last_run['recovered_from_running'] = True
     return config, agent, scope
 
 

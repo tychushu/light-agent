@@ -61,6 +61,7 @@ class Config:
     token_metadata_base_url: str = ""
     reasoning_effort: str = ""
     ui_language: str = "zh"
+    tool_history_keep_groups: int = 2
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -75,7 +76,7 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "rtk_enabled", "rtk_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments", "auto_compact", "auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold", "context_recovery", "no_progress_detection", "no_progress_threshold", "context_window_tokens", "output_reserve_tokens", "max_output_tokens", "chat_include_usage", "chat_max_tokens_field", "token_count_mode", "token_cache_ttl", "token_metadata_base_url", "reasoning_effort"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "rtk_enabled", "rtk_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments", "auto_compact", "auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold", "tool_history_keep_groups", "context_recovery", "no_progress_detection", "no_progress_threshold", "context_window_tokens", "output_reserve_tokens", "max_output_tokens", "chat_include_usage", "chat_max_tokens_field", "token_count_mode", "token_cache_ttl", "token_metadata_base_url", "reasoning_effort"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         config.ui_language = raw.get('ui_language', 'zh')
@@ -96,6 +97,7 @@ class Config:
                             "user_agent", "stream", "max_context_chars", "wire_api", "max_steps",
                             "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments",
                             "auto_compact", "auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold",
+                            "tool_history_keep_groups",
                             "context_recovery", "no_progress_detection", "no_progress_threshold",
                             "context_window_tokens", "output_reserve_tokens", "max_output_tokens",
                             "chat_include_usage", "chat_max_tokens_field", "token_count_mode",
@@ -193,6 +195,7 @@ class Config:
         for key, low, high in (("max_task_calls", 1, 1024),
                                ("max_task_tokens", 0, 10_000_000),
                                ("auto_compact_keep_groups", 1, 20),
+                               ("tool_history_keep_groups", 0, 100),
                                ("auto_compact_keep_turns", 1, 100),
                                ("no_progress_threshold", 2, 20),
                                ("context_window_tokens", 0, 10_000_000),

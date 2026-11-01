@@ -47,6 +47,7 @@ auto_compact = true
 auto_compact_threshold = 0.75
 auto_compact_keep_turns = 2
 auto_compact_keep_groups = 2
+tool_history_keep_groups = 2 # 更早完成轮次的工具历史；0 关闭主动整理
 
 [apis.local]
 kind = "local"
@@ -71,6 +72,11 @@ token_count_mode = "estimate"
 `/chat/completions`。Responses 支持 JSON、SSE、工具调用、思考内容保留及无状态多轮历史回传。
 可自由添加多个本地、云端 API 与不同模型；名称没有固定限制。
 
+无状态 Responses 请求会保留 reasoning 项及其加密内容，与函数调用、结果一起回传。
+不能为了省 token 而一律删除 reasoning：[OpenAI 官方说明](https://developers.openai.com/api/docs/guides/reasoning#keeping-reasoning-items-in-context)
+建议保留当前工具链所需的推理项。加密字段的序列化字符数不等于实测输入 token 消耗；
+用于终端显示的思考文字不会作为第二份 saved Responses 历史重复添加。
+
 - `/api`：列出配置；`/api NAME`、`/api N`、`/api next`：切换并新建会话。
 - `/api default NAME`：设置以后启动时默认使用的 API。
 - `/api add NAME URL MODEL [KEY_ENV] [local|cloud]`：创建独立配置文件。
@@ -81,6 +87,12 @@ token_count_mode = "estimate"
 时不发送密钥，不借用其他配置的凭据。`ta --config PATH` 可指定其他配置文件。
 
 ## 上下文自动压缩与状态栏
+
+新的人类任务开始时，`tool_history_keep_groups` 会主动精简更早完成轮次中的完整工具组，
+无需等到预算阈值。全局或各 API 可设置 0–100，默认保留最近 2 组，0 关闭此项整理。
+全部用户指令、最终回答、当前人类轮次的完整工具链、近期工具组及未知副作用均保留。
+整理使用同样的归档分支机制，不重放工具；`/continue` 不触发新任务整理，也不在每个工具
+步骤反复创建归档。
 
 每次调用模型前检查上下文，默认达到预算 **75%** 时提前压缩，尽量降至触发阈值的四分之三，
 为后续执行预留空间。字符预算和已知 token 窗口都会参与检查；token 预算先扣除输出预留。
@@ -126,6 +138,13 @@ Context=正常 | Chars=120,000/500,000 (24%) | Tokens≈40,000/未知窗口 | Au
 工具检查点。中断工具的结果标记为未知，不自动重放。原 API 失效或配置变更时仍可进入只读
 历史模式，无需网络客户端。`--no-session` 仅使用内存，退出后压缩归档丢失；手动持久化压缩需启用会话存储。
 
+执行段意外退出时会标记为中断并尝试写入检查点，不覆盖原始异常；检查点写入错误仍会停止
+执行。加载遗留 `running` 快照时仅在内存自愈，不改写原数据库行。硬终止不能运行清理，
+因此由加载路径兜底。继续任务保留既有预算和未知工具结果，不重新授予执行权限。
+
+重复 `/continue` 不堆叠相同续跑标记。尚未回答的真实用户消息原样保留，不与控制文字合并；
+空的 user 尾消息可以替换为续跑控制消息。
+
 | 命令 | 说明 |
 |---|---|
 | `/sessions [N]`、`/sessions find TEXT` | 带序号的一行列表：时间、ID、标题、API/模型、消息数、路径 |
@@ -169,6 +188,11 @@ HTTP 500/502/503/504、识别出的结构化 429 错误及适用的连接故障�
 `retry_max_attempts = 3`、`retry_wait_budget = 20.0`，总过程受请求超时约束。
 已接受响应和部分流不会重放；错误透传会脱敏凭据。
 `retry_thinking_400` 是针对特定 thinking 格式错误的独立 API 选项，默认关闭。
+
+在 REPL 中裸输入 `continue`、`clear`、`compact`、`status`、`help`、`exit`、`resume`
+时，只提示对应的斜杠命令，不新建任务或直接执行命令；匹配忽略大小写和首尾空白。
+确需作为文字发送时，可加引号或写成完整句子。显式 `/run continue`、`--prompt continue`
+以及文件内容提交保持原有行为。
 
 终端支持时间戳、角色分栏、中文宽度换行、SecureCRT 退格/删除及持久化 readline 历史。
 输入 `~/`、`～/` 或绝对文件路径，回车即可提交 UTF-8 文本；Tab 补全路径。

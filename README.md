@@ -49,6 +49,7 @@ auto_compact = true
 auto_compact_threshold = 0.75
 auto_compact_keep_turns = 2
 auto_compact_keep_groups = 2
+tool_history_keep_groups = 2 # earlier completed turns; 0 disables proactive cleanup
 
 [apis.local]
 kind = "local"
@@ -76,6 +77,13 @@ and stateless multi-turn replay. Profile names and models are user-defined.
 `~/.config/termux-agent/profiles/`. Missing `api_key_env` on a named profile sends
 no key; credentials are never borrowed from another profile.
 
+Stateless Responses requests retain reasoning items and their encrypted content
+alongside function calls/results. Do not remove all reasoning items to save
+tokens: [OpenAI's guidance](https://developers.openai.com/api/docs/guides/reasoning#keeping-reasoning-items-in-context)
+recommends preserving the active tool chain. Opaque serialized character counts
+are not a measured input-token charge. Display-only reasoning is not added as a
+second copy of the saved Responses items.
+
 Switch with `/api NAME`, `/api N`, or `/api next`; switching saves the conversation
 and starts a fresh session. `/api default NAME` sets the startup choice.
 `/api show NAME` and `/config` omit credential values. `ta --config PATH` selects
@@ -83,6 +91,14 @@ another configuration file. `/api remove NAME` removes only added profiles,
 refuses the active profile, and retains a recovery copy.
 
 ## Context management and status
+
+At a new human-task boundary, `tool_history_keep_groups` proactively reduces
+older complete tool groups even below the budget threshold. It defaults to 2
+and accepts 0–100 globally or per API profile; 0 disables this cleanup. All human
+instructions, final answers, the current human turn's complete tool chain, recent
+groups and unknown side effects are retained. Reduction uses the same archive
+branch mechanism and never replays a tool. `/continue` does not trigger this
+new-task cleanup or repeatedly create a new archive at every tool step.
 
 Before every model request, automatic compaction checks both the character guard
 and, when known, the token window minus reserved output. It starts at **75%** by
@@ -142,6 +158,17 @@ mode, without a network client. `--no-session` uses memory only; its compaction
 archives disappear when the process exits. Persistent manual compaction requires
 session storage.
 
+Unexpected exits from a running segment mark it interrupted and attempt a
+checkpoint without masking the original failure. Checkpoint write errors still
+stop execution. A saved `running` snapshot is repaired in memory when restored,
+without rewriting its original database row. Hard termination cannot run cleanup,
+so restoration provides that fallback. Continuation keeps existing task budgets
+and unknown tool outcomes; it does not grant fresh execution authority.
+
+Repeated `/continue` does not stack identical resume controls. A pending human
+message remains unchanged rather than being merged with controller text; an
+empty user tail can be replaced with a resume control.
+
 | Command | Purpose |
 |---|---|
 | `/sessions [N]`, `/sessions find TEXT` | Numbered list: time, ID, title, API/model, message count, path |
@@ -195,6 +222,13 @@ connection failures share bounded retries: `retry_max_attempts = 3`,
 partial streams are not replayed. Errors are surfaced with credential redaction.
 `retry_thinking_400` is a separate per-profile opt-in for a known thinking-format
 error, disabled by default.
+
+In the REPL, the exact bare words `continue`, `clear`, `compact`, `status`,
+`help`, `exit` and `resume` show their slash-command equivalents without starting
+a new task or executing the command. Matching ignores case and surrounding
+whitespace. To send such a word as text, quote it or use a complete sentence;
+explicit `/run continue`, `--prompt continue`, and text-file submissions keep
+their normal behavior.
 
 Interactive output uses timestamps, role columns and terminal-width wrapping,
 including CJK text. SecureCRT Backspace/Delete and persistent readline history

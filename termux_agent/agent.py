@@ -12,7 +12,8 @@ from typing import Any, Callable
 
 from .client import (Client, ClientError, ContextLengthError, EmptyResponseError,
                      IncompleteOutputError, NetworkError)
-from .context import compact_task_messages, compact_context_messages, context_chars
+from .context import (compact_task_messages, compact_context_messages,
+                      compact_tool_history_messages, context_chars)
 from .token_budget import TokenCounter, estimate_text_tokens
 from .i18n import text as ui_text
 from .tools import TOOLS, DELEGATE_TOOL, WEB_FETCH_TOOL, execute, web_fetch_available
@@ -160,7 +161,11 @@ class Agent:
     def _checkpoint(self):
         # Persistence failures must stop further tools, rather than vanish in _emit.
         if self.checkpoint:
-            self.checkpoint()
+            try:
+                self.checkpoint()
+            except BaseException as exc:
+                self.last_run['checkpoint_error'] = type(exc).__name__
+                raise
 
     def close(self):
         """Close owned HTTP clients and local token capability clients."""
@@ -252,7 +257,7 @@ class Agent:
 
     def _restore_legacy_task(self):
         starts = [i for i, m in enumerate(self.messages) if m.get('role') == 'user' and
-                  not str(m.get('content', '')).startswith(('[Task memo:', '[TASK_RESUME]', '[Context archive:'))]
+                  not str(m.get('content', '')).startswith(('[Task memo:', '[TASK_RESUME]', '[TASK_CONTINUE]', '[Context archive:'))]
         start = starts[-1] if starts else 1
         self._ensure_task_state(self.messages[start].get('content', '') if start < len(self.messages) else '')
         self.task_state['logical_calls'] = sum(m.get('role') == 'assistant' for m in self.messages[start + 1:])
@@ -296,6 +301,58 @@ class Agent:
                              '此结果不能自动续跑；请修正条件后开始新任务。'))
         self._checkpoint()
         return value
+
+    def _task_has_denial(self):
+        starts = [i for i, m in enumerate(self.messages) if m.get('role') == 'user'
+                  and not str(m.get('content', '')).startswith(
+                      ('[Task memo:', '[Context archive:', '[TASK_RESUME]', '[TASK_CONTINUE]'))]
+        for message in self.messages[starts[-1] + 1 if starts else 1:]:
+            if message.get('role') != 'tool':
+                continue
+            raw = message.get('content', '')
+            try:
+                result = json.loads(raw) if isinstance(raw, str) else raw
+            except (ValueError, TypeError):
+                result = {}
+            if isinstance(result, dict) and (result.get('execution_status') == 'denied' or (
+                    result.get('execution_status') is None and isinstance(result.get('error'), str)
+                    and result['error'].startswith('approval denied'))):
+                return True
+        return False
+
+    def _mark_interrupted(self, message):
+        """State-only repair; the caller owns checkpoint failure handling."""
+        if not self.task_state:
+            self._restore_legacy_task()
+        if self._segment_started:
+            self.task_state['active_seconds'] += time.monotonic() - self._segment_started
+            self._segment_started = 0.0
+        denied = self._approval_denied or self._task_has_denial()
+        self._approval_denied = denied
+        self.task_state.update(status='interrupted', stop_reason='interrupted')
+        self.last_run.update(status='interrupted', stop_reason='interrupted', message=message,
+                             can_continue=not denied, task_budget=self._task_budget(),
+                             continue_hint=self._ui('/continue 开始同一任务的新受控段。' if not denied else
+                                 '此结果不能自动续跑；请修正条件后开始新任务。'))
+
+    def _close_pending_unknown(self):
+        """Complete protocol pairs after an unexpected exit without executing calls."""
+        pending = {}
+        for message in self.messages:
+            if message.get('role') == 'assistant' and message.get('tool_calls'):
+                pending = {call['id']: call for call in message['tool_calls']}
+            elif message.get('role') == 'tool':
+                pending.pop(message.get('tool_call_id'), None)
+        for identifier, call in pending.items():
+            result = {'error': 'Interrupted checkpoint: tool outcome is unknown. It may have run. '
+                      'Inspect actual state before retrying; do not replay automatically.',
+                      'execution_status': 'unknown', 'outcome_status': 'unknown'}
+            if call.get('function', {}).get('name') in ('write_file', 'edit_file'):
+                result['write_status'] = 'unknown'
+                self._tool_write_unknown += 1
+            self.messages.append({'role': 'tool', 'tool_call_id': identifier,
+                                  'content': json.dumps(result, separators=(',', ':'))})
+        self._unsafe_write_fingerprints.update(self._scan_unsafe_writes(self.messages))
 
     def _request_messages(self, rules='', messages=None):
         source = self.messages if messages is None else messages
@@ -375,6 +432,9 @@ class Agent:
         result, details = best, best_details
         details.update(before_chars=chars,
                        after_chars=context_chars(self._request_messages(rules, messages=result), self.tools))
+        return self._publish_compaction(source, result, details, archive_id)
+
+    def _publish_compaction(self, source, result, details, archive_id):
         persistent = self.branch_after_compact is not None and (
             self.branch_after_compact(archive_id, result, details) is not False)
         if not persistent:
@@ -388,6 +448,19 @@ class Agent:
         self._emit('task_compacted', {'archive': archive_id, 'persistent': persistent, **details})
         self._checkpoint()
         return True
+
+    def _trim_tool_history(self, rules=''):
+        if (not self.config.tool_history_keep_groups
+                or not (self.config.auto_compact or self.config.auto_compact_task)):
+            return False
+        archive_id = self.archive_id or 'memory-' + uuid.uuid4().hex[:12]
+        result, details = compact_tool_history_messages(
+            self.messages, self.config.tool_history_keep_groups, archive_id)
+        if details.get('skipped_no_reduction'):
+            return False
+        details.update(before_chars=context_chars(self._request_messages(rules), self.tools),
+                       after_chars=context_chars(self._request_messages(rules, messages=result), self.tools))
+        return self._publish_compaction(self.messages, result, details, archive_id)
 
     def continue_task(self, steps=None, auto_continue=None):
         if self.history_only:
@@ -441,6 +514,8 @@ class Agent:
         self._emit('request_start', {'logical_call': self.task_state['logical_calls'],
                                     'max_logical_calls': self.task_state['max_logical_calls'],
                                     'recovery': recovery})
+        # Reserve the logical call durably before a process can die in HTTP I/O.
+        self._checkpoint()
         try:
             answer = self.client.chat(request, self.tools)
         except BaseException as exc:
@@ -450,27 +525,63 @@ class Agent:
         return answer
 
     def _run_segment(self, text, *, automatic, resume, segment_steps):
-        rules = load_prompt_file('task_prompt.txt') if automatic else ''
-        nudge = load_prompt_file('task_continue.txt') if automatic else ''
-        self._last_auto_prompt_chars = len(rules) + 2 if rules else 0
         self._segment_progress = False
         self.task_state['segments'] += 1
         self._segment_started = time.monotonic()
         self.last_run = {'status': 'running', 'stop_reason': 'running', 'auto': automatic,
                          'continuations': 0, 'steps': 0, 'segment': self.task_state['segments'],
                          'task_id': self.task_state['id'], 'message': self._ui('任务运行中。')}
+        original_error = None
+        try:
+            return self._run_segment_body(text, automatic=automatic, resume=resume, segment_steps=segment_steps)
+        except BaseException as exc:
+            original_error = exc
+            raise
+        finally:
+            if self.last_run.get('status') == 'running':
+                try:
+                    self._mark_interrupted(self._ui('执行段意外中断；请检查未知工具结果后再继续。'))
+                    self._close_pending_unknown()
+                    self._checkpoint()
+                except BaseException as cleanup_error:
+                    if original_error is None:
+                        raise
+                    original_error.add_note('Interruption checkpoint failed: ' + type(cleanup_error).__name__)
+                    self.last_run['checkpoint_error'] = type(cleanup_error).__name__
+
+    def _resume_messages(self, text):
+        result = deepcopy(self.messages)
+        if result[-1].get('role') != 'user':
+            result.append({'role': 'user', 'content': text})
+        elif result[-1].get('content') in (None, '', []):
+            result[-1] = {'role': 'user', 'content': text}
+        elif isinstance(result[-1].get('content'), str) and not result[-1]['content'].strip():
+            result[-1] = {'role': 'user', 'content': text}
+        while (len(result) > 2 and result[-1].get('role') == result[-2].get('role') == 'user'
+               and isinstance(result[-1].get('content'), str)
+               and result[-1]['content'].startswith('[TASK_RESUME]\n')
+               and result[-1]['content'] == result[-2].get('content')):
+            result.pop()
+        return result
+
+    def _run_segment_body(self, text, *, automatic, resume, segment_steps):
+        if not resume:
+            self.messages.append({'role': 'user', 'content': text})
+            self._conversation_count += 1
+            self._checkpoint()
+        rules = load_prompt_file('task_prompt.txt') if automatic else ''
+        nudge = load_prompt_file('task_continue.txt') if automatic else ''
+        self._last_auto_prompt_chars = len(rules) + 2 if rules else 0
         if hasattr(self.client, 'set_control_markers'):
             self.client.set_control_markers(TASK_MARKERS if automatic else ())
         if resume:
-            prospective = [*__import__('copy').deepcopy(self.messages), {'role': 'user', 'content': text}]
+            prospective = self._resume_messages(text)
             compacted = self._compact_for_context(messages=prospective, rules=rules)
             if not compacted:
-                self.messages.append({'role': 'user', 'content': text})
+                self.messages[:] = prospective
+            self._checkpoint()
         else:
-            self.messages.append({'role': 'user', 'content': text})
-        if not resume:
-            self._conversation_count += 1
-        self._checkpoint()
+            self._trim_tool_history(rules)
         pauses = 0
         warned = False
         for step in range(segment_steps):
@@ -497,12 +608,16 @@ class Agent:
             try:
                 answer = self._chat_with_recovery(request, rules)
             except KeyboardInterrupt:
+                if self.last_run.get('checkpoint_error'):
+                    raise
                 return self._finish('interrupted', 'interrupted', self._ui('LLM 请求已中断。'))
             except TaskBudgetExhausted as exc:
                 reason = {'time_budget': 'time_budget', 'token_budget': 'token_budget'}.get(
                     exc.reason, 'task_call_budget')
                 return self._finish('limit', reason, self._ui('同一任务的硬预算已用完；未执行新的调用。'))
             except Exception as exc:
+                if self.last_run.get('checkpoint_error'):
+                    raise
                 if isinstance(exc, IncompleteOutputError) or (
                         isinstance(exc, EmptyResponseError) and getattr(exc, 'length', False)):
                     self.incomplete_draft = deepcopy(getattr(exc, 'assistant_message', None))

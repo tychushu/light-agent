@@ -74,6 +74,12 @@ KEY_ENV 是密钥环境变量名；NAME / ID / TEXT 等是需要替换的参数�
 _readline = None
 _history_file = None
 
+BARE_COMMAND_HINT = ('裸输入 {v0} 不会执行命令；如需执行请使用 {v1}。'
+                     '如确实要作为文字发送，请输入带引号的 "{v0}" 或完整句子。')
+BARE_COMMANDS = {name: '/' + name for name in (
+    'continue', 'clear', 'compact', 'status', 'help', 'exit', 'resume',
+)}
+
 
 def configure_readline(history_file=None):
     """Enable terminal editing for input(); no global tty changes or history file."""
@@ -461,6 +467,9 @@ def main():
                 value['branch'] = current_branch()
                 revision = store.save(session_id, revision, value, clear_draft=clear_draft)
             saved_fingerprint = payload_fingerprint(value)
+            # Fresh sessions need a real persisted archive ID before their first
+            # automatic compaction; in-memory IDs are invalid SQLite session IDs.
+            agent.archive_id = session_id
 
     def branch_after_compact(archive_id, messages, details):
         nonlocal session_id, revision, saved_fingerprint
@@ -474,6 +483,17 @@ def main():
         draft = store.draft(archive_id)
         create_active_branch(value, title[:95] + ' · compact task', archive_id=archive_id, draft=draft)
         return True
+
+    def show_interruption(exc):
+        nonlocal stream_wrote
+        if stream_wrote:
+            formatter.finish()
+            stream_wrote = False
+        display(tr('Interrupted.'))
+        for note in getattr(exc, '__notes__', ()):
+            if note.startswith('Interruption checkpoint failed: '):
+                display(tr('中断检查点保存失败（{v0}）；请核实最新状态。',
+                           v0=note.removeprefix('Interruption checkpoint failed: ')), 'Recovery')
 
     def submit_input(value, automatic=None):
         nonlocal stream_wrote, read_grant
@@ -491,11 +511,8 @@ def main():
             show_answer(answer)
             save_current()
             return True
-        except KeyboardInterrupt:
-            if stream_wrote:
-                formatter.finish()
-                stream_wrote = False
-            display(tr('Interrupted.'))
+        except KeyboardInterrupt as exc:
+            show_interruption(exc)
         except Exception as exc:
             if stream_wrote:
                 formatter.finish()
@@ -733,6 +750,10 @@ def main():
                 break
             if not prompt:
                 continue
+            bare_command = BARE_COMMANDS.get(prompt.lower())
+            if bare_command:
+                display(tr(BARE_COMMAND_HINT, v0=prompt.lower(), v1=bare_command), 'Input')
+                continue
             if history_mode() and prompt.split(maxsplit=1)[0] not in (
                     '/help', '/sessions', '/session', '/resume', '/history', '/stats', '/status', '/config', '/debug',
                     '/debug-context', '/silent', '/api', '/title', '/recall', '/export', '/copy', '/paste', '/exit'):
@@ -777,6 +798,8 @@ def main():
                     value = prompt[9:].strip()
                     answer = agent.continue_task(int(value) if value else None)
                     show_answer(answer); save_current()
+                except KeyboardInterrupt as exc:
+                    show_interruption(exc)
                 except (ValueError, OSError, sqlite3.Error) as exc:
                     display(tr('Error: {v0}', v0=exc))
             elif prompt == '/compact' or prompt.startswith('/compact '):

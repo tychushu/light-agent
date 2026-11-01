@@ -142,6 +142,9 @@ class Client:
                 if saved:
                     if not isinstance(saved, list) or any(not isinstance(item, dict) for item in saved):
                         raise ClientError('Invalid saved Responses output items')
+                    # Stateless tool chains need their reasoning items, including
+                    # opaque encrypted_content. They are not disposable display text:
+                    # https://developers.openai.com/api/docs/guides/reasoning#keeping-reasoning-items-in-context
                     for item in deepcopy(saved):
                         item.pop('id', None)
                         resp_input.append(item)

@@ -4,6 +4,15 @@ import re
 # Source templates stay beside their callers; values are interpolated only after
 # translation. Never use substring replacement on a transcript or a tool result.
 EN = {
+    '中断检查点保存失败（{v0}）；请核实最新状态。':
+        'Interruption checkpoint could not be saved ({v0}); verify the latest state.',
+    '执行段意外中断；请检查未知工具结果后再继续。':
+        'Execution was interrupted unexpectedly; inspect unknown tool outcomes before continuing.',
+    '恢复了未完成的运行检查点；请核实未知工具结果后再继续。':
+        'Restored an unfinished running checkpoint; verify unknown tool outcomes before continuing.',
+    '裸输入 {v0} 不会执行命令；如需执行请使用 {v1}。如确实要作为文字发送，请输入带引号的 "{v0}" 或完整句子。':
+        'Bare {v0} does not execute a command; use {v1} to run it. '
+        'To send it as text, enter "{v0}" with quotes or use a complete sentence.',
     ' | Mode=历史查看': ' | Mode=history-only',
     '/compact 需要会话持久化，请去掉 --no-session': '/compact requires session storage; omit --no-session',
     '/export 需要会话持久化': '/export requires session storage',
