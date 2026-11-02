@@ -61,8 +61,12 @@ class Agent:
         self._allow_delegation = allow_delegation
         self._web_fetch_enabled = config.web_fetch_enabled and web_fetch_available(config.lightpanda_binary or None)
         self.output_compressor = OutputCompressor(config)
-        self.tools = (TOOLS + ([WEB_FETCH_TOOL] if self._web_fetch_enabled else []) +
-                      ([DELEGATE_TOOL] if allow_delegation and config.max_subagents else []))
+        self.tools = TOOLS + ([WEB_FETCH_TOOL] if self._web_fetch_enabled else [])
+        if allow_delegation and config.max_subagents:
+            delegate_tool = deepcopy(DELEGATE_TOOL)
+            delegate_tool['function']['parameters']['properties']['max_steps']['maximum'] = min(
+                config.subagent_max_steps, config.max_steps, config.max_task_calls)
+            self.tools.append(delegate_tool)
         self._subagents_this_run = 0
         self._subagent_calls_total = 0
         self._subagent_api_calls_total = 0
@@ -115,6 +119,7 @@ class Agent:
         self._unsafe_write_fingerprints = self._scan_unsafe_writes(self.messages)
         self.last_run = self._idle_run(config.ui_language)
         self._parent_time_budget = None
+        self._parent_cooldown = None
         self._request_attempts_accounted = 0
         setup_retry = getattr(self.client, 'set_retry_hooks', None)
         if callable(setup_retry):
@@ -136,7 +141,8 @@ class Agent:
 
     def _pending_retry_delay(self):
         value = (self.task_state or {}).get('retry_not_before', 0)
-        return max(0.0, value - time.time()) if isinstance(value, (int, float)) and math.isfinite(value) else 0.0
+        remaining = max(0.0, value - time.time()) if isinstance(value, (int, float)) and math.isfinite(value) else 0.0
+        return max(remaining, self._parent_cooldown()) if self._parent_cooldown else remaining
 
     def _record_retry_state(self, info):
         if not self.task_state:
@@ -1036,8 +1042,9 @@ class Agent:
         self._subagents_this_run += 1
         self._subagent_calls_total += 1
         identifier = f"sub-{self._subagent_calls_total}"
-        child_config = replace(self.config, auto_continue=False,
-                               max_steps=min(requested, self.config.subagent_max_steps, self.config.max_steps))
+        step_limit = min(requested, self.config.subagent_max_steps, self.config.max_steps, self.config.max_task_calls)
+        child_config = replace(self.config, auto_continue=False, auto_extend_segments=False,
+                               max_steps=step_limit, max_task_calls=step_limit)
         base = self.base_system + "\n\n" + load_prompt_file("subagent_prompt.txt")
         child_client = Client(child_config)
         child_client.on_retry = lambda info: self._emit("subagent_retry", {**info, "id": identifier})
@@ -1052,6 +1059,7 @@ class Agent:
                           event=lambda kind, payload: self._emit(kind, {**payload, "subagent": identifier}),
                           base_system=base, allow_delegation=False)
             child._parent_time_budget = self._request_seconds_remaining
+            child._parent_cooldown = self._pending_retry_delay
             summary = child.run(task, auto_continue=False)
             status = child.last_run["status"]
             if child._approval_denied:
@@ -1068,6 +1076,18 @@ class Agent:
                     "usage": stats_snapshot["usage_totals"]}
         finally:
             if child is not None:
+                # Workers use the same API/key; preserve a deferred worker's wait
+                # before a subsequent worker or the parent sends another request.
+                child_state = getattr(child, 'task_state', None)
+                child_state = child_state if isinstance(child_state, dict) else {}
+                deferred = child_state.get('retry_not_before', 0)
+                if (self.task_state is not None and isinstance(deferred, (int, float))
+                        and math.isfinite(deferred) and deferred > self.task_state.get('retry_not_before', 0)):
+                    self.task_state['retry_not_before'] = deferred
+                    metadata = child_state.get('retry')
+                    retry = {**(metadata if isinstance(metadata, dict) else {}), 'subagent': identifier}
+                    self.task_state['retry'] = retry
+                    self.last_run['retry'] = dict(retry)
                 if not compression_merged:
                     compression_merged = True
                     self._merge_output_compression(child._primitive_output_compression())

@@ -279,7 +279,13 @@ Startup loads no Skills. Search paths are `~/.hermes/skills/`, `./skills/`, and
 - **Workers:** `/sub TASK` or the `delegate` tool runs bounded synchronous workers
   using the current API/model and approval policy. Workers have separate context
   but share the filesystem. `max_subagents = 3` (0 disables) and
-  `subagent_max_steps = 6`; no nested delegation.
+  `subagent_max_steps = 3`; workers execute serially, including calls in the same
+  response. The step cap is a hard total logical-call limit, including recovery,
+  and workers cannot automatically extend segments or delegate further. The tool
+  schema advertises the effective configured cap. Prefer one small delegation at
+  a time and review its result before planning the next.
+  Deferred cooldowns are shared with the parent and subsequent workers using
+  that same API, so another delegation cannot skip a known wait.
 - **Web:** optional Lightpanda `web_fetch`, disabled by default. See
   [setup, contract and acceptance](docs/web-fetch.md).
 - **RTK:** optional shell-output reduction, disabled by default. Install native

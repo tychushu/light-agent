@@ -60,7 +60,7 @@ class SubagentTests(unittest.TestCase):
         root_client = ScriptClient(call("delegate", {"task": "inspect a", "max_steps": 12}),
                                    {"content": "parent conclusion"})
         child_client = ScriptClient({"content": "worker finding", "reasoning_content": "private worker reasoning"})
-        config = Config(max_steps=4, approval_policy="never", api_key="test-key")
+        config = Config(max_steps=4, subagent_max_steps=6, approval_policy="never", api_key="test-key")
         agent = Agent(config, client=root_client, base_system="base + directory instructions")
         agent.messages.extend([{"role": "user", "content": "parent private history"},
                                {"role": "assistant", "content": "earlier answer"}])

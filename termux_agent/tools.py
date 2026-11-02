@@ -207,10 +207,11 @@ MAX_FILE_BYTES = 10 * 1024 * 1024
 DELEGATE_TOOL = {
     "type": "function", "function": {
         "name": "delegate",
-        "description": "Delegate a self-contained subtask to an independent bounded worker. Include all necessary facts. Runs synchronously with the same API, directory and approvals; no nested delegation. Returns status, summary and usage.",
+        "description": "Delegate one small self-contained subtask at a time; wait for its result before planning another. Include necessary facts. Runs synchronously with the same API, directory and approvals; no nested delegation. The configured model-call cap is enforced, including recovery calls. Returns status, summary and usage.",
         "parameters": {"type": "object", "properties": {
             "task": {"type": "string", "minLength": 1, "maxLength": 16000},
-            "max_steps": {"type": "integer", "minimum": 1, "maximum": 12}},
+            "max_steps": {"type": "integer", "minimum": 1, "maximum": 12,
+                          "description": "Maximum logical model calls for this worker; use a small budget."}},
             "required": ["task"], "additionalProperties": False}}}
 
 MAX_EDIT_BYTES = 2 * 1024 * 1024

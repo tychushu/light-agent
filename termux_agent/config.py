@@ -24,7 +24,7 @@ class Config:
     retry_wait_budget: float = 20.0
     retry_max_attempts: int = 3
     max_subagents: int = 3
-    subagent_max_steps: int = 6
+    subagent_max_steps: int = 3
     web_fetch_enabled: bool = False
     lightpanda_binary: str = ""
     rtk_enabled: bool = False
