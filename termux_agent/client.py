@@ -86,6 +86,10 @@ class IncompleteOutputError(ClientError):
         self.context_limited = bool(context_limited)
 
 
+class StreamInterruptedError(IncompleteOutputError):
+    """An accepted stream ended without proof of completion, not a token cap."""
+
+
 class Client:
     RETRYABLE_STATUS = {500, 502, 503, 504}
     # Only used while sending/receiving headers, never during successful body reads.
@@ -633,7 +637,7 @@ class Client:
         if not finish and not saw_done:
             if calls:
                 message['_incomplete_tool_calls'] = message.pop('tool_calls')
-            raise IncompleteOutputError('LLM stream ended before completion; output was saved as a draft.', message)
+            raise StreamInterruptedError('LLM stream ended before completion; output was saved as a draft.', message)
         return message
 
     def close(self) -> None:

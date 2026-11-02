@@ -12,7 +12,7 @@ import uuid
 from typing import Any, Callable
 
 from .client import (Client, ClientError, ContextLengthError, EmptyResponseError,
-                     IncompleteOutputError, NetworkError, RateLimitError)
+                     IncompleteOutputError, NetworkError, RateLimitError, StreamInterruptedError)
 from .context import (compact_task_messages, compact_context_messages,
                       compact_tool_history_messages, context_chars)
 from .token_budget import TokenCounter, estimate_text_tokens
@@ -707,7 +707,8 @@ class Agent:
                         self.last_run['retry'] = dict(retry)
                     return self._finish('error', 'rate_limit', self._ui('LLM 请求失败：{v0}', v0=exc))
                 if isinstance(exc, IncompleteOutputError):
-                    reason = 'context_limit' if getattr(exc, 'context_limited', False) else 'output_limit'
+                    reason = ('stream_interrupted' if isinstance(exc, StreamInterruptedError) else
+                              'context_limit' if getattr(exc, 'context_limited', False) else 'output_limit')
                     return self._finish('incomplete', reason, self._ui('LLM 请求失败：输出不完整：{v0}', v0=exc), False)
                 if isinstance(exc, EmptyResponseError):
                     reason = 'output_limit' if getattr(exc, 'length', False) else 'provider_error'

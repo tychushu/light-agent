@@ -137,6 +137,7 @@ class RateHardeningTests(unittest.TestCase):
             a=Agent(client.config,client=client)
             with patch('termux_agent.agent.execute',side_effect=AssertionError('incomplete tool ran')):a.run('task')
             self.assertEqual(a.last_run['status'],'incomplete')
+            self.assertEqual(a.last_run['stop_reason'],'stream_interrupted')
             self.assertIn('_incomplete_tool_calls',a.incomplete_draft)
             self.assertEqual([m['role'] for m in a.messages],['system','user'])
         self.assertEqual(len(seen),1)
