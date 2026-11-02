@@ -526,10 +526,10 @@ class RetryBehaviorTests(unittest.TestCase):
             self.assertFalse(profile.retry_thinking_400)
             self.assertEqual(profile.retry_wait_budget, 9.0)
 
-        for valid in (0, 60):
+        for valid in (0, 60, 180, 3600):
             config = Config(retry_wait_budget=valid)
             config.validate()
-        for invalid in (-0.01, 60.01, True, math.nan, math.inf, -math.inf):
+        for invalid in (-0.01, 3600.01, True, math.nan, math.inf, -math.inf):
             with self.subTest(budget=invalid):
                 with self.assertRaises(ValueError):
                     Config(retry_wait_budget=invalid).validate()

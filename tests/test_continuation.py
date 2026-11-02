@@ -104,6 +104,7 @@ class ContinuationTests(unittest.TestCase):
         parts = ['Finished [TA', 'SK_D', 'ONE]', '\n']
         self.assertEqual(''.join(filter.feed(x) for x in parts) + filter.feed('', final=True), 'Finished \n')
         frames = [f'data: {json.dumps({"choices":[{"delta":{"content":x}}]})}\n\n' for x in parts]
+        frames.append('data: [DONE]\n\n')
         def respond(request):
             return httpx.Response(200, content=''.join(frames), headers={'content-type':'text/event-stream'})
         with httpx.Client(transport=httpx.MockTransport(respond)) as http:

@@ -10,8 +10,8 @@ from typing import Any, Callable
 
 import httpx
 from .continuation import MarkerFilter
-from .retry import (RetryDeadlineError, backoff, rate_limit_error, request_deadline,
-                    retry_after, thinking_echo_error)
+from .retry import (RetryDeadlineError, backoff, rate_limit_error, rate_limit_axis, request_deadline,
+                    server_retry_delay, thinking_echo_error)
 
 
 def upstream_error_fields(value):
@@ -56,6 +56,13 @@ class ProviderError(ClientError):
 
 class NetworkError(ClientError):
     pass
+
+
+class RateLimitError(ProviderError):
+    def __init__(self, text, *, retry_after_seconds=None, pre_accept=True):
+        super().__init__(text)
+        self.retry_after_seconds = retry_after_seconds
+        self.pre_accept = pre_accept
 
 
 class ContextLengthError(ClientError):
@@ -106,6 +113,14 @@ class Client:
         self.context_limited = False
         self.control_markers = ()
         self._marker_filter = None
+        self._remaining_budget = self._retry_state = self._initial_cooldown = None
+
+    def set_retry_hooks(self, *, remaining_seconds=None, on_progress=None, initial_cooldown=None):
+        self._remaining_budget, self._retry_state = remaining_seconds, on_progress
+        self._initial_cooldown = initial_cooldown
+
+    def _check_owner_budget(self):
+        return self._remaining_budget() if self._remaining_budget else None
 
     def set_control_markers(self, markers):
         self.control_markers = tuple(markers)
@@ -226,7 +241,11 @@ class Client:
         if self.config.api_key:
             headers["Authorization"] = "Bearer " + self.config.api_key
         thinking_retry = bool(getattr(self.config, "retry_thinking_400", False))
-        deadline = self._clock() + self.config.timeout
+        total = getattr(self.config, 'retry_total_timeout', 0) or self.config.timeout
+        owner_remaining = self._check_owner_budget()
+        if owner_remaining is not None:
+            total = min(total, owner_remaining)
+        deadline = self._clock() + total
         try:
             remaining = deadline - self._clock()
             if remaining <= 0:
@@ -234,6 +253,7 @@ class Client:
             with request_deadline(remaining) as accepted:
                 return self._chat_attempts(body, url, headers, thinking_retry, deadline, accepted)
         except RetryDeadlineError as exc:
+            self._check_owner_budget()
             raise NetworkError(str(exc)) from None
 
     def _chat_attempts(self, body, url, headers, thinking_retry, deadline, accepted):
@@ -242,14 +262,23 @@ class Client:
         # a caller modifies its original message objects while we are waiting.
         wire = self._http.build_request("POST", url, json=body, headers=headers).content
         max_attempts = getattr(self.config, "retry_max_attempts", 3)
+        if self._initial_cooldown:
+            delay = self._initial_cooldown()
+            if delay > 0:
+                waited = self._wait_retry(-1, 'LLM retry cooldown', 'cooldown', 429,
+                                           None, deadline, waited, minimum_delay=delay)
         for attempt in range(max_attempts):
             try:
+                self._check_owner_budget()
                 remaining = deadline - self._clock()
                 if remaining <= 0:
                     raise NetworkError("LLM retry deadline exceeded")
                 request = self._http.build_request("POST", url, content=wire,
-                                                   headers=headers, timeout=remaining)
+                                                   headers=headers, timeout=min(remaining, self.config.timeout))
                 self.last_attempts = attempt + 1
+                if self._retry_state:
+                    self._retry_state({'phase': 'request', 'attempt': self.last_attempts,
+                                       'max_attempts': max_attempts})
                 # Inspect status/headers before reading any body, even for JSON.
                 response = self._http.send(request, stream=True)
             except self.RETRYABLE_ERRORS as exc:
@@ -267,7 +296,7 @@ class Client:
                 raise NetworkError(f"LLM connection failed{where}") from None
             if response.status_code in self.RETRYABLE_STATUS and attempt + 1 < max_attempts:
                 status = response.status_code
-                after = response.headers.get("Retry-After")
+                after = response.headers
                 response.close()
                 error = f"LLM endpoint returned HTTP {status}"
                 waited = self._wait_retry(attempt, error, "upstream-status", status,
@@ -290,12 +319,12 @@ class Client:
                                else rate_limit_error(value))
                     if ("text/html" not in response.headers.get("content-type", "").lower()
                             and matched and attempt + 1 < max_attempts):
-                        after = response.headers.get("Retry-After")
+                        after = response.headers
                         status = response.status_code
                         response.close()
                         cause = "thinking-echo" if status == 400 else "rate-limit"
                         waited = self._wait_retry(attempt, error, cause, status,
-                                                  after, deadline, waited)
+                                                  after, deadline, waited, axis=rate_limit_axis(value))
                         continue
                     raise classified
                 response.raise_for_status()
@@ -322,22 +351,35 @@ class Client:
                 response.close()
         raise NetworkError("LLM request failed after retries")
 
-    def _wait_retry(self, attempt, error, cause, status, after, deadline, waited):
-        delay = backoff(attempt, self._randomizer())
-        server_delay = retry_after(after, self._wall_clock())
+    def _wait_retry(self, attempt, error, cause, status, after, deadline, waited, *, minimum_delay=None, axis=None):
+        self._check_owner_budget()
+        rate_limited = status == 429
+        jitter = max(0.0, min(self._randomizer(), 1.0))
+        delay = 0.0 if cause == 'cooldown' else backoff(max(0, attempt), jitter, rate_limited=rate_limited)
+        server_delay = server_retry_delay(after, self._wall_clock(), rate_limited=rate_limited, axis=axis)
+        if minimum_delay is not None:
+            server_delay = max(server_delay or 0, minimum_delay)
         if server_delay is not None:
-            delay = max(delay, server_delay)
+            delay = server_delay + jitter * min(1.0, max(.05, server_delay * .1))
         remaining = deadline - self._clock()
         budget = getattr(self.config, "retry_wait_budget", 20.0) - waited
+        def exhausted(message):
+            if rate_limited:
+                return RateLimitError(message, retry_after_seconds=delay)
+            return NetworkError(message)
         if delay > budget or delay >= remaining:
-            raise NetworkError(f"{error}; retry budget exhausted (required wait {delay:g}s)")
+            raise exhausted(f"{error}; retry budget exhausted (required wait {delay:g}s)")
+        info = {"attempt": attempt + 2, "max_attempts": getattr(self.config, "retry_max_attempts", 3),
+                "status": status, "cause": cause, "wait_seconds": delay}
+        if self._retry_state:
+            self._retry_state({**info, 'phase': 'wait'})
         if self.on_retry:
-            self.on_retry({"attempt": attempt + 2, "max_attempts": getattr(self.config, "retry_max_attempts", 3),
-                           "status": status, "cause": cause, "wait_seconds": round(delay, 3)})
+            self.on_retry(info)
         if delay >= deadline - self._clock():
-            raise NetworkError(f"{error}; retry deadline exceeded")
+            raise exhausted(f"{error}; retry deadline exceeded")
         before = self._clock()
         self._sleep(delay)
+        self._check_owner_budget()
         return waited + max(delay, self._clock() - before)
 
     def _error_sample(self, response, deadline=None):
@@ -359,6 +401,17 @@ class Client:
     def _classified_error(self, response, sample=None):
         sample = self._error_sample(response) if sample is None else sample
         diagnostic = self._http_error(response, sample)
+        if response.status_code == 429 and 'text/html' not in response.headers.get('content-type', '').lower():
+            try:
+                data = json.loads(sample)
+                if rate_limit_error(data):
+                    delay = server_retry_delay(response.headers, self._wall_clock(), rate_limited=True,
+                                               axis=rate_limit_axis(data))
+                    if delay is None:
+                        delay = backoff(max(0, self.last_attempts - 1), self._randomizer(), rate_limited=True)
+                    return RateLimitError(diagnostic, retry_after_seconds=delay)
+            except ValueError:
+                pass
         if response.status_code in (400, 413, 422) and 'text/html' not in response.headers.get('content-type', '').lower():
             try:
                 data = json.loads(sample)
@@ -437,6 +490,8 @@ class Client:
         if self.config.wire_api == "responses":
             from .responses import message
             return message(self, result)
+        if result.get('error'):
+            raise self._body_error(result)
         choices = result.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise ClientError("LLM response has no choices")
@@ -447,6 +502,15 @@ class Client:
         self.last_finish_reason = choices[0].get("finish_reason")
         self._apply_local_response_flags(result, message)
         return message
+
+    def _body_error(self, value):
+        fields = upstream_error_fields(value)
+        detail = ': '.join(filter(None, (upstream_error_text(fields.get('code', ''), self.config.api_key, 80),
+                                        upstream_error_text(fields.get('message', ''), self.config.api_key, 300))))
+        label = 'LLM response error' + (': ' + detail if detail else '')
+        if rate_limit_error(value):
+            return RateLimitError(label, pre_accept=False)
+        return ProviderError(label)
 
     def _apply_local_response_flags(self, result, message=None):
         values = [result]
@@ -483,10 +547,14 @@ class Client:
         finish = None
         local_flags = False
         saw_choice = False
+        saw_done = False
 
         def consume(data: str) -> None:
-            nonlocal usage, finish, local_flags, saw_choice
-            if not data or data.strip() in ("[DONE]", "null"):
+            nonlocal usage, finish, local_flags, saw_choice, saw_done
+            if data.strip() == '[DONE]':
+                saw_done = True
+                return
+            if not data or data.strip() == "null":
                 return
             try:
                 event = json.loads(data)
@@ -494,6 +562,8 @@ class Client:
                 raise ClientError("LLM endpoint returned malformed SSE JSON") from None
             if not isinstance(event, dict):
                 return
+            if event.get('error') or event.get('type') == 'error':
+                raise self._body_error(event)
             if isinstance(event.get("usage"), dict):
                 usage = event["usage"]
             local_flags = local_flags or any(
@@ -560,6 +630,10 @@ class Client:
             message["reasoning_content"] = "".join(reasoning)
         if calls:
             message["tool_calls"] = [calls[index] for index in sorted(calls)]
+        if not finish and not saw_done:
+            if calls:
+                message['_incomplete_tool_calls'] = message.pop('tool_calls')
+            raise IncompleteOutputError('LLM stream ended before completion; output was saved as a draft.', message)
         return message
 
     def close(self) -> None:

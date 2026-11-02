@@ -39,12 +39,74 @@ class RetryDeadlineError(RuntimeError):
 
 def rate_limit_error(value) -> bool:
     """Only explicitly temporary rate limits; never infer from error prose."""
-    error = value.get("error") if isinstance(value, dict) else None
-    if not isinstance(error, dict):
+    if not isinstance(value, dict):
         return False
-    return (error.get("type") in ("rate_limit_error", "rate_limit_exceeded", "requests", "tokens")
-            and error.get("code") in (None, "rate_limit_exceeded", "requests_rate_limit_exceeded",
-                                      "tokens_rate_limit_exceeded"))
+    error = value.get('error') if isinstance(value.get('error'), dict) else value
+    normalize = lambda item: str(item or '').strip().lower().replace('-', '_')
+    kind, code = normalize(error.get('type')), normalize(error.get('code'))
+    denied = {'insufficient_quota', 'quota_exceeded', 'billing_hard_limit_reached',
+              'insufficient_balance', 'authentication_error', 'invalid_api_key',
+              'permission_denied', 'content_blocked', 'account_deactivated'}
+    if kind in denied or code in denied:
+        return False
+    codes = {'rate_limit_exceeded', 'rate_limit_error', 'requests_rate_limit_exceeded',
+             'tokens_rate_limit_exceeded', 'ratelimitreached', 'too_many_requests', '429'}
+    return code in codes or (kind in (codes | {'requests', 'tokens'}) and not code)
+
+
+def duration_seconds(value):
+    """Bounded duration syntax used by token/request reset headers, never prose."""
+    if not isinstance(value, str) or not value or len(value) > 128:
+        return None
+    value = value.strip().lower()
+    if value == '0':
+        return 0.0
+    total, end = 0.0, 0
+    units = {'h': 3600, 'm': 60, 's': 1, 'ms': .001}
+    for match in re.finditer(r'(\d+(?:\.\d+)?)(ms|[hms])', value):
+        if match.start() != end:
+            return None
+        total += float(match[1]) * units[match[2]]
+        end = match.end()
+    return total if end == len(value) and end and math.isfinite(total) else None
+
+
+def rate_limit_axis(value):
+    error = value.get('error', value) if isinstance(value, dict) else {}
+    if not isinstance(error, dict):
+        return None
+    fields = [str(error.get(name, '')).lower() for name in ('code', 'type')]
+    for axis in ('requests', 'tokens'):
+        if any(field == axis or field.startswith(axis + '_') for field in fields):
+            return axis
+    return None
+
+
+def server_retry_delay(headers, now, *, rate_limited=False, axis=None):
+    """Explicit Retry-After takes priority over bucket-full reset estimates."""
+    if isinstance(headers, str) or headers is None:
+        return retry_after(headers, now)
+    headers = {str(key).lower(): value for key, value in headers.items()}
+    values = [retry_after(headers.get('retry-after'), now)]
+    milliseconds = headers.get('retry-after-ms')
+    if isinstance(milliseconds, str) and len(milliseconds) <= 128 and re.fullmatch(r'\d+(?:\.\d+)?', milliseconds):
+        delay = float(milliseconds) / 1000
+        if math.isfinite(delay):
+            values.append(delay)
+    explicit = [value for value in values if value is not None]
+    if explicit:
+        return max(explicit)
+    if rate_limited:
+        for bucket in (axis,) if axis in ('requests', 'tokens') else ('requests', 'tokens'):
+            remaining = headers.get('x-ratelimit-remaining-' + bucket)
+            if bucket == 'requests' and remaining is not None and axis is None:
+                try:
+                    if float(remaining) > 0:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+            values.append(duration_seconds(headers.get('x-ratelimit-reset-' + bucket)))
+    return max((v for v in values if v is not None), default=None)
 
 
 @contextmanager
@@ -99,6 +161,6 @@ def retry_after(value: str | None, now: float) -> float | None:
         return None
 
 
-def backoff(attempt: int, random_value: float) -> float:
-    cap = min(2.0 ** min(attempt, 3), 8.0)
+def backoff(attempt: int, random_value: float, *, rate_limited=False) -> float:
+    cap = min(5 * 2.0 ** min(attempt, 4), 60.0) if rate_limited else min(2.0 ** min(attempt, 3), 8.0)
     return cap * (0.5 + 0.5 * max(0.0, min(random_value, 1.0)))

@@ -91,6 +91,8 @@ def validate_task_state(value, config=None):
     out['stop_reason'] = stop_reason if isinstance(stop_reason, str) else None
     out['started'] = _safe_float(out.get('started'), time.time())
     out['active_seconds'] = _safe_float(out.get('active_seconds'))
+    if 'retry_not_before' in out:
+        out['retry_not_before'] = _safe_float(out['retry_not_before'])
     for key in ('segments', 'logical_calls', 'tokens', 'recovery_requests', 'compactions'):
         out[key] = _safe_int(out.get(key))
     defaults = {

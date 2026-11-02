@@ -40,6 +40,9 @@ max_steps = 16
 max_output_chars = 20000
 max_context_chars = 500000
 timeout = 120.0
+retry_max_attempts = 3
+retry_wait_budget = 20.0
+retry_total_timeout = 0.0 # 0 沿用 timeout；可单独设置接受响应前的总重试时限
 stream = true
 silent_writes = true
 
@@ -185,8 +188,22 @@ Tab 可补全命令、API、列表序号/会话 ID、局部指令文件及技能
 精简后重试一次。未完成输出保留为草稿，不执行其中未完成的工具调用。
 
 HTTP 500/502/503/504、识别出的结构化 429 错误及适用的连接故障使用有界自动重试：
-`retry_max_attempts = 3`、`retry_wait_budget = 20.0`，总过程受请求超时约束。
-已接受响应和部分流不会重放；错误透传会脱敏凭据。
+`retry_max_attempts` 包含首次 HTTP 尝试，范围 1–6，默认 3；`retry_wait_budget` 限制每个
+逻辑请求的累计等待，范围 0–3600 秒，默认 20。`retry_total_timeout` 限制接受响应前包含等待
+的总重试时限，范围 0–3600，0 沿用 `timeout`；单次尝试同时受 `timeout` 限制。
+父任务剩余时间进一步约束重试，委派的子任务也遵守此边界。
+
+临时限流使用较慢的指数退避和随机抖动，优先遵守 `Retry-After` / `retry-after-ms`，
+缺失时参考有效的请求/token 重置提示。所需等待超出预算时停止并延后，不截短后提前重试。429 中的余额、
+配额、账单、HTML 或无法识别的错误不重试；暂时性 5xx 仍按状态码处理。依据见
+[OpenAI 重试说明](https://developers.openai.com/api/docs/guides/rate-limits#retrying-with-exponential-backoff)。
+三个重试选项均支持 API 单独覆盖；分钟级云端限流可配置为 6 次尝试、累计等待 180 秒、
+总重试时限 480 秒，原任务硬预算仍然生效。
+
+等待状态、HTTP 尝试计数和已观察到的活动时间会写入检查点。尝试耗尽后 `/status` 显示
+`rate_limit`、冷却信息及续跑提示；`/continue` 保持原目标和预算，发送前继续遵守已保存的
+未来冷却时间。自动续段采用循环，不增长递归栈。已接受响应、部分流和流内限流错误均不自动
+重放；没有完成标记的断流输出保留为草稿，其中工具不执行。错误详情继续脱敏凭据。
 `retry_thinking_400` 是针对特定 thinking 格式错误的独立 API 选项，默认关闭。
 
 在 REPL 中裸输入 `continue`、`clear`、`compact`、`status`、`help`、`exit`、`resume`

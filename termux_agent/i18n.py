@@ -4,6 +4,8 @@ import re
 # Source templates stay beside their callers; values are interpolated only after
 # translation. Never use substring replacement on a transcript or a tool result.
 EN = {
+    '等待限流冷却后用 /continue 继续原任务；已完成工具不会自动重放。':
+        'Wait for the rate-limit cooldown, then use /continue for the same task; completed tools are not replayed automatically.',
     '中断检查点保存失败（{v0}）；请核实最新状态。':
         'Interruption checkpoint could not be saved ({v0}); verify the latest state.',
     '执行段意外中断；请检查未知工具结果后再继续。':

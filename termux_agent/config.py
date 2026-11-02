@@ -62,6 +62,7 @@ class Config:
     reasoning_effort: str = ""
     ui_language: str = "zh"
     tool_history_keep_groups: int = 2
+    retry_total_timeout: float = 0.0
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -80,6 +81,7 @@ class Config:
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         config.ui_language = raw.get('ui_language', 'zh')
+        config.retry_total_timeout = raw.get('retry_total_timeout', 0.0)
         from .api_profiles import ProfileStore
         store = ProfileStore(config_path)
         profiles = store.entries(raw)
@@ -93,7 +95,7 @@ class Config:
             for required in ("base_url", "model"):
                 if required not in entry:
                     raise ValueError(f"API profile requires {required}")
-            profile_keys = ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts",
+            profile_keys = ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "retry_total_timeout",
                             "user_agent", "stream", "max_context_chars", "wire_api", "max_steps",
                             "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments",
                             "auto_compact", "auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold",
@@ -179,11 +181,15 @@ class Config:
         retry_budget_valid = isinstance(self.retry_wait_budget, (int, float)) and not isinstance(self.retry_wait_budget, bool)
         if retry_budget_valid:
             try:
-                retry_budget_valid = math.isfinite(self.retry_wait_budget) and 0 <= self.retry_wait_budget <= 60
+                retry_budget_valid = math.isfinite(self.retry_wait_budget) and 0 <= self.retry_wait_budget <= 3600
             except OverflowError:
                 retry_budget_valid = False
         if not retry_budget_valid:
-            raise ValueError("retry_wait_budget must be between 0 and 60 seconds")
+            raise ValueError("retry_wait_budget must be between 0 and 3600 seconds")
+        value = self.retry_total_timeout
+        if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                or not 0 <= value <= 3600 or not math.isfinite(value)):
+            raise ValueError('retry_total_timeout must be between 0 and 3600 seconds')
         if not isinstance(self.user_agent, str) or not self.user_agent.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in self.user_agent):
             raise ValueError("user_agent must be a single-line ASCII string")
         if not isinstance(self.base_url, str) or not self.base_url.startswith(("http://", "https://")):

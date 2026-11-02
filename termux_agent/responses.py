@@ -4,7 +4,8 @@ import json
 
 
 def _failure(value, label, client=None):
-    from .client import ProviderError, ContextLengthError, upstream_error_fields, upstream_error_text
+    from .client import ProviderError, ContextLengthError, RateLimitError, upstream_error_fields, upstream_error_text
+    from .retry import rate_limit_error
     error = upstream_error_fields(value)
     code = error.get('code')
     if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long',
@@ -16,6 +17,8 @@ def _failure(value, label, client=None):
     parts = [upstream_error_text(code, api_key, 80),
              upstream_error_text(error.get('message', ''), api_key, 2000)]
     detail = ': '.join(part for part in parts if part)
+    if rate_limit_error(value):
+        return RateLimitError(f'{label}（{detail}）' if detail else label, pre_accept=False)
     return ProviderError(f'{label}（{detail}）' if detail else label)
 
 

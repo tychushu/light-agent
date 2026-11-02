@@ -42,6 +42,9 @@ max_steps = 16
 max_output_chars = 20000
 max_context_chars = 500000
 timeout = 120.0
+retry_max_attempts = 3
+retry_wait_budget = 20.0
+retry_total_timeout = 0.0 # 0 reuses timeout; set a separate pre-accept retry deadline if needed
 stream = true
 silent_writes = true
 
@@ -217,9 +220,30 @@ allows one retry after a pre-accept context error and successful reduction.
 Incomplete output remains a draft and never executes incomplete tools.
 
 Transient HTTP 500/502/503/504, classified structured 429 responses and eligible
-connection failures share bounded retries: `retry_max_attempts = 3`,
-`retry_wait_budget = 20.0`, within the request timeout. Accepted responses and
-partial streams are not replayed. Errors are surfaced with credential redaction.
+connection failures share bounded retries. `retry_max_attempts` counts all HTTP
+attempts, including the first (1–6; default 3). `retry_wait_budget` caps cumulative
+waiting per logical call (0–3600 seconds; default 20). `retry_total_timeout` sets
+the total pre-accept operation deadline, including waits (0–3600; 0 reuses
+`timeout`). Each attempt also respects `timeout`. Remaining task time further
+limits retries, including inside delegated workers.
+
+Temporary rate limits use slower exponential backoff with jitter. Standard
+`Retry-After` / `retry-after-ms` take priority; valid token/request reset hints
+are used when those are absent. A delay beyond the available budget stops and defers the request,
+never retries sooner. Billing/quota and HTML/unclassified 429 errors are not
+retried; transient 5xx handling remains status-based.
+These rules follow [OpenAI's retry guidance](https://developers.openai.com/api/docs/guides/rate-limits#retrying-with-exponential-backoff).
+API profiles can override all three retry settings; for minute-scale cloud limits,
+one bounded example is 6 attempts, a 180-second wait budget and a 480-second total
+deadline. Task hard limits still apply.
+
+Waiting state, HTTP-attempt counters and observed active time are checkpointed.
+`/status` reports `rate_limit`, the cooldown and continuation hint when attempts
+are exhausted. `/continue` keeps the goal/budgets and honors a saved future
+cooldown before sending. Task segments extend iteratively rather than recursively.
+Accepted responses and partial streams are not automatically replayed, including
+in-stream rate-limit failures. A stream ending without a completion marker stays
+a draft; its tools are not executed. Errors retain credential redaction.
 `retry_thinking_400` is a separate per-profile opt-in for a known thinking-format
 error, disabled by default.
 

@@ -7,11 +7,12 @@ import hashlib
 from copy import deepcopy
 from dataclasses import replace
 import time
+import math
 import uuid
 from typing import Any, Callable
 
 from .client import (Client, ClientError, ContextLengthError, EmptyResponseError,
-                     IncompleteOutputError, NetworkError)
+                     IncompleteOutputError, NetworkError, RateLimitError)
 from .context import (compact_task_messages, compact_context_messages,
                       compact_tool_history_messages, context_chars)
 from .token_budget import TokenCounter, estimate_text_tokens
@@ -36,6 +37,11 @@ class TaskBudgetExhausted(RuntimeError):
     def __init__(self, reason):
         self.reason = reason
         super().__init__(f'task budget exhausted: {reason}')
+
+
+class _NextSegment:
+    def __init__(self, text, steps):
+        self.text, self.steps = text, steps
 
 
 class Agent:
@@ -108,6 +114,44 @@ class Agent:
         self._last_progress_evidence = None
         self._unsafe_write_fingerprints = self._scan_unsafe_writes(self.messages)
         self.last_run = self._idle_run(config.ui_language)
+        self._parent_time_budget = None
+        self._request_attempts_accounted = 0
+        setup_retry = getattr(self.client, 'set_retry_hooks', None)
+        if callable(setup_retry):
+            setup_retry(remaining_seconds=self._request_seconds_remaining,
+                        on_progress=self._record_retry_state, initial_cooldown=self._pending_retry_delay)
+
+    def _request_seconds_remaining(self):
+        if not self.task_state:
+            return None
+        budget = self._task_budget()
+        remaining = budget['max_active_seconds'] - budget['active_seconds']
+        if self._parent_time_budget:
+            parent = self._parent_time_budget()
+            if parent is not None:
+                remaining = min(remaining, parent)
+        if remaining <= 0:
+            raise TaskBudgetExhausted('time_budget')
+        return remaining
+
+    def _pending_retry_delay(self):
+        value = (self.task_state or {}).get('retry_not_before', 0)
+        return max(0.0, value - time.time()) if isinstance(value, (int, float)) and math.isfinite(value) else 0.0
+
+    def _record_retry_state(self, info):
+        if not self.task_state:
+            return
+        self._account_http_attempts()
+        if info['phase'] == 'wait':
+            retry = {**info, 'next_retry_at': time.time() + info['wait_seconds']}
+            self.task_state['retry_not_before'] = retry['next_retry_at']
+            self.task_state['retry'] = retry
+            self.last_run['retry'] = dict(retry)
+        else:
+            self.task_state.pop('retry_not_before', None)
+            self.task_state.pop('retry', None)
+            self.last_run.pop('retry', None)
+        self._checkpoint()
 
     def _ui(self, template, **values):
         return ui_text(template, self.config.ui_language, **values)
@@ -161,6 +205,10 @@ class Agent:
     def _checkpoint(self):
         # Persistence failures must stop further tools, rather than vanish in _emit.
         if self.checkpoint:
+            if self._segment_started and self.task_state:
+                now = time.monotonic()
+                self.task_state['active_seconds'] += max(0.0, now - self._segment_started)
+                self._segment_started = now
             try:
                 self.checkpoint()
             except BaseException as exc:
@@ -299,6 +347,8 @@ class Agent:
                              can_continue=can_continue, task_budget=self._task_budget(),
                              continue_hint=self._ui('/continue 开始同一任务的新受控段。' if can_continue else
                              '此结果不能自动续跑；请修正条件后开始新任务。'))
+        if stop_reason == 'rate_limit':
+            self.last_run['continue_hint'] = self._ui('等待限流冷却后用 /continue 继续原任务；已完成工具不会自动重放。')
         self._checkpoint()
         return value
 
@@ -488,9 +538,7 @@ class Agent:
         usage = self._clean_usage(getattr(self.client, 'last_usage', None))
         self._usage_history.append(usage)
         self._request_history_chars.append(self._history_chars(request))
-        attempts = max(0, int(getattr(self.client, 'last_attempts', 0) or 0))
-        self._http_attempts_total += attempts
-        self._http_retries_total += max(0, attempts - 1)
+        self._account_http_attempts()
         total = usage.get('total_tokens') if usage else None
         if total is None and usage and usage.get('prompt_tokens') is not None and usage.get('completion_tokens') is not None:
             total = usage['prompt_tokens'] + usage['completion_tokens']
@@ -505,11 +553,19 @@ class Agent:
             self.task_state['token_source'] = 'conservative_estimate'
             self.task_state['token_budget_exact'] = False
 
+    def _account_http_attempts(self):
+        attempts = max(0, int(getattr(self.client, 'last_attempts', 0) or 0))
+        accounted = self._request_attempts_accounted
+        self._http_attempts_total += max(0, attempts - accounted)
+        self._http_retries_total += max(0, max(0, attempts - 1) - max(0, accounted - 1))
+        self._request_attempts_accounted = max(accounted, attempts)
+
     def _send_model_request(self, request, *, recovery=False):
         stop = self._budget_stop()
         if stop:
             raise TaskBudgetExhausted(stop)
         self._total_calls += 1
+        self._request_attempts_accounted = 0
         self.task_state['logical_calls'] += 1
         self._emit('request_start', {'logical_call': self.task_state['logical_calls'],
                                     'max_logical_calls': self.task_state['max_logical_calls'],
@@ -522,32 +578,42 @@ class Agent:
             self._record_model_request(request, getattr(exc, 'assistant_message', None))
             raise
         self._record_model_request(request, answer if isinstance(answer, dict) else None)
+        self.task_state.pop('retry_not_before', None)
+        self.task_state.pop('retry', None)
+        self.last_run.pop('retry', None)
         return answer
 
     def _run_segment(self, text, *, automatic, resume, segment_steps):
-        self._segment_progress = False
-        self.task_state['segments'] += 1
-        self._segment_started = time.monotonic()
-        self.last_run = {'status': 'running', 'stop_reason': 'running', 'auto': automatic,
-                         'continuations': 0, 'steps': 0, 'segment': self.task_state['segments'],
-                         'task_id': self.task_state['id'], 'message': self._ui('任务运行中。')}
-        original_error = None
-        try:
-            return self._run_segment_body(text, automatic=automatic, resume=resume, segment_steps=segment_steps)
-        except BaseException as exc:
-            original_error = exc
-            raise
-        finally:
-            if self.last_run.get('status') == 'running':
-                try:
-                    self._mark_interrupted(self._ui('执行段意外中断；请检查未知工具结果后再继续。'))
-                    self._close_pending_unknown()
-                    self._checkpoint()
-                except BaseException as cleanup_error:
-                    if original_error is None:
-                        raise
-                    original_error.add_note('Interruption checkpoint failed: ' + type(cleanup_error).__name__)
-                    self.last_run['checkpoint_error'] = type(cleanup_error).__name__
+        # Segment extension is iterative; long tasks must not grow Python's stack.
+        while True:
+            self._segment_progress = False
+            self.task_state['segments'] += 1
+            self._segment_started = time.monotonic()
+            self.last_run = {'status': 'running', 'stop_reason': 'running', 'auto': automatic,
+                             'continuations': 0, 'steps': 0, 'segment': self.task_state['segments'],
+                             'task_id': self.task_state['id'], 'message': self._ui('任务运行中。')}
+            original_error = None
+            result = None
+            try:
+                result = self._run_segment_body(text, automatic=automatic, resume=resume,
+                                                segment_steps=segment_steps)
+            except BaseException as exc:
+                original_error = exc
+                raise
+            finally:
+                if self.last_run.get('status') == 'running' and not isinstance(result, _NextSegment):
+                    try:
+                        self._mark_interrupted(self._ui('执行段意外中断；请检查未知工具结果后再继续。'))
+                        self._close_pending_unknown()
+                        self._checkpoint()
+                    except BaseException as cleanup_error:
+                        if original_error is None:
+                            raise
+                        original_error.add_note('Interruption checkpoint failed: ' + type(cleanup_error).__name__)
+                        self.last_run['checkpoint_error'] = type(cleanup_error).__name__
+            if not isinstance(result, _NextSegment):
+                return result
+            text, segment_steps, resume = result.text, result.steps, True
 
     def _resume_messages(self, text):
         result = deepcopy(self.messages)
@@ -630,6 +696,16 @@ class Agent:
                                              | {'role': 'assistant'})
                 if isinstance(exc, ContextLengthError):
                     return self._finish('context_limit', 'context_limit', self._ui('LLM 请求失败：{v0}', v0=exc), False)
+                if isinstance(exc, RateLimitError):
+                    delay = exc.retry_after_seconds
+                    if isinstance(delay, (int, float)) and not isinstance(delay, bool) and math.isfinite(delay) and delay >= 0:
+                        retry = {'phase': 'deferred', 'attempt': getattr(self.client, 'last_attempts', 0),
+                                 'wait_seconds': delay, 'next_retry_at': time.time() + delay,
+                                 'pre_accept': exc.pre_accept, 'cause': 'rate-limit', 'status': 429}
+                        self.task_state['retry'] = retry
+                        self.task_state['retry_not_before'] = retry['next_retry_at']
+                        self.last_run['retry'] = dict(retry)
+                    return self._finish('error', 'rate_limit', self._ui('LLM 请求失败：{v0}', v0=exc))
                 if isinstance(exc, IncompleteOutputError):
                     reason = 'context_limit' if getattr(exc, 'context_limited', False) else 'output_limit'
                     return self._finish('incomplete', reason, self._ui('LLM 请求失败：输出不完整：{v0}', v0=exc), False)
@@ -694,9 +770,9 @@ class Agent:
             self.task_state['active_seconds'] += time.monotonic() - self._segment_started
             self._segment_started = 0.0
             self._emit('segment_extension', self._task_budget())
-            remaining = self.config.max_task_calls - self.task_state['logical_calls']
-            return self._run_segment('[TASK_RESUME]\n' + load_prompt_file('task_resume.txt'), automatic=automatic,
-                                     resume=True, segment_steps=max(1, min(segment_steps, remaining)))
+            remaining = self.task_state['max_logical_calls'] - self.task_state['logical_calls']
+            return _NextSegment('[TASK_RESUME]\n' + load_prompt_file('task_resume.txt'),
+                                max(1, min(segment_steps, remaining)))
         return self._finish('limit', 'step_limit', self._ui('已达到最大模型请求次数；同一任务可用 /continue 开始新的受控段。'))
 
     def _can_extend_segment(self, require_progress=True):
@@ -974,6 +1050,7 @@ class Agent:
             child = Agent(child_config, approve=self.approve, client=child_client,
                           event=lambda kind, payload: self._emit(kind, {**payload, "subagent": identifier}),
                           base_system=base, allow_delegation=False)
+            child._parent_time_budget = self._request_seconds_remaining
             summary = child.run(task, auto_continue=False)
             status = child.last_run["status"]
             if child._approval_denied:
@@ -1042,7 +1119,7 @@ class Agent:
         for field in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"):
             observed = [item[field] for item in self._usage_history if item and field in item]
             totals[field] = sum(observed) if observed else None
-            missing[field] = len(self._usage_history) - len(observed)
+            missing[field] = max(self._total_calls, len(self._usage_history)) - len(observed)
         last_usage = self._usage_history[-1] if self._usage_history else None
         compression = {
             "enabled": self.config.rtk_enabled,
@@ -1094,7 +1171,8 @@ class Agent:
                          "step": self.last_run.get("steps", 0),
                          "segment": self.last_run.get("segment", self.task_state.get("segments", 0)
                                                        if isinstance(self.task_state, dict) else 0),
-                         "task_budget": self._task_budget()},
+                         "task_budget": self._task_budget(),
+                         "retry": deepcopy(self.last_run.get("retry"))},
                 "tool_schema_chars": len(json.dumps(self.tools, ensure_ascii=False, separators=(",", ":"))),
                 "request_history_chars": list(self._request_history_chars),
                 "current_history_chars": self._history_chars(),
