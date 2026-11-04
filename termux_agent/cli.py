@@ -1,6 +1,7 @@
 """Plain terminal REPL; no terminal UI framework."""
 import argparse
 import copy
+import hashlib
 import json
 import sys
 import os
@@ -14,7 +15,7 @@ from .instructions import load_instructions
 
 from .agent import Agent
 from .config import Config
-from .sessions import SessionStore, new_id, snapshot, restore, validate_title
+from .sessions import SessionStore, new_id, snapshot, restore, validate_title, has_unknown_tool_results
 from .skills import SkillRegistry
 from .api_profiles import ProfileStore
 from .terminal_ui import Columns, Completer, COMMANDS, format_context_status
@@ -23,6 +24,7 @@ from .display_privacy import WRITE_TOOLS, hide_write_payloads, safe_tool_argumen
 from .approval import reason as approval_reason
 from .history import history_entry
 from .i18n import text as ui_text, help_text
+from .security import child_environment
 
 HELP = """/help           显示命令帮助（Show commands）
 Tab             补全命令、API 配置、会话 ID 和技能名称
@@ -31,6 +33,7 @@ Tab             补全命令、API 配置、会话 ID 和技能名称
 /compact [N]    自动精简跨轮次历史，保留用户指令；指定 N 则只保留最近 N 轮
 /compact task [N]  压缩当前单任务工具链；保留最近 N 个完整工具组，不调用模型
 /continue [N]   从检查点继续同一任务，开始一个新的受控模型调用段
+continue/resume  未完成任务的简短续跑输入；不新建任务，引号内文字按原文发送
 /status         查看上次停止原因和继续方式
 /recall TEXT    在已保存会话正文和工具参数中检索，最多显示 20 个会话
 /export [ID] [markdown|json] [PATH]  导出会话；默认当前会话、Markdown、新文件
@@ -288,6 +291,14 @@ def main():
             if debug:
                 display({"segment_extension": payload}, "Progress")
             return
+        if kind == 'auto_resume':
+            wait = payload.get('wait_seconds') or 0
+            display(tr('自动续跑 {v0}/{v1}：{v2}', v0=payload['count'], v1=payload['max'], v2=payload['reason']) +
+                    (tr('；等待 {v0:g} 秒后继续', v0=wait) if wait else ''), 'Resume')
+            return
+        if kind == 'resume_routed':
+            display(tr('按 /continue 续跑原任务，不新建任务：{v0}', v0=payload.get('goal', '')), 'Resume')
+            return
         if kind == 'task_compacted':
             display(tr('已压缩上下文 {v0:,} → {v1:,} 字符；完整历史：{v2}', v0=payload['before_chars'], v1=payload['after_chars'], v2=payload['archive']) +
                     ('' if payload['persistent'] else tr('（仅内存；退出后丢失）')), 'Context')
@@ -315,7 +326,7 @@ def main():
             if elapsed >= 10 and shutil.which("termux-vibrate"):
                 try:
                     subprocess.Popen(["termux-vibrate", "-d", "100"], stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_environment())
                 except OSError:
                     pass
 
@@ -376,7 +387,7 @@ def main():
         store = None if options.no_session else SessionStore()
     except (OSError, sqlite3.Error) as exc:
         if agent is not None:
-            agent.client.close()
+            getattr(agent, 'close', agent.client.close)()
         parser.error(tr('Session store unavailable: {v0}', v0=exc))
     session_id, revision = new_id(), 0
 
@@ -407,7 +418,11 @@ def main():
                 "instructions": instructions, "instruction_path": instruction_path}
 
     def payload_fingerprint(value):
-        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        # The marker describes how a snapshot was written, not changed task data.
+        # A finish checkpoint must deduplicate the following ordinary save too.
+        data = {k: v for k, v in value.items() if k != 'checkpoint'}
+        encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
 
     def current_branch(archive_id=None):
         value = dict(branch_state) if active_branch else {
@@ -448,25 +463,24 @@ def main():
         if agent is not None and history_mode():
             return
         if store and agent is not None and (force or revision or len(agent.messages) > 1):
-            value = snapshot(agent, current_scope(), checkpoint=checkpoint)
+            branch = current_branch()
+            value = snapshot(agent, current_scope(), checkpoint=checkpoint, branch=branch)
             fingerprint = payload_fingerprint(value)
-            plain = snapshot(agent, current_scope(), checkpoint=checkpoint)
-            plain.pop('branch', None)
-            plain_fingerprint = payload_fingerprint(plain)
-            unchanged_source = not active_branch and plain_fingerprint == source_fingerprint
-            if not force and not checkpoint and (fingerprint == saved_fingerprint or unchanged_source):
-                return
+            if not force and not checkpoint:
+                if fingerprint == saved_fingerprint:
+                    return
+                if not active_branch:
+                    plain = {k: v for k, v in value.items() if k != 'branch'}
+                    if payload_fingerprint(plain) == source_fingerprint:
+                        return
             clear_draft = checkpoint and getattr(agent, 'last_run', {}).get('status') not in ('error', 'interrupted')
             if not active_branch:
-                branch = current_branch()
-                value['branch'] = branch
                 revision = store.save(session_id, revision, value, clear_draft=clear_draft)
                 active_branch, loaded_row = True, None
                 branch_state = branch
             else:
-                value['branch'] = current_branch()
                 revision = store.save(session_id, revision, value, clear_draft=clear_draft)
-            saved_fingerprint = payload_fingerprint(value)
+            saved_fingerprint = fingerprint
             # Fresh sessions need a real persisted archive ID before their first
             # automatic compaction; in-memory IDs are invalid SQLite session IDs.
             agent.archive_id = session_id
@@ -474,8 +488,6 @@ def main():
     def branch_after_compact(archive_id, messages, details):
         nonlocal session_id, revision, saved_fingerprint
         if not store:
-            agent.in_memory_archives.append({'id': archive_id,
-                                             'messages': copy.deepcopy(agent.messages)})
             return False
         title = current_title()
         value = snapshot(agent, current_scope(), branch=current_branch(archive_id))
@@ -533,26 +545,48 @@ def main():
         store.rename(session_id, title, revision)
         display(f"{session_id} · {title}", "Session")
 
+    def reset_session_io():
+        nonlocal stream_draft, draft_saved_at, read_grant
+        stream_draft, draft_saved_at, read_grant = {}, 0.0, False
+        tool_started.clear()
+
+    def reset_session_tracking(branch=None):
+        nonlocal session_id, revision, saved_fingerprint, active_branch
+        nonlocal loaded_row, source_fingerprint, branch_state, source_meta
+        session_id, revision = new_id(), 0
+        active_branch, loaded_row, source_fingerprint = True, None, None
+        branch_state, saved_fingerprint = branch or {'kind': 'active'}, None
+        source_meta = None
+        agent.archive_id = None
+        reset_session_io()
+
+    def start_new_session(next_config, next_instructions):
+        """Publish a fully built replacement only after saving the current session."""
+        nonlocal config, agent, language, instructions, registry
+        replacement = build_agent(next_config, next_instructions)
+        try:
+            save_current()
+            getattr(agent, 'close', agent.client.close)()
+        except BaseException as primary:
+            try:
+                getattr(replacement, 'close', replacement.client.close)()
+            except BaseException as cleanup:
+                primary.add_note('Replacement cleanup failed: ' + type(cleanup).__name__)
+            raise
+        config, agent = next_config, replacement
+        language, instructions = config.ui_language, next_instructions
+        registry = SkillRegistry()
+        reset_session_tracking()
+
     def switch_api(name, persist=False):
-        nonlocal language
-        nonlocal config, agent, session_id, revision, saved_fingerprint
-        nonlocal active_branch, loaded_row, source_fingerprint, branch_state
         candidate = Config.load(config_path, name)
         if name == config.api_profile and not history_mode():
             if persist:
                 profile_store.set_default(name)
             return False
-        save_current()
         if persist:
             profile_store.set_default(name)
-        replacement = build_agent(candidate, instructions)
-        getattr(agent, 'close', agent.client.close)()
-        config, agent = candidate, replacement
-        language = config.ui_language
-        session_id, revision = new_id(), 0
-        active_branch, loaded_row, source_fingerprint = True, None, None
-        branch_state, saved_fingerprint = {'kind': 'active'}, None
-        agent.archive_id = None
+        start_new_session(candidate, instructions)
         return True
 
     def show_session_listing(limit=50, query=None, empty_text=None):
@@ -691,13 +725,15 @@ def main():
             source_fingerprint = payload_fingerprint(snapshot(replacement, current_scope()))
         saved_fingerprint = payload_fingerprint(snapshot(replacement, current_scope(), branch=branch_state))
         replacement.archive_id = identifier
+        reset_session_io()
         registry = SkillRegistry()
         profile_store = ProfileStore(config_path)
         if history_mode():
             display(tr('历史查看模式：') + agent.client.reason + tr('可用 /history、/recall、/export 查看；用 /api NAME 新建会话，原历史保持保存。'), 'History')
         draft = store.draft(identifier)
         incomplete = agent.incomplete_draft
-        if payload.get('checkpoint') or draft or incomplete:
+        unfinished_checkpoint = payload.get('checkpoint') and agent.last_run.get('status') not in ('complete', 'idle')
+        if unfinished_checkpoint or draft or incomplete or has_unknown_tool_results(agent.messages):
             display(tr('恢复了未完成任务的检查点；工具状态不明时先核实实际结果。'), 'Recovery')
         if draft:
             display(tr('上次流式草稿（未完成，未加入模型上下文；/export 可完整导出）：\n') +
@@ -735,7 +771,11 @@ def main():
             return
         display(tr('Termux Agent — /help for commands'))
         display({"api": config.api_profile, "directory": str(directory), "agent_file": instruction_path, "session": session_id if store else "in-memory"})
-        display({"auto_continue": config.auto_continue, "max_steps": config.max_steps})
+        # Effective limits of the active profile: a key placed under another [apis.*]
+        # table silently falls back to defaults, and this line makes that visible.
+        display({"auto_continue": config.auto_continue, "max_steps": config.max_steps,
+                 "max_task_calls": config.max_task_calls, "max_task_seconds": config.max_task_seconds,
+                 "auto_resume": config.auto_resume_max if config.auto_continue and config.auto_resume else 0})
         if formatter.enabled:
             display(tr('Tab 补全命令和 ~/本地路径；文件路径回车提交文本。'))
         while True:
@@ -751,7 +791,7 @@ def main():
             if not prompt:
                 continue
             bare_command = BARE_COMMANDS.get(prompt.lower())
-            if bare_command:
+            if bare_command and not (bare_command in ('/continue', '/resume') and agent._resumable()):
                 display(tr(BARE_COMMAND_HINT, v0=prompt.lower(), v1=bare_command), 'Input')
                 continue
             if history_mode() and prompt.split(maxsplit=1)[0] not in (
@@ -778,14 +818,7 @@ def main():
                 display(help_text(HELP, language))
             elif prompt == "/clear":
                 try:
-                    save_current()
-                    replacement = build_agent(config, instructions)
-                    getattr(agent, 'close', agent.client.close)()
-                    agent = replacement
-                    session_id, revision = new_id(), 0
-                    active_branch, loaded_row, source_fingerprint = True, None, None
-                    branch_state, saved_fingerprint = {'kind': 'active'}, None
-                    agent.archive_id = None
+                    start_new_session(config, instructions)
                     display(tr('New session; previous conversation remains saved.'))
                 except (ValueError, OSError, sqlite3.Error) as exc:
                     display(tr('Error: {v0}', v0=exc))
@@ -883,7 +916,8 @@ def main():
                     elif value:
                         raise ValueError(tr('Use /auto on|off|steps N'))
                     display({"auto_continue": config.auto_continue, "max_steps": config.max_steps,
-                             "max_continuations": config.max_continuations})
+                             "max_continuations": config.max_continuations,
+                             "auto_resume": config.auto_resume_max if config.auto_continue and config.auto_resume else 0})
                 except ValueError as exc:
                     display(tr('Error: {v0}', v0=exc))
             elif prompt == "/run" or prompt.startswith("/run "):
@@ -980,11 +1014,7 @@ def main():
                     elif value != "reload":
                         next_file, next_disabled = value, False
                     text, source = load_instructions(directory, next_file, next_disabled)
-                    save_current()
-                    replacement = build_agent(config, text)
-                    agent.client.close()
-                    agent = replacement
-                    session_id, revision = new_id(), 0
+                    start_new_session(config, text)
                     instructions, instruction_path = text, source
                     session_file, disabled = next_file, next_disabled
                     display({"agent_file": source, "chars": len(text), "new_conversation": True})
@@ -1044,7 +1074,8 @@ def main():
                     command = shutil.which("termux-clipboard-set")
                     if not command:
                         raise RuntimeError("termux-clipboard-set is unavailable; install Termux:API")
-                    result = subprocess.run([command], input=text, text=True, capture_output=True, timeout=10)
+                    result = subprocess.run([command], input=text, text=True, capture_output=True, timeout=10,
+                                            env=child_environment())
                     if result.returncode:
                         raise RuntimeError(result.stderr.strip() or "clipboard write failed")
                     display(tr('Copied to Android clipboard.') if text else tr('Nothing to copy.'))
@@ -1056,7 +1087,8 @@ def main():
                     display(tr('termux-clipboard-get is unavailable; install Termux:API'))
                     continue
                 try:
-                    result = subprocess.run([command], text=True, capture_output=True, timeout=10, check=True)
+                    result = subprocess.run([command], text=True, capture_output=True, timeout=10, check=True,
+                                            env=child_environment())
                     if len(result.stdout) > config.max_output_chars:
                         display(result.stdout[:config.max_output_chars] + tr('\n[TRUNCATED]'))
                     else:
@@ -1164,11 +1196,10 @@ def main():
                         if history_mode():
                             raise ValueError(tr('历史查看模式保留原快照；请用 /api NAME 新建可用会话。'))
                         if command == "new":
+                            start_new_session(config, instructions)
+                        else:
                             save_current()
-                            replacement = build_agent(config, instructions)
-                            getattr(agent, 'close', agent.client.close)()
-                            agent = replacement
-                        session_id, revision = new_id(), 0
+                            reset_session_tracking({'kind': 'active', 'source_session_id': session_id})
                         save_current(force=True)
                         if value:
                             store.rename(session_id, value)

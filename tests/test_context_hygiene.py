@@ -23,9 +23,9 @@ def group(index,size=6000,name='read_file',result=None):
                                                        'execution_status':'executed'})]
 
 
-def history():
+def history(groups=6):
     messages=[{'role':'system','content':'rules'}]
-    for i in range(6):
+    for i in range(groups):
         messages.extend([{'role':'user','content':f'constraint-{i}'},*group(i),
                          {'role':'assistant','content':f'conclusion-{i}'}])
     return messages
@@ -52,11 +52,12 @@ class ContextHygieneTests(unittest.TestCase):
         self.assertLess(context_chars(reduced),context_chars(messages))
 
     def test_default_cleanup_is_below_threshold_and_only_at_new_human_boundary(self):
-        a=self.make();a.messages=history()
+        a=self.make();keep=a.config.tool_history_keep_groups
+        a.messages=history(keep+4)  # four groups more than the default retention
         before=copy.deepcopy(a.messages)
         self.assertLess(context_chars(before,a.tools),a.config.max_context_chars*.75)
         self.assertEqual(a.run('new task'),'done')
-        self.assertEqual(sum(m['role']=='tool' for m in a.client.sent[0]),2)
+        self.assertEqual(sum(m['role']=='tool' for m in a.client.sent[0]),keep)
         self.assertEqual(len(a.in_memory_archives),1)
         self.assertEqual(a.in_memory_archives[0]['messages'][:-1],before)
         self.assertEqual(a.task_state['compactions'],1)
@@ -113,7 +114,7 @@ class ContextHygieneTests(unittest.TestCase):
         self.assertLess(len(memos[0]['content']),10000)
 
     def test_archive_failure_stops_before_send_and_preserves_full_input(self):
-        a=self.make();a.messages=history();before=copy.deepcopy(a.messages)
+        a=self.make();a.messages=history(a.config.tool_history_keep_groups+4);before=copy.deepcopy(a.messages)
         def fail(*args):raise OSError('archive failed')
         a.branch_after_compact=fail
         with self.assertRaises(OSError):a.run('next task')

@@ -45,14 +45,15 @@ timeout = 120.0
 retry_max_attempts = 3
 retry_wait_budget = 20.0
 retry_total_timeout = 0.0 # 0 reuses timeout; set a separate pre-accept retry deadline if needed
+max_response_bytes = 16777216 # received body cap, 16 MiB; configurable per API
 stream = true
 silent_writes = true
 
 auto_compact = true
 auto_compact_threshold = 0.75
 auto_compact_keep_turns = 2
-auto_compact_keep_groups = 2
-tool_history_keep_groups = 2 # earlier completed turns; 0 disables proactive cleanup
+auto_compact_keep_groups = 6
+tool_history_keep_groups = 6 # earlier completed tasks; 0 disables proactive cleanup
 
 [apis.local]
 kind = "local"
@@ -72,6 +73,12 @@ wire_api = "responses" # or "chat_completions" (default)
 token_count_mode = "estimate"
 # context_window_tokens = 32768 # set the actual window supported by your endpoint
 ```
+
+A comment such as `# Cloud API` does **not** end a TOML table. Keys placed after
+`[apis.local]` still belong to local until another table header appears. Put shared
+limits before the first table, or cloud-only limits explicitly inside
+`[apis.cloud]`. Check `/config` and the startup line for the effective profile's
+call/time/recovery limits rather than assuming the file's visual grouping applies.
 
 `base_url` is the API root, such as `/v1`; the client appends `/responses` or
 `/chat/completions`. Responses supports JSON/SSE, tool calls, reasoning history,
@@ -96,12 +103,13 @@ refuses the active profile, and retains a recovery copy.
 ## Context management and status
 
 At a new human-task boundary, `tool_history_keep_groups` proactively reduces
-older complete tool groups even below the budget threshold. It defaults to 2
+older complete tool groups even below the budget threshold. It defaults to 6
 and accepts 0–100 globally or per API profile; 0 disables this cleanup. All human
-instructions, final answers, the current human turn's complete tool chain, recent
+instructions, final answers, the current task's complete tool chain, recent
 groups and unknown side effects are retained. Reduction uses the same archive
-branch mechanism and never replays a tool. `/continue` does not trigger this
-new-task cleanup or repeatedly create a new archive at every tool step.
+branch mechanism and never replays a tool. `/continue` and short resume-only input
+such as `继续执行` or `keep going` are not new task boundaries, including in legacy
+histories; they do not trigger new-task cleanup.
 
 Before every model request, automatic compaction checks both the character guard
 and, when known, the token window minus reserved output. It starts at **75%** by
@@ -116,6 +124,10 @@ results become bounded artifact references; older answers may become labeled
 excerpts if needed. Retained reasoning/protocol items are unchanged. This is a
 local deterministic reduction, without an extra summarization API call; excerpts
 are not a complete semantic summary. Missing facts must be recovered explicitly.
+Budget-driven reduction prefers `auto_compact_keep_groups` (default 6), then half
+that depth, then 1, choosing the deepest candidate that reaches the target. Six
+is a preference, not a hard floor or a percentage-of-window allocation. Existing
+explicit values such as 2 still override the new defaults.
 
 - `/compact`: run the same cross-turn reduction manually.
 - `/compact N`: explicitly retain only the latest N human turns (1–100).
@@ -165,8 +177,11 @@ Unexpected exits from a running segment mark it interrupted and attempt a
 checkpoint without masking the original failure. Checkpoint write errors still
 stop execution. A saved `running` snapshot is repaired in memory when restored,
 without rewriting its original database row. Hard termination cannot run cleanup,
-so restoration provides that fallback. Continuation keeps existing task budgets
-and unknown tool outcomes; it does not grant fresh execution authority.
+so restoration provides that fallback. Continuation keeps the real goal, unspent
+budgets and unknown tool outcomes; it does not grant fresh execution authority.
+An explicit continuation after a budget stop can reopen a spent window under the
+current settings, without changing the task ID. This does not restart a killed
+process unattended; start `ta`, restore the session and continue it.
 
 Repeated `/continue` does not stack identical resume controls. A pending human
 message remains unchanged rather than being merged with controller text; an
@@ -209,15 +224,61 @@ bodies in tool displays while retaining the real protocol data and approvals.
 Approval policies: `always` asks for each tool, `on-risk` asks for recognized
 risky operations, and `never` disables prompts. Approval matching is a heuristic,
 not filesystem isolation. Noninteractive calls requiring approval are denied.
+Command wrappers, reordered deletion flags, package installs and shell configuration
+writes are inspected. Unparsed/evaluated syntax is handled conservatively and may
+prompt for harmless quoted or commented text. File tools and approval share path
+handling for `~`, fullwidth `～` and relative paths. `$VAR` is literal in file-tool
+paths and is never expanded from the agent's environment.
 
-`/run TASK` or `/auto on` enables bounded continuous execution; persistent settings
-are `auto_continue = true`, `max_steps`, and `max_continuations` (default 3).
-`/continue [N]` resumes a task segment. `max_task_calls` (32), `max_task_seconds`
-(600), and optional `max_task_tokens` bound the task across segments; time limits
-are checked at request/tool boundaries. `auto_extend_segments = true` permits
-progress-based segment extension within those limits. `context_recovery = true`
-allows one retry after a pre-accept context error and successful reduction.
-Incomplete output remains a draft and never executes incomplete tools.
+Agent config/data, custom loaded config files, SSH files and Git hooks are protected
+under `on-risk`: writes and commands with those paths as arguments require approval,
+with exceptions for a small set of obvious readers. Shell, Lightpanda, RTK and Termux API
+children inherit ordinary runtime variables but exclude configured API-key names,
+common API-key/token variables, aliases of credential values at least 16 characters
+long, and `BASH_ENV`/`ENV`. Named credentials are removed even when their values are short.
+The LLM client's credentials and the parent environment are unchanged. These
+checks do not restrict user-authorized programs' access to local files.
+
+`/run TASK` or `/auto on` enables continuous execution; `auto_continue = true`
+persists that mode. `max_steps` bounds a segment and `max_continuations` (default
+3) bounds no-tool nudges. `/continue [N]` resumes the same task from checkpoints.
+A short, unquoted resume-only phrase such as `继续执行`, `continue`, `resume` or
+`keep going` routes to that same path when the task is unfinished and resumable:
+it retains the task ID, original goal and active history. Phrases with additional
+instructions, such as `继续执行，但先备份`, start a new task. A bare resume does not
+restart a task whose result explicitly disallows continuation.
+
+For automatic tasks, `auto_resume = true` (default) enables an outer recovery
+loop. `auto_resume_max = 8` bounds automatic resumes per run or explicit
+continuation (0–50; 0 disables), and `auto_resume_max_wait = 300.0` bounds each
+recovery delay (0–3600 seconds). Classified pre-accept temporary network/provider
+failures and rate limits can resume after backoff; saved server cooldowns are
+respected, including exhausted/final 5xx attempts and shared-worker cooldowns.
+Repeated failures stop after four recovery attempts without tool progress.
+Recovery count, wait/reason and effective active-profile limits are displayed;
+final stop notes and counts are checkpointed. Normal chat and workers do not
+activate this loop.
+
+`max_task_calls` (32) and `max_task_seconds` (600 active seconds) bound a budget
+window across segments; checks occur at request/tool boundaries. With new
+successful tool evidence, automatic resumption can renew a spent call/time
+window, at most `auto_resume_max` times. Thus these are **not fixed task-wide
+caps when auto-resume is enabled**: the default ceiling is nine call/time
+windows. Execution and automatic retry waits both consume the time window;
+manual idle time does not. A cooldown that cannot fit the remaining window stops
+recovery rather than being shortened. Set `auto_resume = false` for fixed
+call/time caps. An optional `max_task_tokens`
+cap remains cumulative across automatic windows; explicit user continuation
+after a budget stop can reopen spent call/time/token budgets under current
+settings. Unknown writes and approval restrictions are never reset by renewal.
+
+`auto_extend_segments = true` extends segments within a window after tool
+progress. `context_recovery = true` allows one retry after a pre-accept context
+error and successful reduction. Completion, user/provider blockers, approval
+denial, non-novel progress at a limit, token caps, unrecoverable context limits,
+incomplete output and permanent/malformed failures stop unattended recovery.
+Incomplete output remains a draft and never executes incomplete tools. All
+recovery is best effort, not a guarantee of uninterrupted execution.
 
 Transient HTTP 500/502/503/504, classified structured 429 responses and eligible
 connection failures share bounded retries. `retry_max_attempts` counts all HTTP
@@ -226,6 +287,12 @@ waiting per logical call (0–3600 seconds; default 20). `retry_total_timeout` s
 the total pre-accept operation deadline, including waits (0–3600; 0 reuses
 `timeout`). Each attempt also respects `timeout`. Remaining task time further
 limits retries, including inside delegated workers.
+
+After acceptance, `timeout` remains the body-read idle timeout even when the
+pre-accept retry deadline was shorter. `max_response_bytes` bounds received JSON
+and SSE bodies (default 16 MiB, range 1 KiB–64 MiB, including SSE framing and
+terminal events). Exceeding it stops with `response_limit`; partial stream output
+stays a draft and its tools are not executed or automatically replayed.
 
 Temporary rate limits use slower exponential backoff with jitter. Standard
 `Retry-After` / `retry-after-ms` take priority; valid token/request reset hints
@@ -239,20 +306,27 @@ deadline. Task hard limits still apply.
 
 Waiting state, HTTP-attempt counters and observed active time are checkpointed.
 `/status` reports `rate_limit`, the cooldown and continuation hint when attempts
-are exhausted. `/continue` keeps the goal/budgets and honors a saved future
-cooldown before sending. Task segments extend iteratively rather than recursively.
-Accepted responses and partial streams are not automatically replayed, including
-in-stream rate-limit failures. A stream ending without a completion marker stays
-a draft; its tools are not executed. Errors retain credential redaction.
+are exhausted. `/continue` keeps the goal and unspent budgets and honors a saved
+future cooldown before sending, including when reopening a spent budget window.
+Task segments extend iteratively rather than recursively. Only pre-accept
+failures may trigger unattended retries. Accepted-body errors and interrupted
+streams stop automatic recovery, even for a rate-limit/temporary failure event;
+available partial text/tool arguments stay in an inert draft, never executable
+history. Permanent runtime deadline-setup refusals (for example, a non-main thread
+or an existing process alarm) also stop without retry waits. Errors retain
+credential redaction; structured diagnostics record acceptance, exception type,
+available HTTP status and calls since the latest in-process compaction, without
+inferring that compaction caused the failure.
 `retry_thinking_400` is a separate per-profile opt-in for a known thinking-format
 error, disabled by default.
 
-In the REPL, the exact bare words `continue`, `clear`, `compact`, `status`,
-`help`, `exit` and `resume` show their slash-command equivalents without starting
-a new task or executing the command. Matching ignores case and surrounding
-whitespace. To send such a word as text, quote it or use a complete sentence;
-explicit `/run continue`, `--prompt continue`, and text-file submissions keep
-their normal behavior.
+In the REPL, bare `continue` and `resume` resume an unfinished, resumable task;
+otherwise they show the slash-command hint (`/resume` still selects a saved
+session). Bare `clear`, `compact`, `status`, `help` and `exit` always show hints
+rather than executing commands. Matching ignores case and surrounding whitespace.
+To send a resume word literally, quote it, for example `"continue"`, or provide a
+full instruction. Explicit `/run`, `--prompt` and text-file submissions use the
+normal agent input path, including resume detection when an unfinished task exists.
 
 Interactive output uses timestamps, role columns and terminal-width wrapping,
 including CJK text. SecureCRT Backspace/Delete and persistent readline history
@@ -286,6 +360,8 @@ Startup loads no Skills. Search paths are `~/.hermes/skills/`, `./skills/`, and
   a time and review its result before planning the next.
   Deferred cooldowns are shared with the parent and subsequent workers using
   that same API, so another delegation cannot skip a known wait.
+  Worker reservations are checkpointed per parent task: `/continue` and restoration
+  retain the count; a new human task or explicit `/sub` gets a fresh task count.
 - **Web:** optional Lightpanda `web_fetch`, disabled by default. See
   [setup, contract and acceptance](docs/web-fetch.md).
 - **RTK:** optional shell-output reduction, disabled by default. Install native
@@ -295,6 +371,8 @@ Startup loads no Skills. Search paths are `~/.hermes/skills/`, `./skills/`, and
   command runs once. Exit status/stderr remain intact; failures use raw output.
   Full bounded output is kept privately under `output-artifacts/` for recovery.
   `/stats` reports applied UTF-8 byte/character savings, not measured token savings.
+  Model requests receive a smaller compression receipt; saved history retains
+  full diagnostics and recovery references.
 
 RTK raw artifacts expose UTF-8 `stdout_text` / `stderr_text`, bounded to 1 MiB per
 capture. The private archive has an 8 MiB / 32-file best-effort retention limit,

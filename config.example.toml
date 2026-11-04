@@ -1,11 +1,12 @@
 default_api = "local"
+ui_language = "zh" # "zh" or "en"; CLI display only
 base_url = "http://192.168.86.244:8085/v1"
 model = "Qwen3.8-27B-MTPLX-Speed"
 max_steps = 16
 auto_continue = false
 max_continuations = 3
 max_subagents = 3 # per parent task; 0 disables delegation
-subagent_max_steps = 6 # each child, capped by max_steps; no recursion
+subagent_max_steps = 3 # total logical calls per child; no automatic extension or nested delegation
 web_fetch_enabled = false # optional; needs an existing Lightpanda executable
 lightpanda_binary = "" # empty: TERMUX_AGENT_LIGHTPANDA, then PATH; supports ~/bin/lightpanda
 rtk_enabled = false # opt-in model-shell output reduction; repository default is off
@@ -13,13 +14,21 @@ rtk_binary = "" # empty: TERMUX_AGENT_RTK, then PATH; supports ~/bin/rtk; per-pr
 max_output_chars = 20000 # single tool-output char cap; 128..1000000 (25000 valid); not context tokens
 max_input_file_chars = 64000
 max_context_chars = 500000 # serialized messages + schemas char guard; default 500000; per-profile override allowed
-max_task_calls = 32 # model calls in one logical task, including recovery calls
-max_task_seconds = 600.0 # active execution budget; checked at request/tool-batch boundaries
-max_task_tokens = 0 # 0 disables the task token cap; otherwise cumulative reported/estimated tokens
-auto_extend_segments = false # continue after max_steps only when the segment made progress
+max_task_calls = 32 # logical model calls per budget window, including context recovery calls
+max_task_seconds = 600.0 # execution + automatic retry-wait seconds per window; excludes manual idle time
+max_task_tokens = 0 # 0 disables the cap; automatic resumption never resets cumulative tokens
+auto_extend_segments = false # extend max_steps within the current window after tool progress
+auto_resume = true # only active for /run or auto_continue=true; bounded best-effort recovery
+auto_resume_max = 8 # automatic resumes per run/explicit continuation; 0 disables (range 0..50)
+auto_resume_max_wait = 300.0 # maximum delay for one automatic resume (0..3600 seconds)
+# With new tool progress, auto-resume may renew spent call/time windows, at most auto_resume_max times.
+# Disable auto_resume for a fixed task-wide call/time cap. Explicit /continue can reopen spent budgets.
+auto_compact = true
+auto_compact_keep_turns = 2
+tool_history_keep_groups = 6 # older completed human tasks; 0 disables cleanup; bare resumes aren't new tasks
 auto_compact_task = false # archive-and-branch one task when the threshold is reached
-auto_compact_keep_groups = 2 # most recent complete tool groups retained verbatim
-auto_compact_threshold = 0.85 # max of character and token-window ratios; 0.5..0.95
+auto_compact_keep_groups = 6 # prefer this many recent complete groups; fall back to half, then 1 if needed
+auto_compact_threshold = 0.75 # max of character and token-window ratios; 0.5..0.95
 context_recovery = false # allow one pre-accept context recovery after a real compaction
 no_progress_detection = false # stop repeated identical call/argument/result loops
 no_progress_threshold = 3 # consecutive identical tool groups; 2..20
@@ -27,6 +36,8 @@ approval_policy = "on-risk"
 silent_writes = true
 timeout = 120.0
 retry_wait_budget = 20.0
+retry_total_timeout = 0.0 # pre-accept deadline; 0 reuses timeout; accepted-body idle timeout stays timeout
+max_response_bytes = 16777216 # 16 MiB received body cap; 1024..67108864, per-profile override allowed
 retry_max_attempts = 3 # includes the initial request; 1–6, per-profile override allowed
 # Defaults to false; enable only for a profile confirmed to return the known error.
 # retry_thinking_400 = false
@@ -48,12 +59,11 @@ model = "Qwen3.8-27B-MTPLX-Speed"
 api_key_env = "TERMUX_AGENT_API_KEY"
 
 [apis.cloud]
-base_url = "https://agentrouter.org/v1"
-model = "deepseek-v4-flash"
-api_key_env = "AGENTROUTER_API_KEY"
-user_agent = "claude-cli/2.1.119 (external, cli)"
+base_url = "https://your-provider.example/v1"
+model = "your-cloud-model-id"
+api_key_env = "CLOUD_API_KEY"
 timeout = 300.0
-# Use for an AgentRouter model/route requiring the Responses endpoint:
+# Use for a provider/model requiring the Responses endpoint:
 # wire_api = "responses"
 # Per-profile opt-in; uncomment only if this API returns the known error.
 # retry_thinking_400 = true

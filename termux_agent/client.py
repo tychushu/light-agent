@@ -10,8 +10,9 @@ from typing import Any, Callable
 
 import httpx
 from .continuation import MarkerFilter
-from .retry import (RetryDeadlineError, backoff, rate_limit_error, rate_limit_axis, request_deadline,
-                    server_retry_delay, thinking_echo_error)
+from .streaming import iter_sse_data, response_chunks, limited_draft
+from .retry import (RetryDeadlineError, RetryDeadlineSetupError, backoff, rate_limit_error,
+                    rate_limit_axis, request_deadline, server_retry_delay, thinking_echo_error)
 
 
 def upstream_error_fields(value):
@@ -46,16 +47,35 @@ def upstream_error_text(value, api_key='', limit=300):
     return text[:limit]
 
 
+def is_context_error(value):
+    error = upstream_error_fields(value)
+    code = str(error.get('code', '')).lower()
+    text = str(error.get('message', '')).lower()
+    return code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long',
+                    'context_shift', 'context_shift_error') or any(
+        phrase in text for phrase in ('maximum context length', 'context length exceeded',
+                                     'context window exceeded', 'prompt is too long',
+                                     'context shift', 'input truncated to fit context'))
+
+
 class ClientError(RuntimeError):
     pass
 
 
 class ProviderError(ClientError):
-    pass
+    def __init__(self, text, *, pre_accept=None, transient=None, retry_after_seconds=None):
+        super().__init__(text)
+        self.pre_accept = pre_accept
+        self.transient = transient
+        self.retry_after_seconds = retry_after_seconds
 
 
 class NetworkError(ClientError):
-    pass
+    def __init__(self, text, *, pre_accept=True, transient=True, retry_after_seconds=None):
+        super().__init__(text)
+        self.pre_accept = pre_accept
+        self.transient = transient
+        self.retry_after_seconds = retry_after_seconds
 
 
 class RateLimitError(ProviderError):
@@ -90,6 +110,10 @@ class StreamInterruptedError(IncompleteOutputError):
     """An accepted stream ended without proof of completion, not a token cap."""
 
 
+class ResponseLimitError(IncompleteOutputError):
+    """Local receive cap; never a reason to replay an accepted response."""
+
+
 class Client:
     RETRYABLE_STATUS = {500, 502, 503, 504}
     # Only used while sending/receiving headers, never during successful body reads.
@@ -109,15 +133,28 @@ class Client:
         self.on_retry: Callable[[dict[str, Any]], None] | None = None
         self.last_attempts = 0
         self.on_stream: Callable[[str, str], None] | None = None
-        self.last_request: dict[str, Any] | None = None
+        self._last_request = None
+        self._last_request_wire = None
         self.last_usage: dict[str, Any] | None = None
         self.streamed = False
         self.streamed_text = False
+        self.last_accepted = False
         self.last_finish_reason = None
         self.context_limited = False
         self.control_markers = ()
         self._marker_filter = None
         self._remaining_budget = self._retry_state = self._initial_cooldown = None
+
+    @property
+    def last_request(self):
+        # Keep the immutable bytes already needed by retries; decode only for debug.
+        if self._last_request is None and self._last_request_wire is not None:
+            self._last_request = json.loads(self._last_request_wire)
+        return self._last_request
+
+    @last_request.setter
+    def last_request(self, value):
+        self._last_request, self._last_request_wire = value, None
 
     def set_retry_hooks(self, *, remaining_seconds=None, on_progress=None, initial_cooldown=None):
         self._remaining_budget, self._retry_state = remaining_seconds, on_progress
@@ -234,12 +271,13 @@ class Client:
             if body["stream"] and getattr(self.config, "chat_include_usage", False):
                 body["stream_options"] = {"include_usage": True}
             url = self.config.base_url.rstrip("/") + "/chat/completions"
-        self.last_request = deepcopy(body)
+        self.last_request = None
         self.last_attempts = 0
         self.last_usage = None
         self.last_finish_reason = None
         self.context_limited = False
         self.streamed = self.streamed_text = False
+        self.last_accepted = False
         self._marker_filter = MarkerFilter(self.control_markers) if self.control_markers else None
         headers = {"Content-Type": "application/json", "User-Agent": self.config.user_agent}
         if self.config.api_key:
@@ -258,13 +296,14 @@ class Client:
                 return self._chat_attempts(body, url, headers, thinking_retry, deadline, accepted)
         except RetryDeadlineError as exc:
             self._check_owner_budget()
-            raise NetworkError(str(exc)) from None
+            raise NetworkError(str(exc), transient=not isinstance(exc, RetryDeadlineSetupError)) from None
 
     def _chat_attempts(self, body, url, headers, thinking_retry, deadline, accepted):
         waited = 0.0
         # Serialize once so every HTTP attempt carries the same bytes, even if
         # a caller modifies its original message objects while we are waiting.
         wire = self._http.build_request("POST", url, json=body, headers=headers).content
+        self._last_request_wire = wire
         max_attempts = getattr(self.config, "retry_max_attempts", 3)
         if self._initial_cooldown:
             delay = self._initial_cooldown()
@@ -278,7 +317,10 @@ class Client:
                 if remaining <= 0:
                     raise NetworkError("LLM retry deadline exceeded")
                 request = self._http.build_request("POST", url, content=wire,
-                                                   headers=headers, timeout=min(remaining, self.config.timeout))
+                                                   headers=headers, timeout=httpx.Timeout(
+                                                       self.config.timeout,
+                                                       connect=min(remaining, self.config.timeout),
+                                                       pool=min(remaining, self.config.timeout)))
                 self.last_attempts = attempt + 1
                 if self._retry_state:
                     self._retry_state({'phase': 'request', 'attempt': self.last_attempts,
@@ -337,23 +379,32 @@ class Client:
                 # Once a valid successful response is accepted, use ordinary
                 # body-read timeouts; no path below can restart the request.
                 accepted()
+                self.last_accepted = True
                 if body["stream"]:
                     self.streamed = True
                     return self._checked_message(self._read_sse(response))
-                response.read()
-                result = response.json()
+                raw = b''.join(response_chunks(response, self.config.max_response_bytes))
+                result = json.loads(raw)
                 return self._checked_message(self._message(result))
             except httpx.HTTPStatusError as exc:
                 raise self._classified_error(exc.response) from None
-            except httpx.TimeoutException:
-                raise NetworkError("LLM response timed out") from None
+            except httpx.TimeoutException as exc:
+                raise self._response_failure(exc, "LLM response timed out") from None
             except httpx.RequestError as exc:
-                raise NetworkError(f"LLM response interrupted ({type(exc).__name__})") from None
+                raise self._response_failure(exc, f"LLM response interrupted ({type(exc).__name__})") from None
             except ValueError:
-                raise ProviderError("LLM endpoint returned invalid JSON") from None
+                raise ProviderError("LLM endpoint returned invalid JSON", pre_accept=not self.last_accepted,
+                                    transient=False) from None
             finally:
                 response.close()
         raise NetworkError("LLM request failed after retries")
+
+    def _response_failure(self, source, text):
+        error = NetworkError(text, pre_accept=not self.last_accepted)
+        draft = getattr(source, 'assistant_message', None)
+        if isinstance(draft, dict):
+            error.assistant_message = draft
+        return error
 
     def _wait_retry(self, attempt, error, cause, status, after, deadline, waited, *, minimum_delay=None, axis=None):
         self._check_owner_budget()
@@ -370,7 +421,7 @@ class Client:
         def exhausted(message):
             if rate_limited:
                 return RateLimitError(message, retry_after_seconds=delay)
-            return NetworkError(message)
+            return NetworkError(message, retry_after_seconds=delay)
         if delay > budget or delay >= remaining:
             raise exhausted(f"{error}; retry budget exhausted (required wait {delay:g}s)")
         info = {"attempt": attempt + 2, "max_attempts": getattr(self.config, "retry_max_attempts", 3),
@@ -423,11 +474,7 @@ class Client:
                 if isinstance(error, dict):
                     code = str(error.get('code', '')).lower()
                     text = str(error.get('message', '')).lower()
-                    if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long',
-                                'context_shift', 'context_shift_error') or any(
-                            phrase in text for phrase in ('maximum context length', 'context length exceeded',
-                                                         'context window exceeded', 'prompt is too long',
-                                                         'context shift', 'input truncated to fit context')):
+                    if is_context_error(data):
                         return ContextLengthError('上下文超过模型窗口；请使用 /compact task 归档并缩短当前任务，'
                                                   '/compact N 保留最近轮次，或 /clear 新建会话。')
                     if code == 'content-blocked' or 'content-blocked' in text:
@@ -437,7 +484,9 @@ class Client:
                         )
             except ValueError:
                 pass
-        return ProviderError(diagnostic)
+        retryable = response.status_code in self.RETRYABLE_STATUS
+        delay = server_retry_delay(response.headers, self._wall_clock()) if retryable else None
+        return ProviderError(diagnostic, pre_accept=True, transient=retryable, retry_after_seconds=delay)
 
     def _checked_message(self, message):
         content = message.get('content')
@@ -512,9 +561,11 @@ class Client:
         detail = ': '.join(filter(None, (upstream_error_text(fields.get('code', ''), self.config.api_key, 80),
                                         upstream_error_text(fields.get('message', ''), self.config.api_key, 300))))
         label = 'LLM response error' + (': ' + detail if detail else '')
+        if is_context_error(value):
+            return ContextLengthError(label, pre_accept=False)
         if rate_limit_error(value):
             return RateLimitError(label, pre_accept=False)
-        return ProviderError(label)
+        return ProviderError(label, pre_accept=False, transient=False)
 
     def _apply_local_response_flags(self, result, message=None):
         values = [result]
@@ -546,7 +597,6 @@ class Client:
             return read_sse(self, response)
         content, reasoning = [], []
         calls: dict[int, dict[str, Any]] = {}
-        data_lines = []
         usage = None
         finish = None
         local_flags = False
@@ -600,7 +650,7 @@ class Client:
                 if not isinstance(index, int):
                     continue
                 call = calls.setdefault(index, {"id": "", "type": "function",
-                                                "function": {"name": "", "arguments": ""}})
+                                                "function": {"name": [], "arguments": []}})
                 for field in ("id", "type"):
                     value = item.get(field)
                     if isinstance(value, str):
@@ -609,17 +659,19 @@ class Client:
                 for field in ("name", "arguments"):
                     value = function.get(field) if isinstance(function, dict) else None
                     if isinstance(value, str):
-                        call["function"][field] += value
+                        call["function"][field].append(value)
 
-        for line in response.iter_lines():
-            if not line:
-                if data_lines:
-                    consume("\n".join(data_lines))
-                    data_lines.clear()
-            elif line.startswith("data:"):
-                data_lines.append(line[5:].lstrip())
-        if data_lines:
-            consume("\n".join(data_lines))
+        def finish_calls():
+            return [{**calls[index], 'function': {
+                key: ''.join(value) for key, value in calls[index]['function'].items()}}
+                for index in sorted(calls)]
+
+        try:
+            for data in iter_sse_data(response, self.config.max_response_bytes):
+                consume(data)
+        except Exception as exc:
+            exc.assistant_message = limited_draft(''.join(content), ''.join(reasoning), finish_calls())
+            raise
         if not saw_choice or not (content or reasoning or calls or finish):
             raise ClientError("LLM endpoint returned no assistant choices in SSE; possible gateway response")
         if self._marker_filter is not None:
@@ -633,7 +685,7 @@ class Client:
         if reasoning:
             message["reasoning_content"] = "".join(reasoning)
         if calls:
-            message["tool_calls"] = [calls[index] for index in sorted(calls)]
+            message["tool_calls"] = finish_calls()
         if not finish and not saw_done:
             if calls:
                 message['_incomplete_tool_calls'] = message.pop('tool_calls')

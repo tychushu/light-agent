@@ -14,3 +14,6 @@ config.toml
 *.sqlite3-*
 .DS_Store
 ._*
+
+# Private local migration evidence and diagnostics; never publish with source
+.local-history/

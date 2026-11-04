@@ -6,15 +6,17 @@ import json
 import hashlib
 from copy import deepcopy
 from dataclasses import replace
+import re
 import time
 import math
 import uuid
 from typing import Any, Callable
 
 from .client import (Client, ClientError, ContextLengthError, EmptyResponseError,
-                     IncompleteOutputError, NetworkError, RateLimitError, StreamInterruptedError)
+                     IncompleteOutputError, NetworkError, ProviderError, RateLimitError,
+                     StreamInterruptedError, ResponseLimitError)
 from .context import (compact_task_messages, compact_context_messages,
-                      compact_tool_history_messages, context_chars)
+                      compact_tool_history_messages, context_chars, task_starts)
 from .token_budget import TokenCounter, estimate_text_tokens
 from .i18n import text as ui_text
 from .tools import TOOLS, DELEGATE_TOOL, WEB_FETCH_TOOL, execute, web_fetch_available
@@ -23,7 +25,10 @@ from .output_compression import OutputCompressor, stable_result_payload
 from .approval import needs_approval
 from .instructions import load_system_prompt, load_prompt_file
 from .display_privacy import hide_write_payloads
-from .continuation import TASK_MARKERS, provider_blocked, task_status
+from .continuation import (TASK_MARKERS, control_prompt, is_resume_text,
+                           provider_blocked, task_status)
+from .paths import normalize_tool_args
+from .model_input import project_tool_messages
 
 
 OUTPUT_COMPRESSION_COUNTERS = (
@@ -67,7 +72,6 @@ class Agent:
             delegate_tool['function']['parameters']['properties']['max_steps']['maximum'] = min(
                 config.subagent_max_steps, config.max_steps, config.max_task_calls)
             self.tools.append(delegate_tool)
-        self._subagents_this_run = 0
         self._subagent_calls_total = 0
         self._subagent_api_calls_total = 0
         self._subagent_tool_calls_total = 0
@@ -75,6 +79,7 @@ class Agent:
         self.system = self.base_system
         self._direct_shell_count = 0
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self.system}]
+        self._tool_projection_cache = {}
         self._total_calls = 0
         self._tool_calls_total = 0
         self._tool_calls_executed = 0
@@ -116,6 +121,11 @@ class Agent:
         self._segment_progress = False
         self._task_progress = False
         self._last_progress_evidence = None
+        # Auto-resume only trusts progress it has not already seen in this task.
+        self._segment_novel = False
+        self._seen_progress = set()
+        self._sleep = time.sleep
+        self._last_compaction_call = None
         self._unsafe_write_fingerprints = self._scan_unsafe_writes(self.messages)
         self.last_run = self._idle_run(config.ui_language)
         self._parent_time_budget = None
@@ -299,7 +309,8 @@ class Agent:
                            'segments': 0, 'logical_calls': 0, 'max_logical_calls': self.config.max_task_calls,
                            'max_active_seconds': self.config.max_task_seconds, 'max_tokens': self.config.max_task_tokens,
                            'tokens': 0, 'token_source': 'unknown', 'token_budget_exact': True,
-                           'recovery_requests': 0, 'compactions': 0, 'progress_evidence': []}
+                           'recovery_requests': 0, 'compactions': 0, 'progress_evidence': [],
+                           'subagents_started': 0}
         self._approval_denied = False
         self._no_progress_stop = False
         self._last_tool_fingerprint = None
@@ -307,16 +318,26 @@ class Agent:
         self._segment_progress = False
         self._task_progress = False
         self._last_progress_evidence = None
+        self._segment_novel = False
+        self._seen_progress = set()
         self.incomplete_draft = None
 
     def _restore_legacy_task(self):
-        starts = [i for i, m in enumerate(self.messages) if m.get('role') == 'user' and
-                  not str(m.get('content', '')).startswith(('[Task memo:', '[TASK_RESUME]', '[TASK_CONTINUE]', '[Context archive:'))]
+        # A bare "继续执行" is not the goal; anchor on the last real instruction.
+        starts = task_starts(self.messages)
         start = starts[-1] if starts else 1
         self._ensure_task_state(self.messages[start].get('content', '') if start < len(self.messages) else '')
         self.task_state['logical_calls'] = sum(m.get('role') == 'assistant' for m in self.messages[start + 1:])
+        self.task_state['subagents_started'] = self._task_delegate_count()
         self.task_state['status'] = self.last_run.get('status', 'limit')
         self.task_state['stop_reason'] = self.last_run.get('stop_reason', 'step_limit')
+
+    def _task_delegate_count(self):
+        starts = task_starts(self.messages)
+        start = starts[-1] if starts else 0
+        return sum(call.get('function', {}).get('name') == 'delegate'
+                   for message in self.messages[start + 1:] if message.get('role') == 'assistant'
+                   for call in message.get('tool_calls', []))
 
     def _task_budget(self):
         state = self.task_state or {}
@@ -341,7 +362,7 @@ class Agent:
             return 'token_budget'
         return None
 
-    def _finish(self, status, stop_reason, value, can_continue=True):
+    def _finish(self, status, stop_reason, value, can_continue=True, error=None):
         if not self.task_state:
             self._ensure_task_state()
         state = self.task_state
@@ -353,15 +374,15 @@ class Agent:
                              can_continue=can_continue, task_budget=self._task_budget(),
                              continue_hint=self._ui('/continue 开始同一任务的新受控段。' if can_continue else
                              '此结果不能自动续跑；请修正条件后开始新任务。'))
+        if error is not None:
+            self.last_run['error'] = error
         if stop_reason == 'rate_limit':
             self.last_run['continue_hint'] = self._ui('等待限流冷却后用 /continue 继续原任务；已完成工具不会自动重放。')
         self._checkpoint()
         return value
 
     def _task_has_denial(self):
-        starts = [i for i, m in enumerate(self.messages) if m.get('role') == 'user'
-                  and not str(m.get('content', '')).startswith(
-                      ('[Task memo:', '[Context archive:', '[TASK_RESUME]', '[TASK_CONTINUE]'))]
+        starts = task_starts(self.messages)
         for message in self.messages[starts[-1] + 1 if starts else 1:]:
             if message.get('role') != 'tool':
                 continue
@@ -412,8 +433,9 @@ class Agent:
 
     def _request_messages(self, rules='', messages=None):
         source = self.messages if messages is None else messages
-        return ([{'role': 'system', 'content': self.system + '\n\n' + rules}, *source[1:]]
-                if rules else source)
+        projected = project_tool_messages(source, self._tool_projection_cache)
+        return ([{'role': 'system', 'content': self.system + '\n\n' + rules}, *projected[1:]]
+                if rules else projected)
 
     def _context_budget(self, request_messages, *, allow_network=True):
         chars = context_chars(request_messages, self.tools)
@@ -447,6 +469,8 @@ class Agent:
                 'threshold': self.config.auto_compact_threshold}
 
     def _compact_for_context(self, force=False, messages=None, rules=None, budget=None):
+        if not force and not (self.config.auto_compact or self.config.auto_compact_task):
+            return False
         if rules is None:
             rules = load_prompt_file('task_prompt.txt') if self.config.auto_continue else ''
         source = self.messages if messages is None else messages
@@ -459,14 +483,19 @@ class Agent:
         best, best_details, best_ratio = source, None, ratio
         # Keep a gap below the trigger to avoid branching on every subsequent call.
         target = self.config.auto_compact_threshold * 0.75
-        starts = [m for m in source if m.get('role') == 'user' and not str(m.get('content', '')).startswith(
-            ('[Context archive:', '[Task memo:', '[TASK_RESUME]', '[TASK_CONTINUE]'))]
+        # Bare "继续执行" messages are not tasks: one real task plus resumes is still one task.
+        single_task = len(task_starts(source)) == 1
+        base_keep = self.config.auto_compact_keep_groups
+        # Keep as much recent work as the target allows: configured depth first, then
+        # half of it, then one group.  A few huge groups therefore cannot force a
+        # choice between "too big" and "almost nothing" in one step.
+        keeps = tuple(dict.fromkeys((base_keep, max(1, base_keep // 2), 1)))
         def candidates():
             # Retain the legacy single-task memo format for existing opt-in profiles.
-            if self.config.auto_compact_task and len(starts) == 1:
-                yield compact_task_messages(source, self.config.auto_compact_keep_groups, archive_id)
+            if self.config.auto_compact_task and single_task:
+                yield compact_task_messages(source, base_keep, archive_id)
             for answers in (False, True):
-                for keep in dict.fromkeys((self.config.auto_compact_keep_groups, 1)):
+                for keep in keeps:
                     yield compact_context_messages(source, keep, archive_id,
                         keep_turns=self.config.auto_compact_keep_turns, reduce_answers=answers)
         source_chars = context_chars(source)
@@ -495,12 +524,15 @@ class Agent:
             self.branch_after_compact(archive_id, result, details) is not False)
         if not persistent:
             if not any(item.get('id') == archive_id for item in self.in_memory_archives):
+                if len(self.in_memory_archives) >= 16:
+                    raise ValueError('In-memory archive limit reached; save/export this session before compacting again')
                 self.in_memory_archives.append({'id': archive_id,
                                                 'messages': __import__('copy').deepcopy(source)})
         self.messages[:] = result
         if self.task_state is not None:
             self.task_state['compactions'] += 1
         self._task_compactions += 1
+        self._last_compaction_call = self._total_calls
         self._emit('task_compacted', {'archive': archive_id, 'persistent': persistent, **details})
         self._checkpoint()
         return True
@@ -518,6 +550,66 @@ class Agent:
                        after_chars=context_chars(self._request_messages(rules, messages=result), self.tools))
         return self._publish_compaction(self.messages, result, details, archive_id)
 
+    _RESUMABLE_STATUSES = frozenset({'limit', 'interrupted', 'error', 'stalled', 'context_limit'})
+    _BUDGET_STOPS = ('task_call_budget', 'time_budget', 'token_budget')
+    _TRANSIENT_STOPS = ('rate_limit', 'network_error', 'provider_error')
+
+    def _task_goal(self):
+        """The real instruction of the current task, never a bare "继续执行"."""
+        goal = (self.task_state or {}).get('goal')
+        if isinstance(goal, str) and goal.strip() and not is_resume_text(goal):
+            return goal
+        starts = task_starts(self.messages)
+        content = self.messages[starts[-1]].get('content') if starts else ''
+        return content if isinstance(content, str) else ''
+
+    def _resumable(self):
+        """Whether a bare "继续执行" should resume the unfinished task instead of starting a new one."""
+        run = self.last_run if isinstance(self.last_run, dict) else {}
+        return (not self.history_only and run.get('can_continue') is not False
+                and run.get('status') in self._RESUMABLE_STATUSES and bool(task_starts(self.messages)))
+
+    def _resume_text(self):
+        text = load_prompt_file('task_resume.txt').rstrip()
+        goal = self._task_goal().strip()
+        # Compaction keeps human messages, but restating the goal costs little and
+        # keeps a long task anchored after any number of resumes.
+        return text + ('\nOriginal goal (truncated): ' + goal[:600] if goal else '')
+
+    def _renew_budget(self, *, include_tokens):
+        """Open a new call/time window for the same task under the current limits."""
+        state = self.task_state
+        windows = state.get('budget_windows') if isinstance(state.get('budget_windows'), list) else []
+        windows.append({'logical_calls': state.get('logical_calls', 0),
+                        'active_seconds': round(float(state.get('active_seconds', 0) or 0), 3),
+                        'tokens': state.get('tokens', 0), 'stop_reason': state.get('stop_reason')})
+        renewals = state.get('renewals')
+        state['budget_windows'] = windows[-16:]
+        state['renewals'] = (renewals if isinstance(renewals, int) and not isinstance(renewals, bool) else 0) + 1
+        state.update(logical_calls=0, active_seconds=0.0, max_logical_calls=self.config.max_task_calls,
+                     max_active_seconds=self.config.max_task_seconds)
+        if include_tokens:
+            state.update(tokens=0, max_tokens=self.config.max_task_tokens)
+        # Server/shared-worker cooldowns outlive an execution-budget window.
+
+    def _prepare_user_resume(self):
+        """An explicit request to carry on reopens a spent budget window and the stall guard."""
+        state = self.task_state
+        if not isinstance(state.get('goal'), str) or not state['goal'].strip() or is_resume_text(state['goal']):
+            state['goal'] = self._task_goal()
+        if self.last_run.get('stop_reason') in self._BUDGET_STOPS or self._budget_stop():
+            self._renew_budget(include_tokens=True)
+        self._no_progress_stop = False
+        self._same_tool_fingerprint_count = 0
+        self._last_tool_fingerprint = None
+        # A restored task must not count recently saved evidence as new progress.
+        evidence = state.get('progress_evidence', [])
+        if isinstance(evidence, list):
+            self._seen_progress.update(item['result_fingerprint'] for item in evidence[-32:]
+                                       if isinstance(item, dict)
+                                       and isinstance(item.get('result_fingerprint'), str)
+                                       and re.fullmatch('[0-9a-f]{64}', item['result_fingerprint']))
+
     def continue_task(self, steps=None, auto_continue=None):
         if self.history_only:
             raise ValueError(self._ui('历史查看模式不能继续任务；请用 /api NAME 新建可用会话。'))
@@ -527,18 +619,186 @@ class Agent:
             raise ValueError(self._ui('上次任务明确不可自动续跑；请修正条件后开始新任务。'))
         if steps is not None and (isinstance(steps, bool) or not isinstance(steps, int) or not 1 <= steps <= 256):
             raise ValueError('continue steps must be between 1 and 256')
-        return self._run_segment('[TASK_RESUME]\n' + load_prompt_file('task_resume.txt'),
-                                 automatic=self.config.auto_continue if auto_continue is None else auto_continue,
-                                 resume=True, segment_steps=steps or self.config.max_steps)
+        self._prepare_user_resume()
+        automatic = self.config.auto_continue if auto_continue is None else auto_continue
+        segment_steps = steps or self.config.max_steps
+        return self._drive(automatic, lambda: self._run_segment(
+            control_prompt('[TASK_RESUME]', self._resume_text()), automatic=automatic,
+            resume=True, segment_steps=segment_steps))
 
     def run(self, text: str, auto_continue: bool | None = None) -> str:
         if self.history_only:
             raise ValueError(self._ui('历史查看模式不能调用模型；请用 /api NAME 新建可用会话。'))
         if not isinstance(text, str) or not text.strip():
             raise ValueError('input must be a non-empty string')
-        self._ensure_task_state(text)
-        return self._run_segment(text, automatic=self.config.auto_continue if auto_continue is None else auto_continue,
-                                 resume=False, segment_steps=self.config.max_steps)
+        bare_resume = is_resume_text(text)
+        if bare_resume and self.last_run.get('can_continue') is False:
+            raise ValueError(self._ui('上次任务明确不可自动续跑；请修正条件后开始新任务。'))
+        if bare_resume and self._resumable():
+            # "继续执行" carries no new instruction: resume the unfinished task. Starting
+            # a new one would make it the task boundary and discard the work just done.
+            self._emit('resume_routed', {'goal': self._task_goal()[:80]})
+            return self.continue_task(auto_continue=auto_continue)
+        self._ensure_task_state((self._task_goal() if bare_resume else '') or text)
+        automatic = self.config.auto_continue if auto_continue is None else auto_continue
+        return self._drive(automatic, lambda: self._run_segment(
+            text, automatic=automatic, resume=False, segment_steps=self.config.max_steps))
+
+    def _drive(self, automatic, start):
+        """Run a task, then resume it by itself after a recoverable stop (automatic tasks only)."""
+        self._segment_novel = False
+        answer = start()
+        cfg = self.config
+        if not (automatic and cfg.auto_resume and cfg.auto_resume_max > 0):
+            return answer
+        resumes = failures = 0
+        while True:
+            plan = self._auto_resume_plan(resumes, failures)
+            if plan is None:
+                break
+            if plan[0] == 'stop':
+                self.last_run['auto_resume_note'] = plan[1]
+                answer = f'{answer}\n{plan[1]}' if answer else plan[1]
+                break
+            _, reason, delay, renew = plan
+            resumes += 1
+            if renew:
+                self._renew_budget(include_tokens=False)
+            started = self.task_state.get('auto_resumes')
+            self.task_state['auto_resumes'] = (started if isinstance(started, int) and not isinstance(started, bool) else 0) + 1
+            self._emit('auto_resume', {'count': resumes, 'max': cfg.auto_resume_max, 'reason': reason,
+                                       'wait_seconds': round(delay, 1), 'task_id': self.task_state.get('id')})
+            self._checkpoint()
+            if delay > 0:
+                self._wait(delay)
+            stop = self._budget_stop()
+            if stop:
+                answer = self._finish('limit', stop, self._ui('同一任务的硬预算已用完；未执行新的调用。'))
+                continue
+            self._segment_novel = False
+            answer = self._run_segment(control_prompt('[TASK_RESUME]', self._resume_text()),
+                                       automatic=True, resume=True, segment_steps=cfg.max_steps)
+            failures = ((0 if self._segment_novel else failures + 1)
+                        if reason in self._TRANSIENT_STOPS else 0)
+        if resumes or self.last_run.get('auto_resume_note'):
+            if resumes:
+                self.last_run['auto_resumes'] = resumes
+            self.last_run['message'] = answer
+            # _finish saved the segment, but these driver diagnostics were added later.
+            self._checkpoint()
+        return answer
+
+    def _auto_resume_plan(self, resumes, failures):
+        """None, ('stop', note), or ('resume', reason, delay, renew_budget)."""
+        cfg, run = self.config, self.last_run
+        reason = run.get('stop_reason')
+        if (run.get('can_continue') is False or self._approval_denied or self._no_progress_stop
+                or run.get('status') not in ('limit', 'error')):
+            return None
+        error = run.get('error') if isinstance(run.get('error'), dict) else {}
+        if error.get('pre_accept') is False:
+            return None  # Never turn a failed accepted response into an automatic replay.
+        if reason in ('step_limit', 'task_call_budget', 'time_budget'):
+            transient = False
+        elif reason in self._TRANSIENT_STOPS and error.get('transient') is True:
+            transient = True
+        else:
+            return None
+        budget = self._task_budget()
+        if budget['max_tokens'] and budget['tokens'] >= budget['max_tokens']:
+            return ('stop', self._ui('自动续跑已停止：任务 token 预算已用完。'))
+        renew = (budget['logical_calls'] >= budget['max_logical_calls']
+                 or budget['active_seconds'] >= budget['max_active_seconds'])
+        if resumes >= cfg.auto_resume_max:
+            return ('stop', self._ui('自动续跑已达上限 {v0} 次；可用 /continue 或输入“继续执行”再续。', v0=cfg.auto_resume_max))
+        # A transient failure may coincide with a spent budget. Decide renewal now,
+        # while its preceding tool progress is still available, not in an empty segment.
+        if (not transient or renew) and not self._segment_novel:
+            return ('stop', self._ui('自动续跑已停止：上一段没有产生新的有效进展。'))
+        if transient and failures >= 4:
+            return ('stop', self._ui('自动续跑已停止：连续多次失败且没有进展。'))
+        delay = min(cfg.auto_resume_max_wait + 1, 5.0 * 3 ** failures) if transient else 0.0
+        cooldown = self._pending_retry_delay()
+        if cooldown > 0:
+            delay = max(delay, cooldown + 1.0)
+        if delay > cfg.auto_resume_max_wait:
+            return ('stop', self._ui('自动续跑已停止：需要等待 {v0:g} 秒，超过 auto_resume_max_wait。', v0=round(delay)))
+        remaining = cfg.max_task_seconds if renew else budget['max_active_seconds'] - budget['active_seconds']
+        if delay >= remaining:
+            return ('stop', self._ui('自动续跑已停止：需要等待 {v0:g} 秒，超过剩余任务时间 {v1:g} 秒。',
+                                     v0=round(delay, 1), v1=round(max(0.0, remaining), 1)))
+        return ('resume', reason, delay, renew)
+
+    def _wait(self, seconds):
+        remaining = self._request_seconds_remaining()
+        if remaining is not None and seconds >= remaining:
+            raise TaskBudgetExhausted('time_budget')
+        before, error = time.monotonic(), None
+        try:
+            self._sleep(seconds)
+        except BaseException as exc:
+            error = exc
+            raise
+        finally:
+            if self.task_state:
+                self.task_state['active_seconds'] += max(0.0, time.monotonic() - before)
+            if error is None:
+                self._checkpoint()
+            else:
+                try:
+                    self._mark_interrupted(self._ui('自动续跑等待已中断。'))
+                    self._checkpoint()
+                except BaseException as cleanup_error:
+                    error.add_note('Interruption checkpoint failed: ' + type(cleanup_error).__name__)
+
+    @staticmethod
+    def _transient_failure(exc, status, text):
+        if getattr(exc, 'pre_accept', None) is False:
+            return False
+        if isinstance(exc, (ContextLengthError, EmptyResponseError, IncompleteOutputError)):
+            return False
+        classified = getattr(exc, 'transient', None)
+        if isinstance(classified, bool):
+            return classified
+        if isinstance(exc, (NetworkError, RateLimitError)):
+            return True
+        if status is not None:
+            return status in (408, 425, 500, 502, 503, 504, 520, 521, 522, 523, 524, 529)
+        return False  # Unknown/malformed provider errors are not evidence of a temporary failure.
+
+    def _error_info(self, exc):
+        """Bounded, non-secret facts about a failed model request for diagnosis and auto-resume."""
+        match = re.search(r'returned HTTP (\d{3})', str(exc))
+        status = int(match.group(1)) if match else None
+        since = None if self._last_compaction_call is None else self._total_calls - self._last_compaction_call
+        accepted = getattr(self.client, 'last_accepted', None)
+        pre_accept = getattr(exc, 'pre_accept', None)
+        if accepted is True:
+            pre_accept = False
+        elif not isinstance(pre_accept, bool) and accepted is False:
+            pre_accept = True
+        info = {'type': type(exc).__name__, 'status': status,
+                'transient': pre_accept is not False and self._transient_failure(exc, status, str(exc)),
+                'calls_since_compaction': since}
+        if isinstance(pre_accept, bool):
+            info['pre_accept'] = pre_accept
+        return info
+
+    def _defer_retry(self, exc, error):
+        delay = getattr(exc, 'retry_after_seconds', None)
+        if (error.get('transient') is not True or not isinstance(delay, (int, float))
+                or isinstance(delay, bool) or not math.isfinite(delay) or delay < 0):
+            return
+        until = time.time() + delay
+        if until <= self.task_state.get('retry_not_before', 0):
+            return
+        retry = {'phase': 'deferred', 'attempt': getattr(self.client, 'last_attempts', 0),
+                 'wait_seconds': delay, 'next_retry_at': until, 'pre_accept': error.get('pre_accept'),
+                 'cause': 'rate-limit' if isinstance(exc, RateLimitError) else 'upstream-retry',
+                 'status': error.get('status') or (429 if isinstance(exc, RateLimitError) else None)}
+        self.task_state['retry'] = retry
+        self.task_state['retry_not_before'] = until
+        self.last_run['retry'] = dict(retry)
 
     def _record_model_request(self, request, answer=None):
         usage = self._clean_usage(getattr(self.client, 'last_usage', None))
@@ -622,7 +882,7 @@ class Agent:
             text, segment_steps, resume = result.text, result.steps, True
 
     def _resume_messages(self, text):
-        result = deepcopy(self.messages)
+        result = list(self.messages)
         if result[-1].get('role') != 'user':
             result.append({'role': 'user', 'content': text})
         elif result[-1].get('content') in (None, '', []):
@@ -642,16 +902,22 @@ class Agent:
             self._conversation_count += 1
             self._checkpoint()
         rules = load_prompt_file('task_prompt.txt') if automatic else ''
-        nudge = load_prompt_file('task_continue.txt') if automatic else ''
+        nudge = control_prompt('[TASK_CONTINUE]', load_prompt_file('task_continue.txt')) if automatic else ''
         self._last_auto_prompt_chars = len(rules) + 2 if rules else 0
         if hasattr(self.client, 'set_control_markers'):
             self.client.set_control_markers(TASK_MARKERS if automatic else ())
+        first_budget = None
         if resume:
             prospective = self._resume_messages(text)
-            compacted = self._compact_for_context(messages=prospective, rules=rules)
-            if not compacted:
+            first_budget = self._context_budget(self._request_messages(rules, messages=prospective))
+            # Ordering invariant: compaction must choose/persist the new branch
+            # before the first resume checkpoint can write a loaded source row.
+            if self._compact_for_context(messages=prospective, rules=rules, budget=first_budget):
+                first_budget = None
+                # _publish_compaction already checkpointed the changed state.
+            else:
                 self.messages[:] = prospective
-            self._checkpoint()
+                self._checkpoint()
         else:
             self._trim_tool_history(rules)
         pauses = 0
@@ -663,7 +929,8 @@ class Agent:
                 reason = {'time_budget': 'time_budget', 'token_budget': 'token_budget'}.get(stop, 'task_call_budget')
                 return self._finish('limit', reason, self._ui('同一任务的硬预算已用完；未执行新的调用。'))
             request = self._request_messages(rules)
-            chars, token, exceeded = self._context_budget(request)
+            chars, token, exceeded = first_budget or self._context_budget(request)
+            first_budget = None
             if self._compact_for_context(rules=rules, budget=(chars, token, exceeded)):
                 request = self._request_messages(rules)
                 chars, token, exceeded = self._context_budget(request)
@@ -700,26 +967,24 @@ class Agent:
                                               if k not in ('tool_calls', '_incomplete_tool_calls', '_responses_output',
                                                            '_incomplete_output')}
                                              | {'role': 'assistant'})
+                elif isinstance(getattr(exc, 'assistant_message', None), dict):
+                    self.incomplete_draft = deepcopy(exc.assistant_message)
                 if isinstance(exc, ContextLengthError):
                     return self._finish('context_limit', 'context_limit', self._ui('LLM 请求失败：{v0}', v0=exc), False)
+                error = self._error_info(exc)
+                self._defer_retry(exc, error)
                 if isinstance(exc, RateLimitError):
-                    delay = exc.retry_after_seconds
-                    if isinstance(delay, (int, float)) and not isinstance(delay, bool) and math.isfinite(delay) and delay >= 0:
-                        retry = {'phase': 'deferred', 'attempt': getattr(self.client, 'last_attempts', 0),
-                                 'wait_seconds': delay, 'next_retry_at': time.time() + delay,
-                                 'pre_accept': exc.pre_accept, 'cause': 'rate-limit', 'status': 429}
-                        self.task_state['retry'] = retry
-                        self.task_state['retry_not_before'] = retry['next_retry_at']
-                        self.last_run['retry'] = dict(retry)
-                    return self._finish('error', 'rate_limit', self._ui('LLM 请求失败：{v0}', v0=exc))
+                    return self._finish('error', 'rate_limit', self._ui('LLM 请求失败：{v0}', v0=exc), error=error)
                 if isinstance(exc, IncompleteOutputError):
-                    reason = ('stream_interrupted' if isinstance(exc, StreamInterruptedError) else
+                    reason = ('response_limit' if isinstance(exc, ResponseLimitError) else
+                              'stream_interrupted' if isinstance(exc, StreamInterruptedError) else
                               'context_limit' if getattr(exc, 'context_limited', False) else 'output_limit')
                     return self._finish('incomplete', reason, self._ui('LLM 请求失败：输出不完整：{v0}', v0=exc), False)
                 if isinstance(exc, EmptyResponseError):
                     reason = 'output_limit' if getattr(exc, 'length', False) else 'provider_error'
                     return self._finish('empty_response', reason, self._ui('LLM 请求失败：{v0}', v0=exc), False)
-                return self._finish('error', 'network_error' if isinstance(exc, NetworkError) else 'provider_error', self._ui('LLM 请求失败：{v0}', v0=exc))
+                return self._finish('error', 'network_error' if isinstance(exc, NetworkError) else 'provider_error',
+                                    self._ui('LLM 请求失败：{v0}', v0=exc), error=error)
             if not isinstance(answer, dict):
                 return self._finish('error', 'provider_error', self._ui('LLM 响应格式错误：assistant message must be an object'))
             if answer.get('_incomplete_tool_calls') or answer.get('_incomplete_output'):
@@ -778,7 +1043,7 @@ class Agent:
             self._segment_started = 0.0
             self._emit('segment_extension', self._task_budget())
             remaining = self.task_state['max_logical_calls'] - self.task_state['logical_calls']
-            return _NextSegment('[TASK_RESUME]\n' + load_prompt_file('task_resume.txt'),
+            return _NextSegment(control_prompt('[TASK_RESUME]', self._resume_text()),
                                 max(1, min(segment_steps, remaining)))
         return self._finish('limit', 'step_limit', self._ui('已达到最大模型请求次数；同一任务可用 /continue 开始新的受控段。'))
 
@@ -859,6 +1124,11 @@ class Agent:
             function = call.get("function") if isinstance(call.get("function"), dict) else {}
             name = function.get("name") if isinstance(function.get("name"), str) else ""
             args, parse_error = self._tool_args(function.get("arguments", "{}"))
+            if not parse_error:
+                try:
+                    args = normalize_tool_args(name, args or {})
+                except ValueError as exc:
+                    parse_error = str(exc)
             self._tool_calls_total += 1
             write_call = name in ("write_file", "edit_file")
             effective_disposition = disposition
@@ -938,6 +1208,8 @@ class Agent:
                     result = {"error": "tool execution interrupted", "execution_status": "unknown",
                               "outcome_status": "unknown"}
                 except Exception as exc:
+                    if self.last_run.get('checkpoint_error'):
+                        raise
                     result = {"error": f"{type(exc).__name__}: {exc}", "execution_status": "unknown",
                               "outcome_status": "unknown"}
                 if not isinstance(result, dict):
@@ -982,6 +1254,11 @@ class Agent:
                 self._segment_progress = True
                 self._task_progress = True
                 self._last_progress_evidence = evidence
+                if fingerprint not in self._seen_progress:
+                    if len(self._seen_progress) >= 4096:
+                        self._seen_progress.clear()
+                    self._seen_progress.add(fingerprint)
+                    self._segment_novel = True
                 state = self.task_state if isinstance(self.task_state, dict) else None
                 progress = state.setdefault("progress_evidence", []) if state is not None else []
                 if isinstance(progress, list):
@@ -1037,9 +1314,13 @@ class Agent:
         requested = args.get("max_steps", self.config.subagent_max_steps)
         if not isinstance(requested, int) or isinstance(requested, bool) or not 1 <= requested <= 12:
             return {"error": "max_steps must be between 1 and 12"}
-        if self._subagents_this_run >= self.config.max_subagents:
+        if self.task_state is None:
+            self._ensure_task_state('/sub ' + task)
+        if self.task_state.get('subagents_started', 0) >= self.config.max_subagents:
             return {"error": "sub-agent limit reached for this task"}
-        self._subagents_this_run += 1
+        self.task_state['subagents_started'] = self.task_state.get('subagents_started', 0) + 1
+        # Reserve the worker before opening its client; restore must not grant more.
+        self._checkpoint()
         self._subagent_calls_total += 1
         identifier = f"sub-{self._subagent_calls_total}"
         step_limit = min(requested, self.config.subagent_max_steps, self.config.max_steps, self.config.max_task_calls)
@@ -1104,9 +1385,7 @@ class Agent:
             raise ValueError(self._ui('历史查看模式不能委派任务；请用 /api NAME 新建可用会话。'))
         if not isinstance(task, str) or not task.strip() or len(task) > 16000:
             raise ValueError("task must contain 1–16000 characters")
-        if not isinstance(self.task_state, dict):
-            self._ensure_task_state('/sub ' + task)
-        self._subagents_this_run = 0
+        self._ensure_task_state('/sub ' + task)
         self._approval_denied = False
         self._conversation_count += 1
         self.messages.append({"role": "user", "content": "/sub " + task})
@@ -1132,6 +1411,7 @@ class Agent:
 
     def clear(self) -> None:
         self.messages[:] = [{"role": "system", "content": self.system}]
+        self._tool_projection_cache.clear()
         self.client.last_request = None
 
     def stats(self) -> dict[str, Any]:

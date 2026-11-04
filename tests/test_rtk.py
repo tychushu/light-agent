@@ -48,7 +48,9 @@ elif mode == "nul":
 elif mode == "large":
     sys.stdout.buffer.write(b"x" * (int(os.environ.get("RTK_TEST_LARGE_BYTES", "600000"))))
 elif mode == "split-secret":
-    secret = os.environ.get("TERMUX_AGENT_API_KEY", "")
+    # Test output redaction independently of credential environment isolation.
+    # Only the harmless fixture file path is inherited by this fake command.
+    secret = pathlib.Path(os.environ["RTK_TEST_SECRET_FILE"]).read_text(encoding="utf-8")
     middle = len(secret) // 2
     sys.stdout.write("HEAD_UNICODE=开头\n")
     sys.stdout.write(secret[:middle])
@@ -297,7 +299,11 @@ class RTKFixtureTests(unittest.TestCase):
         self.assertFalse(payload["timed_out"])
 
     def test_long_middle_unicode_and_split_secret_are_redacted(self):
-        with patch.dict(os.environ, {"RTK_FILTER_MODE": "fail", "RTK_TEST_MODE": "split-secret"}):
+        secret_file = self.root / 'fixture-secret.txt'
+        secret_file.write_text(self.secret, encoding='utf-8')
+        secret_file.chmod(0o600)
+        with patch.dict(os.environ, {"RTK_FILTER_MODE": "fail", "RTK_TEST_MODE": "split-secret",
+                                    "RTK_TEST_SECRET_FILE": str(secret_file)}):
             result = execute("shell", {"command": "pytest"}, 360,
                              output_compressor=self.compressor)
         visible = result["stdout"] + result["stderr"]

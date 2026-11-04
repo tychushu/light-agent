@@ -345,7 +345,7 @@ class AcceptanceTestCase(unittest.TestCase):
 
 
 class BoundedContinuationTests(AcceptanceTestCase):
-    def test_one_user_task_runs_17_unique_tools_across_segments_then_respects_hard_cap(self):
+    def test_one_user_task_runs_17_unique_tools_then_explicit_resume_reopens_spent_budget(self):
         source = self.root / "source.txt"
         source.write_text("".join(chr(65 + i) + "\n" for i in range(20)), encoding="utf-8")
         replies = [{"tool_calls": [call(f"u{i:02d}", "read_file",
@@ -367,12 +367,53 @@ class BoundedContinuationTests(AcceptanceTestCase):
                              and not str(m.get("content", "")).startswith("[TASK_")]
         self.assertEqual(len(non_control_users), 1)
 
-        before = len(client.sent)
+        self.assertEqual(agent._budget_stop(), "task_call_budget")
+        before, task_id = len(client.sent), agent.task_state["id"]
+        client.replies.append({"content": "no further work [TASK_DONE]"})
         with patch("termux_agent.agent.load_prompt_file", return_value="bounded resume rules"):
-            agent.continue_task(steps=1)
-        self.assertEqual(len(client.sent), before)
-        self.assertEqual(agent.stats()["model_logical_calls_total"], 18)
+            self.assertEqual(agent.continue_task(steps=1), "no further work")
+        self.assertEqual(len(client.sent), before + 1)
+        self.assertEqual(agent.stats()["model_logical_calls_total"], 19)
+        self.assertEqual(agent.task_state["logical_calls"], 1)
+        self.assertEqual(agent.task_state["renewals"], 1)
+        self.assertEqual(agent.task_state["budget_windows"][-1]["logical_calls"], 18)
+        self.assertEqual(agent.task_state["id"], task_id)
+        self.assertEqual(agent.task_state["goal"], "inspect all offsets")
+        self.assertEqual(agent.stats()["tool_calls_executed"], 17)
+        self.assertEqual(agent.last_run["status"], "complete")
+        self.assertEqual(client.replies, [])
+
+    def test_disabled_auto_resume_stops_at_call_cap_until_explicit_user_resume(self):
+        source = self.root / "cap-source.txt"
+        source.write_text("first\nsecond\n", encoding="utf-8")
+        client = ScriptedClient([
+            {"tool_calls": [call("cap-first", "read_file", {"path": str(source), "offset": 0, "limit": 1})]},
+            {"tool_calls": [call("cap-second", "read_file", {"path": str(source), "offset": 1, "limit": 1})]},
+            {"content": "explicitly resumed [TASK_DONE]"},
+        ])
+        agent = Agent(self.config(max_task_calls=2, auto_continue=True, auto_resume=False), client=client)
+        with patch("termux_agent.agent.load_prompt_file", return_value="bounded automatic rules"):
+            agent.run("inspect under a fixed call cap")
+        task_id = agent.task_state["id"]
+        self.assertEqual(len(client.sent), 2)
+        self.assertEqual(agent.stats()["model_logical_calls_total"], 2)
+        self.assertEqual(agent.task_state["logical_calls"], 2)
         self.assertEqual(agent.last_run["stop_reason"], "task_call_budget")
+        self.assertNotIn("renewals", agent.task_state)
+        self.assertNotIn("auto_resumes", agent.task_state)
+        self.assertEqual(len(client.replies), 1)
+
+        with patch("termux_agent.agent.load_prompt_file", return_value="bounded resume rules"):
+            self.assertEqual(agent.continue_task(steps=1), "explicitly resumed")
+        self.assertEqual(len(client.sent), 3)
+        self.assertEqual(agent.stats()["model_logical_calls_total"], 3)
+        self.assertEqual(agent.task_state["logical_calls"], 1)
+        self.assertEqual(agent.task_state["renewals"], 1)
+        self.assertEqual(agent.task_state["budget_windows"][-1]["logical_calls"], 2)
+        self.assertEqual(agent.task_state["id"], task_id)
+        self.assertEqual(agent.last_run["status"], "complete")
+        self.assertNotIn("auto_resumes", agent.task_state)
+        self.assertEqual(client.replies, [])
 
     def test_legacy_known_not_run_write_is_reissued_and_executed_once_after_continue(self):
         target = self.root / "legacy-write.txt"
@@ -955,8 +996,8 @@ class RecoveryAccountingTests(AcceptanceTestCase):
         class BrokenStream:
             status_code = 200
             headers = {"content-type": "text/event-stream"}
-            def iter_lines(self):
-                yield 'data: {"choices":[{"delta":{"content":"accepted partial"}}]}'
+            def iter_bytes(self, chunk_size=None):
+                yield b'data: {"choices":[{"delta":{"content":"accepted partial"}}]}\n\n'
                 raise httpx.ReadError("stream cut after acceptance")
             def close(self):
                 pass

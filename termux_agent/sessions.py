@@ -93,7 +93,7 @@ def validate_task_state(value, config=None):
     out['active_seconds'] = _safe_float(out.get('active_seconds'))
     if 'retry_not_before' in out:
         out['retry_not_before'] = _safe_float(out['retry_not_before'])
-    for key in ('segments', 'logical_calls', 'tokens', 'recovery_requests', 'compactions'):
+    for key in ('segments', 'logical_calls', 'tokens', 'recovery_requests', 'compactions', 'subagents_started'):
         out[key] = _safe_int(out.get(key))
     defaults = {
         'max_logical_calls': getattr(config, 'max_task_calls', 32),
@@ -106,6 +106,14 @@ def validate_task_state(value, config=None):
     out['token_budget_exact'] = out.get('token_budget_exact') if isinstance(out.get('token_budget_exact'), bool) else True
     evidence = out.get('progress_evidence', [])
     out['progress_evidence'] = [dict(item) for item in evidence if isinstance(item, dict)][-32:] if isinstance(evidence, list) else []
+    # Present only after a budget renewal or an automatic resume.
+    for key in ('renewals', 'auto_resumes'):
+        if key in out:
+            out[key] = _safe_int(out[key])
+    if 'budget_windows' in out:
+        windows = out['budget_windows']
+        out['budget_windows'] = ([dict(item) for item in windows if isinstance(item, dict)][-16:]
+                                 if isinstance(windows, list) else [])
     return out
 
 
@@ -172,7 +180,18 @@ def scrub_keys(value, extra=()):
 
 
 def snapshot(agent, scope, checkpoint=False, branch=None):
-    messages = copy.deepcopy(agent.messages) if checkpoint else agent.messages
+    # scrub_keys below already produces an independent tree; avoid a second copy.
+    value = {'version': 4, 'config': agent.config.public_dict(), 'scope': scope,
+             'base_system': agent.base_system,
+             'messages': agent.messages, 'active_skills': agent.get_active_skills(),
+             'counters': {k: getattr(agent, k) for k in COUNTERS},
+             'task_state': agent.task_state, 'last_run': agent.last_run,
+             'incomplete_draft': agent.incomplete_draft,
+             'in_memory_archives': agent.in_memory_archives}
+    if branch is not None:
+        value['branch'] = branch
+    value = scrub_keys(value, (agent.config.api_key,))
+    messages = value['messages']
     if checkpoint:
         pending = {}
         for message in messages:
@@ -185,17 +204,32 @@ def snapshot(agent, scope, checkpoint=False, branch=None):
                 'error': 'Interrupted checkpoint: tool outcome is unknown. It may have run. '
                          'Inspect actual state before retrying; do not assume success or replay automatically.'})})
     validate_messages(messages)
-    value = {'version': 4, 'config': agent.config.public_dict(), 'scope': scope,
-             'base_system': agent.base_system,
-             'messages': messages, 'active_skills': agent.get_active_skills(), 'counters': {k: getattr(agent, k) for k in COUNTERS},
-             'task_state': agent.task_state, 'last_run': agent.last_run,
-             'incomplete_draft': agent.incomplete_draft,
-             'in_memory_archives': agent.in_memory_archives}
-    if branch is not None:
-        value['branch'] = branch
     if checkpoint:
         value['checkpoint'] = True
-    return scrub_keys(value, (agent.config.api_key,))
+    return value
+
+
+def has_unknown_tool_results(messages):
+    """Structured unknown outcomes survive even a completed checkpoint marker."""
+    for message in messages:
+        if message.get('role') != 'tool':
+            continue
+        value = message.get('content')
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except ValueError:
+                continue
+        if not isinstance(value, dict):
+            continue
+        if (value.get('execution_status') == 'unknown' or value.get('outcome_status') == 'unknown'
+                or value.get('write_status') in ('unknown', 'failed')):
+            return True
+        # Older saved pending pairs have only this error, no status fields.
+        error = value.get('error')
+        if isinstance(error, str) and error.startswith('Interrupted checkpoint: tool outcome is unknown'):
+            return True
+    return False
 
 
 class HistoryClient:
@@ -285,6 +319,11 @@ def restore(payload, build_agent, *, history_fallback=False):
     for key in COUNTERS:
         setattr(agent, key, counters.get(key, 0))
     agent.task_state = validate_task_state(payload.get('task_state'), config)
+    if agent.task_state is not None and 'subagents_started' not in (payload.get('task_state') or {}):
+        # Old checkpoints used a session-wide in-memory limit. Preserve that
+        # conservative bound once; a genuinely new task gets its own fresh cap.
+        agent.task_state['subagents_started'] = max(
+            agent._task_delegate_count(), min(config.max_subagents, agent._subagent_calls_total))
     agent.last_run = validate_last_run(payload.get('last_run', agent.last_run))
     agent.incomplete_draft = validate_draft(payload.get('incomplete_draft'))
     agent.in_memory_archives = validate_archives(payload.get('in_memory_archives'))
@@ -300,6 +339,8 @@ class SessionStore:
         root = Path(root) if root else Path.home() / '.local/share/termux-agent'
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         root.chmod(0o700)
+        from .security import protect_directory
+        protect_directory(root)
         self.root = root
         path = root / 'sessions.sqlite3'
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)

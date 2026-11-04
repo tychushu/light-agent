@@ -209,8 +209,10 @@ class RTKCaptureTests(unittest.TestCase):
         self.assertEqual(len(compressor.save_calls), 1)
 
     def test_small_final_saving_does_not_pay_capture_metadata_cost(self):
+        # A short scratch TMPDIR must not accidentally turn the same fixture
+        # into a worthwhile compression. Include a realistic archive path cost.
         result, compressor = self._run(
-            "medium", FilterResult(b"A" * 300, 0), cap=3000)
+            "medium", FilterResult(b"A" * 300, 0), cap=3000, path_length=240)
         self._assert_once()
         self.assertNotIn("output_compression", result)
         self.assertEqual(result["stdout"], "A" * 800)

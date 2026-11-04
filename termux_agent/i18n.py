@@ -4,6 +4,19 @@ import re
 # Source templates stay beside their callers; values are interpolated only after
 # translation. Never use substring replacement on a transcript or a tool result.
 EN = {
+    '自动续跑 {v0}/{v1}：{v2}': 'Auto-resume {v0}/{v1}: {v2}',
+    '；等待 {v0:g} 秒后继续': '; resuming in {v0:g}s',
+    '按 /continue 续跑原任务，不新建任务：{v0}': 'Resuming the unfinished task as /continue would, not starting a new one: {v0}',
+    '自动续跑已达上限 {v0} 次；可用 /continue 或输入“继续执行”再续。':
+        'Auto-resume limit of {v0} reached; use /continue or type "continue" to go on.',
+    '自动续跑已停止：上一段没有产生新的有效进展。': 'Auto-resume stopped: the last segment made no new progress.',
+    '自动续跑已停止：连续多次失败且没有进展。': 'Auto-resume stopped: repeated failures without progress.',
+    '自动续跑已停止：需要等待 {v0:g} 秒，超过 auto_resume_max_wait。':
+        'Auto-resume stopped: a {v0:g}s wait exceeds auto_resume_max_wait.',
+    '自动续跑等待已中断。': 'Auto-resume wait interrupted.',
+    '自动续跑已停止：任务 token 预算已用完。': 'Auto-resume stopped: the task token budget is exhausted.',
+    '自动续跑已停止：需要等待 {v0:g} 秒，超过剩余任务时间 {v1:g} 秒。':
+        'Auto-resume stopped: the required {v0:g}s wait exceeds the remaining {v1:g}s task time.',
     '等待限流冷却后用 /continue 继续原任务；已完成工具不会自动重放。':
         'Wait for the rate-limit cooldown, then use /continue for the same task; completed tools are not replayed automatically.',
     '中断检查点保存失败（{v0}）；请核实最新状态。':
@@ -141,6 +154,28 @@ ZH = {
     'privilege escalation attempt': '尝试提升权限',
     'potentially large deletion': '可能的大范围删除',
     'write to shell or Termux configuration': '写入 Shell 或 Termux 配置',
+    'write to shell, credentials, hooks, or agent configuration/data': '写入 Shell、凭据、Git hooks 或 Agent 配置与数据',
+    'command accesses protected configuration or data': '命令访问受保护的配置或数据',
+    'write with unresolved shell variables': '写入命令含有尚未解析的 Shell 变量',
+    'force push to a remote repository': '强制推送到远端仓库',
+    'synchronization with destination deletion': '同步并删除目标端文件',
+    'destructive file or scheduled-task operation': '破坏性文件或计划任务操作',
+    'Android package operation': 'Android 软件包操作',
+    'inline program execution': '执行内联程序',
+    'program execution from standard input': '从标准输入执行程序',
+    'shell script execution': '执行 Shell 脚本',
+    'shell evaluation or compound command': 'Shell 动态执行或复合命令',
+    'shell command substitution': 'Shell 命令替换',
+    'unparsed shell syntax': '未能解析的 Shell 语法',
+    'environment wrapper with options': '含选项的环境变量命令包装',
+    'command wrapper with options': '含选项的命令包装',
+    'nested command wrapper': '嵌套命令包装',
+    'unresolved shell command name': '尚未解析的 Shell 命令名',
+    'find deletion or command execution': 'find 删除文件或执行命令',
+    'destructive git operation': '破坏性 Git 操作',
+    'directory change with unparsed options': '切换目录时含有未解析的选项',
+    'invalid directory change': '无效的目录切换',
+    'invalid tool path': '无效的工具路径',
     'overwrite or edit of an existing large file': '覆盖或编辑已有大文件',
     'large file overwrite': '大文件覆盖', 'large replacement': '大段替换',
     'overwrite of a broad system or user data path': '覆盖系统或用户数据路径',
@@ -180,6 +215,7 @@ HELP_EN = {
     '自动精简跨轮次历史，保留用户指令；指定 N 则只保留最近 N 轮': 'Reduce cross-turn history, keeping human instructions; N explicitly keeps only the latest N turns',
     '压缩当前单任务工具链；保留最近 N 个完整工具组，不调用模型': 'Reduce the current task, keeping N recent complete tool groups; no model call',
     '从检查点继续同一任务，开始一个新的受控模型调用段': 'Resume the same task from its checkpoint within a new bounded segment',
+    '未完成任务的简短续跑输入；不新建任务，引号内文字按原文发送': 'Bare continue/resume continues an unfinished task, not a new one; quoted text is literal',
     '查看上次停止原因和继续方式': 'Show the last stop reason and continuation hint',
     '在已保存会话正文和工具参数中检索，最多显示 20 个会话': 'Search saved messages/tool arguments; show up to 20 sessions',
     '导出会话；默认当前会话、Markdown、新文件': 'Export a session; defaults to current session, Markdown, a new file',

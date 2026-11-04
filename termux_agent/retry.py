@@ -37,6 +37,10 @@ class RetryDeadlineError(RuntimeError):
     pass
 
 
+class RetryDeadlineSetupError(RetryDeadlineError):
+    """A permanent runtime refusal before any HTTP attempt, not an elapsed deadline."""
+
+
 def rate_limit_error(value) -> bool:
     """Only explicitly temporary rate limits; never infer from error prose."""
     if not isinstance(value, dict):
@@ -117,10 +121,10 @@ def request_deadline(seconds: float | None):
         return
     if (not hasattr(signal, "setitimer")
             or threading.current_thread() is not threading.main_thread()):
-        raise RetryDeadlineError("LLM retry deadline requires the main thread of a Unix client")
+        raise RetryDeadlineSetupError("LLM retry deadline requires the main thread of a Unix client")
     previous_timer = signal.getitimer(signal.ITIMER_REAL)
     if previous_timer[0] > 0:
-        raise RetryDeadlineError("LLM retry deadline cannot replace an existing process alarm")
+        raise RetryDeadlineSetupError("LLM retry deadline cannot replace an existing process alarm")
     previous_handler = signal.getsignal(signal.SIGALRM)
     restored = False
 

@@ -172,9 +172,13 @@ class Columns:
             continuation = " " * 14 + "│ "
         return prefix, continuation, max(2, width - len(prefix))
 
-    def _prefix(self):
+    def _prefix(self, parts=None):
         prefix, continuation, _ = self._layout(self.role)
-        self.out.write(prefix if not self.line_started else continuation)
+        value = prefix if not self.line_started else continuation
+        if parts is None:
+            self.out.write(value)
+        else:
+            parts.append(value)
         self.line_started = True
         self.used = 0
 
@@ -193,9 +197,10 @@ class Columns:
             self.role = role
             self.stamp = stamp if stamp is not None else self.clock().strftime("%H:%M")
         _, _, available = self._layout(role)
+        parts = []
         for char in value:
             if char == "\n":
-                self.out.write("\n")
+                parts.append("\n")
                 self.line_started = True
                 self.used = 0
                 continue
@@ -204,13 +209,15 @@ class Columns:
             for item in text:
                 cells = _cells(item)
                 if self.used + cells > available:
-                    self.out.write("\n")
+                    parts.append("\n")
                     self.line_started = True
                     self.used = 0
                 if self.used == 0:
-                    self._prefix()
-                self.out.write(item)
+                    self._prefix(parts)
+                parts.append(item)
                 self.used += cells
+        if parts:
+            self.out.write(''.join(parts))
         self.out.flush()
 
     def finish(self):

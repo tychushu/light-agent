@@ -43,10 +43,16 @@ class Config:
     max_task_seconds: float = 600.0
     max_task_tokens: int = 0
     auto_extend_segments: bool = False
+    # Unattended recovery for automatic tasks: after a step limit, a call/time budget
+    # window or a transient provider failure, resume the same task by itself while it
+    # keeps making new progress.  Only active when auto_continue is on.
+    auto_resume: bool = True
+    auto_resume_max: int = 8
+    auto_resume_max_wait: float = 300.0
     auto_compact: bool = True
     auto_compact_keep_turns: int = 2
     auto_compact_task: bool = False
-    auto_compact_keep_groups: int = 2
+    auto_compact_keep_groups: int = 6
     auto_compact_threshold: float = 0.75
     context_recovery: bool = False
     no_progress_detection: bool = False
@@ -61,8 +67,9 @@ class Config:
     token_metadata_base_url: str = ""
     reasoning_effort: str = ""
     ui_language: str = "zh"
-    tool_history_keep_groups: int = 2
+    tool_history_keep_groups: int = 6
     retry_total_timeout: float = 0.0
+    max_response_bytes: int = 16 * 1024 * 1024
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -77,11 +84,12 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "rtk_enabled", "rtk_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments", "auto_compact", "auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold", "tool_history_keep_groups", "context_recovery", "no_progress_detection", "no_progress_threshold", "context_window_tokens", "output_reserve_tokens", "max_output_tokens", "chat_include_usage", "chat_max_tokens_field", "token_count_mode", "token_cache_ttl", "token_metadata_base_url", "reasoning_effort"}
+        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "rtk_enabled", "rtk_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments", "auto_resume", "auto_resume_max", "auto_resume_max_wait", "auto_compact", "auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold", "tool_history_keep_groups", "context_recovery", "no_progress_detection", "no_progress_threshold", "context_window_tokens", "output_reserve_tokens", "max_output_tokens", "chat_include_usage", "chat_max_tokens_field", "token_count_mode", "token_cache_ttl", "token_metadata_base_url", "reasoning_effort"}
         for key in valid & raw.keys():
             setattr(config, key, raw[key])
         config.ui_language = raw.get('ui_language', 'zh')
         config.retry_total_timeout = raw.get('retry_total_timeout', 0.0)
+        config.max_response_bytes = raw.get('max_response_bytes', config.max_response_bytes)
         from .api_profiles import ProfileStore
         store = ProfileStore(config_path)
         profiles = store.entries(raw)
@@ -95,10 +103,11 @@ class Config:
             for required in ("base_url", "model"):
                 if required not in entry:
                     raise ValueError(f"API profile requires {required}")
-            profile_keys = ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "retry_total_timeout",
+            profile_keys = ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "retry_total_timeout", "max_response_bytes",
                             "user_agent", "stream", "max_context_chars", "wire_api", "max_steps",
                             "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments",
-                            "auto_compact", "auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold",
+                            "auto_resume", "auto_resume_max", "auto_resume_max_wait",
+                            "auto_compact","auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold",
                             "tool_history_keep_groups",
                             "context_recovery", "no_progress_detection", "no_progress_threshold",
                             "context_window_tokens", "output_reserve_tokens", "max_output_tokens",
@@ -120,6 +129,10 @@ class Config:
             raise ValueError("api_key_env must be an environment variable name")
         config.api_key = os.environ.get(config.api_key_env, "") if config.api_key_env else ""
         config.validate()
+        from .security import register_config
+        names = [raw.get('api_key_env', 'TERMUX_AGENT_API_KEY')]
+        names.extend(entry.get('api_key_env', '') for entry in profiles.values() if isinstance(entry, dict))
+        register_config(config_path, names)
         return config
 
     @staticmethod
@@ -154,13 +167,13 @@ class Config:
                     any(ord(c) < 32 or ord(c) == 127 for c in value)):
                 raise ValueError(f"{key} must be an executable name or path without control characters")
         for key, low, high in (("retry_max_attempts", 1, 6), ("max_subagents", 0, 8),
-                               ("subagent_max_steps", 1, 12)):
+                               ("subagent_max_steps", 1, 12), ("max_response_bytes", 1024, 64 * 1024 * 1024)):
             value = getattr(self, key)
             if not isinstance(value, int) or isinstance(value, bool) or not low <= value <= high:
                 raise ValueError(f"{key} must be between {low} and {high}")
         if not isinstance(self.auto_continue, bool):
             raise ValueError("auto_continue must be a boolean")
-        for key in ("auto_extend_segments", "auto_compact", "auto_compact_task", "context_recovery",
+        for key in ("auto_extend_segments", "auto_resume", "auto_compact", "auto_compact_task", "context_recovery",
                     "no_progress_detection", "chat_include_usage", "rtk_enabled"):
             if not isinstance(getattr(self, key), bool):
                 raise ValueError(f"{key} must be a boolean")
@@ -199,6 +212,7 @@ class Config:
         if not isinstance(self.max_steps, int) or isinstance(self.max_steps, bool) or self.max_steps < 1:
             raise ValueError("max_steps must be a positive integer")
         for key, low, high in (("max_task_calls", 1, 1024),
+                               ("auto_resume_max", 0, 50),
                                ("max_task_tokens", 0, 10_000_000),
                                ("auto_compact_keep_groups", 1, 20),
                                ("tool_history_keep_groups", 0, 100),
@@ -214,6 +228,9 @@ class Config:
         if (not isinstance(self.max_task_seconds, (int, float)) or isinstance(self.max_task_seconds, bool)
                 or not math.isfinite(self.max_task_seconds) or not 1 <= self.max_task_seconds <= 86_400):
             raise ValueError("max_task_seconds must be between 1 and 86400 seconds")
+        if (not isinstance(self.auto_resume_max_wait, (int, float)) or isinstance(self.auto_resume_max_wait, bool)
+                or not math.isfinite(self.auto_resume_max_wait) or not 0 <= self.auto_resume_max_wait <= 3600):
+            raise ValueError("auto_resume_max_wait must be between 0 and 3600 seconds")
         if (not isinstance(self.auto_compact_threshold, (int, float))
                 or isinstance(self.auto_compact_threshold, bool)
                 or not math.isfinite(self.auto_compact_threshold)
@@ -240,10 +257,12 @@ class Config:
         if (not isinstance(self.token_metadata_base_url, str)
                 or self.token_metadata_base_url and not self.token_metadata_base_url.startswith(("http://", "https://"))):
             raise ValueError("token_metadata_base_url must be an http(s) URL or empty")
-        if self.approval_policy not in {"always", "on-risk", "never"}:
+        if not isinstance(self.approval_policy, str) or self.approval_policy not in ("always", "on-risk", "never"):
             raise ValueError("approval_policy must be always, on-risk, or never")
         if not isinstance(self.timeout, (int, float)) or isinstance(self.timeout, bool) or not math.isfinite(self.timeout) or not 0 < self.timeout <= 3600:
             raise ValueError("timeout must be a positive number no greater than 3600 seconds")
+        from .security import register_key_names
+        register_key_names((self.api_key_env,))
 
     def public_dict(self) -> dict[str, Any]:
         """Safe-to-display config; credentials are intentionally omitted."""

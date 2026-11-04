@@ -1,15 +1,16 @@
 """Responses decoding, loaded only for profiles using that wire protocol."""
 from copy import deepcopy
 import json
+from .streaming import iter_sse_data, limited_draft
 
 
-def _failure(value, label, client=None):
-    from .client import ProviderError, ContextLengthError, RateLimitError, upstream_error_fields, upstream_error_text
+def _failure(value, label, client=None, event_type=None):
+    from .client import (ProviderError, ContextLengthError, RateLimitError,
+                         upstream_error_fields, upstream_error_text, is_context_error)
     from .retry import rate_limit_error
     error = upstream_error_fields(value)
     code = error.get('code')
-    if code in ('context_length_exceeded', 'context_window_exceeded', 'prompt_too_long',
-                'context_shift', 'context_shift_error'):
+    if is_context_error(value):
         return ContextLengthError('上下文超过模型窗口；请使用 /compact task、/compact N 或 /clear。',
                                   pre_accept=False)
 
@@ -17,9 +18,12 @@ def _failure(value, label, client=None):
     parts = [upstream_error_text(code, api_key, 80),
              upstream_error_text(error.get('message', ''), api_key, 2000)]
     detail = ': '.join(part for part in parts if part)
+    if not detail and isinstance(event_type, str):
+        # Some gateways send a bare failure event; say so rather than leaving an empty label.
+        detail = upstream_error_text(f'上游未提供错误详情，事件 {event_type}', api_key, 120)
     if rate_limit_error(value):
         return RateLimitError(f'{label}（{detail}）' if detail else label, pre_accept=False)
-    return ProviderError(f'{label}（{detail}）' if detail else label)
+    return ProviderError(f'{label}（{detail}）' if detail else label, pre_accept=False, transient=False)
 
 
 def _decode_output(output, *, incomplete=False):
@@ -83,7 +87,7 @@ def message(client, result):
         text = ('Responses 输出在达到长度上限时截断；正文或工具参数只是未完成草稿，其中工具调用不会执行。'
                 if client.last_finish_reason == 'length'
                 else 'Responses 响应未完成；正文或工具参数只是草稿，工具调用不会执行。')
-        raise IncompleteOutputError(text, answer)
+        raise IncompleteOutputError(text, answer, context_limited=client.context_limited)
     answer = _decode_output(result.get('output', []))
     client.last_finish_reason = 'content_filter' if answer.get('refusal') else 'stop'
     return answer
@@ -91,7 +95,7 @@ def message(client, result):
 
 def read_sse(client, response):
     from .client import ClientError
-    items, content, reasoning, data_lines = {}, [], [], []
+    items, content, reasoning, arguments = {}, [], [], {}
     terminal = None
 
     def consume(data):
@@ -106,7 +110,7 @@ def read_sse(client, response):
             return
         kind = event.get('type', '')
         if kind in ('error', 'response.failed'):
-            raise _failure(event.get('response', event), 'Responses 流式请求失败', client=client)
+            raise _failure(event.get('response', event), 'Responses 流式请求失败', client=client, event_type=kind)
         if kind in ('response.completed', 'response.incomplete'):
             terminal = event.get('response')
             if not isinstance(terminal, dict):
@@ -122,15 +126,21 @@ def read_sse(client, response):
             if not isinstance(item, dict):
                 raise ClientError('Invalid Responses output item')
             items[index] = deepcopy(item)
+            if item.get('type') == 'function_call':
+                value = item.get('arguments', '')
+                if not isinstance(value, str):
+                    raise ClientError('Invalid Responses function arguments')
+                if 'arguments' in item or index not in arguments:
+                    arguments[index] = [value]
         elif kind == 'response.function_call_arguments.delta':
             delta = event.get('delta')
             if index not in items or items[index].get('type') != 'function_call' or not isinstance(delta, str):
                 raise ClientError('Responses function argument delta has no matching call')
-            items[index]['arguments'] = items[index].get('arguments', '') + delta
+            arguments.setdefault(index, []).append(delta)
         elif kind == 'response.function_call_arguments.done':
             if index not in items or not isinstance(event.get('arguments'), str):
                 raise ClientError('Invalid Responses completed arguments')
-            items[index]['arguments'] = event['arguments']
+            arguments[index] = [event['arguments']]
         elif kind == 'response.output_text.delta' or kind in (
                 'response.reasoning.delta', 'response.reasoning_text.delta', 'response.reasoning_summary_text.delta'):
             delta = event.get('delta')
@@ -140,25 +150,44 @@ def read_sse(client, response):
             target.append(delta)
             client._emit('content' if target is content else 'reasoning', delta)
 
-    for line in response.iter_lines():
-        if not line:
-            if data_lines:
-                consume('\n'.join(data_lines))
-                data_lines.clear()
-        elif line.startswith('data:'):
-            data_lines.append(line[5:].lstrip())
-    if data_lines:
-        consume('\n'.join(data_lines))
+    def collected_output():
+        result = []
+        for index in sorted(items):
+            item = dict(items[index])
+            if item.get('type') == 'function_call':
+                item['arguments'] = ''.join(arguments.get(index, [item.get('arguments', '')]))
+            result.append(item)
+        return result
+
+    def draft():
+        calls = [{'id': item.get('call_id') or item.get('id', ''), 'function': {
+            'name': item.get('name', ''), 'arguments': item.get('arguments', '')}}
+            for item in collected_output() if item.get('type') == 'function_call']
+        return limited_draft(''.join(content), ''.join(reasoning), calls)
+
+    try:
+        for data in iter_sse_data(response, client.config.max_response_bytes):
+            consume(data)
+    except Exception as exc:
+        exc.assistant_message = draft()
+        raise
     if terminal is None:
-        raise ClientError('Responses 流在完成事件前结束；未执行其中的工具调用。')
+        error = ClientError('Responses 流在完成事件前结束；未执行其中的工具调用。')
+        error.assistant_message = draft()
+        raise error
     if 'output' not in terminal:
-        output = [items[i] for i in sorted(items)]
+        output = collected_output()
         if content and not any(i.get('type') == 'message' and i.get('content') for i in output):
             output = [i for i in output if i.get('type') != 'message']
             output.append({'type': 'message', 'role': 'assistant',
                            'content': [{'type': 'output_text', 'text': ''.join(content)}]})
         terminal['output'] = output
-    answer = message(client, terminal)
+    try:
+        answer = message(client, terminal)
+    except ClientError as exc:
+        if not isinstance(getattr(exc, 'assistant_message', None), dict):
+            exc.assistant_message = draft()
+        raise
     if reasoning and not answer.get('reasoning_content'):
         answer['reasoning_content'] = ''.join(reasoning)
     emitted = ''.join(content)

@@ -15,6 +15,8 @@ import json
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from .paths import tool_path, normalize_tool_args
+from .security import child_environment
 
 from .output_compression import (MIN_ARTIFACT_BYTES, RAW_STREAM_BYTES, OutputCompressor,
                                 finalize_result_metrics, meaningful_reduction,
@@ -169,7 +171,7 @@ def _web_fetch(args: dict, cap: int, binary: str | None = None,
         command += ["--dump-selector", selector.strip()]
     command.append(url)
 
-    env = os.environ.copy()
+    env = child_environment()
     # Upstream telemetry is on by default; never send it from this agent.
     env["LIGHTPANDA_DISABLE_TELEMETRY"] = "true"
     env.update({"TERM": "dumb", "CI": "1"})
@@ -322,6 +324,13 @@ def _atomic_write(path: Path, data: bytes) -> None:
         if mode is not None:
             os.chmod(temp_name, mode)
         os.replace(temp_name, path)
+        # Keep private modes and existing link replacement semantics; persist the
+        # directory entry as well as the file contents before claiming success.
+        directory_fd = os.open(parent, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     except BaseException:
         try:
             os.unlink(temp_name)
@@ -343,7 +352,7 @@ def _shell(args: dict, cap: int, output_compressor: OutputCompressor | None = No
         raise NotADirectoryError(cwd)
     prefix = os.environ.get("PREFIX", "")
     bash = os.path.join(prefix, "bin/bash") if prefix and os.path.isfile(os.path.join(prefix, "bin/bash")) else shutil.which("bash") or "/bin/bash"
-    env = os.environ.copy()
+    env = child_environment()
     env.update({"TERM": "dumb", "GIT_TERMINAL_PROMPT": "0", "CI": "1"})
     if output_compressor is not None:
         # The shell boundary owns the per-attempt reset even when plan() is
@@ -647,7 +656,7 @@ def _shell(args: dict, cap: int, output_compressor: OutputCompressor | None = No
 
 
 def _read_file(args: dict, cap: int) -> dict:
-    path = Path(args["path"])
+    path = tool_path(args["path"])
     if ("start_line" in args or "end_line" in args or
             ("offset" not in args and "limit" not in args)):
         return _read_lines(path, args, cap)
@@ -734,7 +743,7 @@ def _write_file(args: dict) -> dict:
     if not isinstance(content, str):
         raise ValueError("content must be a string")
     data = content.encode("utf-8")
-    path = Path(args["path"])
+    path = tool_path(args["path"])
     _atomic_write(path, data)
     return {**_write_verification(path, data), "chars_written": len(content)}
 
@@ -759,7 +768,7 @@ def _write_verification(path: Path, data: bytes) -> dict:
 
 
 def _edit_file(args: dict) -> dict:
-    path = Path(args["path"])
+    path = tool_path(args["path"])
     old, new = args["old_text"], args["new_text"]
     expected = args.get("expected_replacements", 1)
     if not isinstance(old, str) or not isinstance(new, str):
@@ -790,6 +799,7 @@ def execute(name: str, args: dict, max_output_chars: int = 20000, *,
     try:
         if not isinstance(args, dict):
             raise ValueError("tool arguments must be an object")
+        args = normalize_tool_args(name, args)
         cap = int(max_output_chars)
         if cap < len("\n[TRUNCATED]\n") + 8:
             raise ValueError("max_output_chars is too small for truncation marker")

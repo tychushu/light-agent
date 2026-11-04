@@ -413,7 +413,8 @@ def run_rtk_filter(binary: str, format_name: str, payload: bytes,
         payload.decode("utf-8")
     except UnicodeDecodeError:
         return FilterResult(None, None, error="output is not UTF-8 text")
-    env = os.environ.copy()
+    from .security import child_environment
+    env = child_environment()
     env["RTK_TELEMETRY_DISABLED"] = "1"
     env.update({"TERM": "dumb", "CI": "1"})
     result = _bounded_process([binary, "pipe", "--filter", format_name], payload, env,

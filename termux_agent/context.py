@@ -2,6 +2,7 @@
 from copy import deepcopy
 import hashlib
 import json
+from .continuation import CONTROL_USER_PREFIXES, is_task_start
 
 
 def context_chars(messages, tools=()):
@@ -14,8 +15,7 @@ def compact_messages(messages, keep_turns, archive_id):
     validate_messages(messages)
     if isinstance(keep_turns, bool) or not isinstance(keep_turns, int) or not 1 <= keep_turns <= 100:
         raise ValueError('Use /compact [1–100 recent user turns]')
-    starts = [i for i, m in enumerate(messages) if m['role'] == 'user' and
-              not str(m.get('content', '')).startswith('[Context archive:')]
+    starts = task_starts(messages)
     if len(starts) <= keep_turns:
         return list(messages), 0
     start = starts[-keep_turns]
@@ -28,7 +28,61 @@ def compact_messages(messages, keep_turns, archive_id):
     return result, start - 1
 
 
-_CONTROL_USER = ("[Context archive:", "[Task memo:", "[TASK_RESUME]", "[TASK_CONTINUE]")
+_CONTROL_USER = CONTROL_USER_PREFIXES
+
+
+def task_starts(messages):
+    """Indexes of the human messages that begin a task.
+
+    Generated notes and bare "继续执行"-style resume messages carry no new goal, so
+    they never become a task boundary.  A history made only of such messages falls
+    back to every non-control user message, keeping legacy sessions compactable.
+    """
+    users = [(i, _text(m.get('content'))) for i, m in enumerate(messages) if m.get('role') == 'user']
+    real = [i for i, text in users if is_task_start(text)]
+    return real or [i for i, text in users if not text.startswith(_CONTROL_USER)]
+
+
+def _memo_references(messages):
+    """Recover our bounded indexes, treating saved memo content as untrusted data."""
+    references = []
+    for message in messages:
+        text = message.get('content')
+        if message.get('role') != 'user' or not isinstance(text, str):
+            continue
+        try:
+            if text.startswith('[Task memo: ') and text.endswith(']'):
+                value = json.loads(text[len('[Task memo: '):-1])
+                items = value.get('artifact_manifest', []) if isinstance(value, dict) else []
+                references.extend({'tool': item} for item in items if isinstance(item, dict))
+            elif text.startswith('[Context archive: ') and '] ' in text:
+                value = json.loads(text.split('] ', 1)[1])
+                items = value.get('references', []) if isinstance(value, dict) else []
+                references.extend(item for item in items if isinstance(item, dict))
+        except (ValueError, TypeError):
+            continue
+    return references
+
+
+def _bounded_references(references):
+    """Newest unique references win; never grow a memo by copying old memo text."""
+    bounded, seen, size = [], set(), 0
+    for item in reversed(references):
+        encoded = json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        identity = hashlib.sha256(encoded.encode()).hexdigest()
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if len(encoded) > 2000:
+            item = {'excerpt': encoded[:1600], 'sha256': identity}
+            encoded = json.dumps(item, ensure_ascii=False, separators=(',', ':'))
+        if size + len(encoded) > 8000 or len(bounded) >= 24:
+            # Keep considering older small references that fit. The bounded
+            # index may have gaps; complete history remains in the archive.
+            continue
+        bounded.append(item)
+        size += len(encoded)
+    return list(reversed(bounded))
 
 
 def _text(value):
@@ -173,13 +227,12 @@ def compact_context_messages(messages, keep_groups, archive_id, *, keep_turns=2,
     for value in (keep_groups, keep_turns):
         if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 100:
             raise ValueError('Context retention must be between 1 and 100')
-    starts = [i for i, message in enumerate(messages) if message.get('role') == 'user'
-              and not _text(message.get('content')).startswith(_CONTROL_USER)]
+    starts = task_starts(messages)
     recent = starts[-min(keep_turns, len(starts))] if starts else len(messages)
     groups = _tool_groups(messages, 1)
     retained = {start for start, _ in groups[-keep_groups:]}
     omitted = set()
-    notes = []
+    notes = _memo_references(messages)
     omitted_groups = reduced_calls = 0
     for start, end in groups:
         if start in retained or _uncertain_group(messages, start, end):
@@ -204,17 +257,7 @@ def compact_context_messages(messages, keep_groups, archive_id, *, keep_turns=2,
     if not omitted:
         return deepcopy(messages), {'omitted_groups': 0, 'reduced_calls': 0, 'omitted_messages': 0}
     # The memo has a fixed bound even after thousands of calls or repeated compactions.
-    bounded, size = [], 0
-    for note in reversed(sorted(notes, key=lambda item: item['message_index'])):
-        encoded = json.dumps(note, ensure_ascii=False, separators=(',', ':'))
-        if len(encoded) > 2000:
-            note = {'message_index': note['message_index'], 'excerpt': encoded[:1600],
-                    'sha256': hashlib.sha256(encoded.encode()).hexdigest()}
-            encoded = json.dumps(note, ensure_ascii=False, separators=(',', ':'))
-        if size + len(encoded) > 8000 or len(bounded) >= 24:
-            break
-        bounded.append(note)
-        size += len(encoded)
+    bounded = _bounded_references(notes)
     note = {'role': 'user', 'content': f'[Context archive: {archive_id}] ' + json.dumps({
         'note': 'Local context reduction. Every human instruction is retained verbatim. '
                 'Full omitted messages remain in the archived session, including earlier archive links. '
@@ -222,7 +265,7 @@ def compact_context_messages(messages, keep_groups, archive_id, *, keep_turns=2,
                 'Do not infer missing facts or replay tools; ask the user for details when needed. '
                 'CLI /recall, /history and /export are user commands, not model tools.',
         'omitted_messages': len(omitted), 'omitted_tool_groups': omitted_groups,
-        'references': list(reversed(bounded)), 'references_omitted': len(notes) - len(bounded),
+        'references': bounded, 'references_omitted': len(notes) - len(bounded),
     }, ensure_ascii=False, separators=(',', ':'))}
     result = [deepcopy(messages[0]), note,
               *(deepcopy(m) for i, m in enumerate(messages[1:], 1) if i not in omitted)]
@@ -256,9 +299,7 @@ def compact_tool_history_messages(messages, keep_groups, archive_id):
             'after_chars': context_chars(messages), 'skipped_no_reduction': True,
         }
 
-    starts = [index for index, message in enumerate(messages)
-              if message.get('role') == 'user'
-              and not _text(message.get('content')).startswith(_CONTROL_USER)]
+    starts = task_starts(messages)
     current_start = starts[-1] if starts else len(messages)
     groups = _tool_groups(messages, 1)
     older = [group for group in groups if group[0] < current_start]
@@ -276,7 +317,7 @@ def compact_tool_history_messages(messages, keep_groups, archive_id):
         }
 
     omitted = set()
-    references = []
+    references = _memo_references(messages[:current_start])
     reduced_calls = 0
     for start, end in omitted_groups:
         omitted.update(range(start, end))
@@ -291,18 +332,7 @@ def compact_tool_history_messages(messages, keep_groups, archive_id):
         if message.get('role') == 'user' and text.startswith(('[Context archive:', '[Task memo:')):
             omitted.add(index)
 
-    bounded, size = [], 0
-    for reference in reversed(sorted(references, key=lambda item: item['message_index'])):
-        encoded = json.dumps(reference, ensure_ascii=False, separators=(',', ':'))
-        if len(encoded) > 2000:
-            reference = {'message_index': reference['message_index'],
-                         'excerpt': encoded[:1600],
-                         'sha256': hashlib.sha256(encoded.encode()).hexdigest()}
-            encoded = json.dumps(reference, ensure_ascii=False, separators=(',', ':'))
-        if size + len(encoded) > 8000 or len(bounded) >= 24:
-            break
-        bounded.append(reference)
-        size += len(encoded)
+    bounded = _bounded_references(references)
 
     note = {'role': 'user', 'content': f'[Context archive: {archive_id}] ' + json.dumps({
         'note': 'Earlier completed tool groups were reduced to bounded artifact references. '
@@ -311,7 +341,7 @@ def compact_tool_history_messages(messages, keep_groups, archive_id):
                 'instructions. Full history, including earlier archive links, remains in the archive. '
                 'Do not replay tools or infer omitted facts.',
         'omitted_tool_groups': len(omitted_groups), 'reduced_calls': reduced_calls,
-        'references': list(reversed(bounded)),
+        'references': bounded,
         'references_omitted': len(references) - len(bounded),
     }, ensure_ascii=False, separators=(',', ':'))}
     result = [deepcopy(messages[0]), note,
@@ -340,9 +370,7 @@ def compact_task_messages(messages, keep_groups, archive_id, task_start=None):
     if isinstance(keep_groups, bool) or not isinstance(keep_groups, int) or not 1 <= keep_groups <= 100:
         raise ValueError('Use /compact task [1–100 recent complete tool groups]')
     if task_start is None:
-        candidates = [i for i, message in enumerate(messages)
-                      if message.get('role') == 'user'
-                      and not _text(message.get('content')).startswith(_CONTROL_USER)]
+        candidates = task_starts(messages)
         if not candidates:
             raise ValueError('No task user message was found')
         task_start = candidates[-1]
@@ -356,12 +384,15 @@ def compact_task_messages(messages, keep_groups, archive_id, task_start=None):
     retained = groups[-keep_groups:]
     retained_start = retained[0][0]
     old_groups = groups[:-keep_groups] if len(groups) > keep_groups else []
-    manifest = []
+    previous = _memo_references(messages[task_start + 1:retained_start])
+    references = previous[:]
     for start, end in old_groups:
         assistant = messages[start]
         results = {item.get('tool_call_id'): item.get('content') for item in messages[start + 1:end]}
         for call in assistant.get('tool_calls', []):
-            manifest.append(artifact_reference(call, results.get(call.get('id'))))
+            references.append({'tool': artifact_reference(call, results.get(call.get('id')))})
+    bounded = _bounded_references(references)
+    manifest = [item['tool'] if isinstance(item.get('tool'), dict) else item for item in bounded]
     retained_groups = []
     for start, end in retained:
         retained_groups.extend(deepcopy(messages[start:end]))
@@ -388,6 +419,7 @@ def compact_task_messages(messages, keep_groups, archive_id, task_start=None):
                  'chars': len(_text(message.get('content')))} for message in current_intents
             ],
             'artifact_manifest': manifest,
+            'references_omitted': len(references) - len(bounded),
             'note': 'The original user message and distinct later user messages are retained once above. '
                     'Full messages and argument bodies remain in the archive. Do not infer omitted facts. '
                     'Ask the user for missing details, or use a bounded archive retrieval tool only if one '
@@ -403,6 +435,6 @@ def compact_task_messages(messages, keep_groups, archive_id, task_start=None):
                                     'before_chars': before_chars, 'after_chars': after_chars,
                                     'skipped_no_reduction': True}
     validate_messages(result)
-    return result, {'omitted_groups': len(old_groups), 'reduced_calls': len(manifest),
+    return result, {'omitted_groups': len(old_groups), 'reduced_calls': len(references) - len(previous),
                     'memo_chars': len(memo['content']), 'before_chars': before_chars,
                     'after_chars': after_chars, 'skipped_no_reduction': False}
