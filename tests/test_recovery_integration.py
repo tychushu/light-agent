@@ -1,6 +1,5 @@
 """Independent checks at CLI/persistence boundaries, beyond reducer unit tests."""
 import json
-import re
 import unittest
 from unittest.mock import patch
 
@@ -24,17 +23,15 @@ class RecoveryIntegrationTests(fixtures.AcceptanceTestCase):
         self.assertNotIn('memory-',output)
         self.assertEqual(len(requests.read_text().splitlines()),5)
         with fixtures.open_store(self.root/'store') as store:
-            rows=[store.load(identifier)[1] for identifier in store.ids()]
-            self.assertEqual(len(rows),2)
-            archived=[p for p in rows if sum(m['role']=='tool' for m in p['messages'])==3]
-            reduced=[p for p in rows if sum(m['role']=='tool' for m in p['messages'])==2]
-            self.assertEqual(len(archived),1)
-            self.assertEqual(len(reduced),1)
-            archive_id=reduced[0]['branch']['archive_session_id']
-            self.assertRegex(archive_id,r'^[0-9a-f]{12}$')
-            self.assertIn(archive_id,store.ids())
-            self.assertIn({'role':'user','content':'inspect sources'},reduced[0]['messages'])
-            self.assertIn({'role':'user','content':'review the findings'},reduced[0]['messages'])
+            [identifier] = store.ids()
+            [archive] = store.archives(identifier)
+            original = store.load_archive(archive['id'])['payload']['messages']
+            reduced = store.load(identifier)[1]['messages']
+            self.assertEqual(sum(m['role']=='tool' for m in original), 3)
+            self.assertEqual(sum(m['role']=='tool' for m in reduced), 2)
+            self.assertTrue(any(archive['id'] in m.get('content', '') for m in reduced))
+            self.assertIn({'role':'user','content':'inspect sources'}, reduced)
+            self.assertIn({'role':'user','content':'review the findings'}, reduced)
 
 
 class UIInterruptionTests(unittest.TestCase):

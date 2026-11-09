@@ -135,6 +135,7 @@ class Client:
         self.on_stream: Callable[[str, str], None] | None = None
         self._last_request = None
         self._last_request_wire = None
+        self._last_request_profile = None
         self.last_usage: dict[str, Any] | None = None
         self.streamed = False
         self.streamed_text = False
@@ -154,7 +155,9 @@ class Client:
 
     @last_request.setter
     def last_request(self, value):
-        self._last_request, self._last_request_wire = value, None
+        self._last_request = value
+        self._last_request_wire = None
+        self._last_request_profile = None
 
     def set_retry_hooks(self, *, remaining_seconds=None, on_progress=None, initial_cooldown=None):
         self._remaining_budget, self._retry_state = remaining_seconds, on_progress
@@ -256,21 +259,61 @@ class Client:
             body["tools"] = resp_tools
         return url, body
 
-    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+    @staticmethod
+    def _wire_json(value: Any) -> tuple[str, bytes]:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        return text, text.encode("utf-8")
+
+    def _profile_identity(self) -> tuple[str, str, str, str]:
+        # Deliberately excludes credentials and all authentication settings.
+        return (self.config.base_url.rstrip("/"), str(getattr(self.config, "api_profile", "")),
+                str(getattr(self.config, "wire_api", "chat_completions")), self.config.model)
+
+    def _prepare_chat_request(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        private = {'_responses_output', '_incomplete_output', '_incomplete_tool_calls'}
+        chat_messages = [{k: v for k, v in m.items() if k not in private} for m in messages]
+        body = {"model": self.config.model, "messages": chat_messages, "tools": tools,
+                "tool_choice": "auto", "stream": bool(getattr(self.config, "stream", True))}
+        if getattr(self.config, "max_output_tokens", 0):
+            body[getattr(self.config, "chat_max_tokens_field", "max_completion_tokens")] = self.config.max_output_tokens
+        if getattr(self.config, "reasoning_effort", ""):
+            body["reasoning_effort"] = self.config.reasoning_effort
+        if body["stream"] and getattr(self.config, "chat_include_usage", False):
+            body["stream_options"] = {"include_usage": True}
+        return self.config.base_url.rstrip("/") + "/chat/completions", body
+
+    def prepare_request(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+        """Build the exact pure request body subsequently sent by ``chat``."""
         if getattr(self.config, "wire_api", "chat_completions") == "responses":
-            url, body = self._prepare_responses_request(messages, tools)
+            return self._prepare_responses_request(messages, tools)
+        return self._prepare_chat_request(messages, tools)
+
+    def request_context(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        """Project a request for budget accounting without headers or HTTP I/O."""
+        _, body = self.prepare_request(messages, tools)
+        request_text, request_wire = self._wire_json(body)
+        if getattr(self.config, "wire_api", "chat_completions") == "responses":
+            prompt_body = {"input": body.get("input", []), "tools": body.get("tools", [])}
+            projected_messages = prompt_body["input"]
         else:
-            private = {'_responses_output', '_incomplete_output', '_incomplete_tool_calls'}
-            chat_messages = [{k: v for k, v in m.items() if k not in private} for m in messages]
-            body = {"model": self.config.model, "messages": chat_messages, "tools": tools,
-                    "tool_choice": "auto", "stream": bool(getattr(self.config, "stream", True))}
-            if getattr(self.config, "max_output_tokens", 0):
-                body[getattr(self.config, "chat_max_tokens_field", "max_completion_tokens")] = self.config.max_output_tokens
-            if getattr(self.config, "reasoning_effort", ""):
-                body["reasoning_effort"] = self.config.reasoning_effort
-            if body["stream"] and getattr(self.config, "chat_include_usage", False):
-                body["stream_options"] = {"include_usage": True}
-            url = self.config.base_url.rstrip("/") + "/chat/completions"
+            prompt_body = {"messages": body.get("messages", []), "tools": body.get("tools", []),
+                           "tool_choice": body.get("tool_choice")}
+            projected_messages = prompt_body["messages"]
+        prompt_text = json.dumps(prompt_body, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        provider_prompt_tokens = None
+        if (self._last_request_wire == request_wire
+                and self._last_request_profile == self._profile_identity()
+                and isinstance(self.last_usage, dict)):
+            value = self.last_usage.get("prompt_tokens")
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                provider_prompt_tokens = value
+        return {"chars": len(request_text), "prompt_wire": prompt_text,
+                "messages": projected_messages, "tools": body.get("tools", []),
+                "provider_prompt_tokens": provider_prompt_tokens}
+
+    def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> dict[str, Any]:
+        url, body = self.prepare_request(messages, tools)
+        _, wire = self._wire_json(body)
         self.last_request = None
         self.last_attempts = 0
         self.last_usage = None
@@ -278,6 +321,8 @@ class Client:
         self.context_limited = False
         self.streamed = self.streamed_text = False
         self.last_accepted = False
+        self._last_request_wire = wire
+        self._last_request_profile = self._profile_identity()
         self._marker_filter = MarkerFilter(self.control_markers) if self.control_markers else None
         headers = {"Content-Type": "application/json", "User-Agent": self.config.user_agent}
         if self.config.api_key:
@@ -293,17 +338,13 @@ class Client:
             if remaining <= 0:
                 raise NetworkError("LLM retry deadline exceeded")
             with request_deadline(remaining) as accepted:
-                return self._chat_attempts(body, url, headers, thinking_retry, deadline, accepted)
+                return self._chat_attempts(wire, url, headers, thinking_retry, deadline, accepted, body['stream'])
         except RetryDeadlineError as exc:
             self._check_owner_budget()
             raise NetworkError(str(exc), transient=not isinstance(exc, RetryDeadlineSetupError)) from None
 
-    def _chat_attempts(self, body, url, headers, thinking_retry, deadline, accepted):
+    def _chat_attempts(self, wire, url, headers, thinking_retry, deadline, accepted, stream):
         waited = 0.0
-        # Serialize once so every HTTP attempt carries the same bytes, even if
-        # a caller modifies its original message objects while we are waiting.
-        wire = self._http.build_request("POST", url, json=body, headers=headers).content
-        self._last_request_wire = wire
         max_attempts = getattr(self.config, "retry_max_attempts", 3)
         if self._initial_cooldown:
             delay = self._initial_cooldown()
@@ -380,7 +421,7 @@ class Client:
                 # body-read timeouts; no path below can restart the request.
                 accepted()
                 self.last_accepted = True
-                if body["stream"]:
+                if stream:
                     self.streamed = True
                     return self._checked_message(self._read_sse(response))
                 raw = b''.join(response_chunks(response, self.config.max_response_bytes))

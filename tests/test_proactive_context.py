@@ -188,7 +188,7 @@ class ProactiveContextTests(unittest.TestCase):
 
 
 class DurableContextTests(fixtures.AcceptanceTestCase):
-    def test_loaded_large_history_branches_on_continue_original_row_unchanged(self):
+    def test_loaded_large_history_compacts_in_place_and_keeps_original_snapshot(self):
         config_path = self.root/'config.toml'
         config_path.write_text('base_url="http://127.0.0.1:9/v1"\nmodel="acceptance-model"\n'
                                'stream=false\nmax_context_chars=40000\nauto_continue=false\n')
@@ -209,11 +209,12 @@ class DurableContextTests(fixtures.AcceptanceTestCase):
         request = json.loads(requests.read_text().splitlines()[0])
         self.assertLess(context_chars(request['messages'],request['tools']),40000)
         with fixtures.open_store(self.root/'store') as store:
-            self.assertEqual(before,store.db.execute('select * from sessions where id=?',(original_id,)).fetchone())
-            self.assertEqual(len(store.ids()),2)
-            branch_id = next(i for i in store.ids() if i!=original_id)
-            payload=store.load(branch_id)[1]
-            self.assertEqual(payload['branch']['archive_session_id'],original_id)
+            self.assertEqual(store.ids(), [original_id])
+            [archive] = store.archives(original_id)
+            saved = store.load_archive(archive['id'])
+            self.assertEqual(saved['payload']['messages'], json.loads(before[-1])['messages'])
+            self.assertEqual(saved['title'], 'original')
+            payload=store.load(original_id)[1]
             self.assertEqual(payload['task_state']['compactions'],1)
         self.assertEqual(len(requests.read_text().splitlines()),1)
 

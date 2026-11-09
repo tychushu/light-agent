@@ -513,14 +513,16 @@ class CliResumeTests(unittest.TestCase):
         self.assertEqual(client.sent[-1][-1]['content'], '"continue"')
         self.assertIn('literal received', shown)
         self.assertNotIn('不新建任务', shown)
-        self.assertEqual(len(rows), 2, rows)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn('已压缩上下文', shown)
 
-    def test_a_new_instruction_still_branches_and_reduces_old_tool_history(self):
+    def test_a_new_instruction_reduces_old_tool_history_within_same_session(self):
         shown, rows, client = self.run_cli(['update hermes', 'now clean up the temp files'],
                                            [{'content': 'cleaned [TASK_DONE]'}], self.settings)
         self.assertIn('cleaned', shown)
-        self.assertEqual(len(rows), 2, rows)
-        self.assertTrue(any('compact task' in title for _, title in rows))
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0][1], 'update hermes')
+        self.assertIn('已压缩上下文', shown)
         self.assertLess(sum(m['role'] == 'tool' for m in client.sent[-1]), 5)
 
     def test_automatic_resume_finishes_the_whole_task_without_typing_anything(self):

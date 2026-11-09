@@ -181,7 +181,7 @@ out = io.StringIO()
 err = io.StringIO()
 patches = [
     patch.object(cli.sys, "argv", ["ta", *scenario["argv"]]),
-    patch("builtins.input", side_effect=scenario["prompts"]),
+    patch("builtins.input", side_effect=[*scenario["prompts"], EOFError()]),
     patch.object(cli.sys, "stdout", out),
     patch.object(cli.sys, "stderr", err),
     patch("termux_agent.agent.Client", factory),
@@ -617,7 +617,7 @@ class CliCompactionTests(AcceptanceTestCase):
             messages.extend([assistant, tool_result(current["id"], {"content": "ok", "offset": index})])
         return messages
 
-    def test_real_cli_auto_compaction_archives_and_branches_without_rewriting_original(self):
+    def test_real_cli_auto_compaction_keeps_id_and_archives_original_messages(self):
         config_path = self.root / "auto-compact.toml"
         config_path.write_text('base_url="http://127.0.0.1:9/v1"\nmodel="acceptance-model"\n'
                                'approval_policy="never"\nstream=false\nmax_steps=6\n'
@@ -669,10 +669,12 @@ class CliCompactionTests(AcceptanceTestCase):
         with open_store(store_root) as store:
             row_after = store.db.execute("SELECT title,updated,revision,payload FROM sessions WHERE id=?",
                                          (original_id,)).fetchone()
-            self.assertEqual(row_after, row_before)
-            new_ids = [identifier for identifier in store.ids() if identifier != original_id]
-            self.assertEqual(len(new_ids), 1)
-            compacted = store.load(new_ids[0])[1]
+            self.assertEqual(row_after[0], row_before[0])
+            self.assertEqual(store.ids(), [original_id])
+            [archive] = store.archives(original_id)
+            self.assertEqual(store.load_archive(archive['id'])['payload']['messages'][:len(original_payload['messages'])],
+                             original_payload['messages'])
+            compacted = store.load(original_id)[1]
         self.assertLess(len(compacted["messages"]), len(original_payload["messages"]))
         compacted_by_id = {message.get("tool_calls", [{}])[0].get("id"): message
                            for message in compacted["messages"] if message.get("tool_calls")}
@@ -731,14 +733,9 @@ class CliCompactionTests(AcceptanceTestCase):
             self.assertGreaterEqual(after[2], before[2] + 1)
             self.assertEqual(after[0], "External source title")
             self.assertIn("EXTERNAL DATA MUST SURVIVE", after[3])
-            if new_ids:
-                branches = [store.load(item)[1] for item in new_ids]
-                self.assertTrue(any(
-                    any(str(message.get("content", "")).startswith("[Task memo:")
-                        for message in branch["messages"])
-                    for branch in branches))
-            else:
-                self.assertRegex(output, r"Session changed/deleted in another process|use /session fork")
+            self.assertEqual(new_ids, [])
+            self.assertEqual(store.archives(identifier), [])
+            self.assertRegex(output, r"Session changed/deleted in another process|use /session fork")
 
     def test_explicit_compact_task_preserves_raw_retained_groups_and_second_call_is_noop(self):
         config_path = self.root / "explicit.toml"

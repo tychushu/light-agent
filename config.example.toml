@@ -63,6 +63,8 @@ base_url = "https://your-provider.example/v1"
 model = "your-cloud-model-id"
 api_key_env = "CLOUD_API_KEY"
 timeout = 300.0
+# Example local request-size guard for a cloud route with a validated large window.
+max_context_chars = 1000000
 # Use for a provider/model requiring the Responses endpoint:
 # wire_api = "responses"
 # Per-profile opt-in; uncomment only if this API returns the known error.

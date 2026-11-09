@@ -202,7 +202,8 @@ class TokenCounter:
                                "template_supported": template_supported, "tokenize_supported": True})
         return count, tool_tokens, bool(rendered is not None)
 
-    def measure(self, messages, tools=(), *, allow_network=True):
+    def measure(self, messages, tools=(), *, allow_network=True, wire_text=None,
+                provider_prompt_tokens=None):
         mode = self.config.token_count_mode
         window = int(self.config.context_window_tokens or 0)
         manual_window = bool(window)
@@ -215,6 +216,13 @@ class TokenCounter:
             metadata_source = 'llama_cpp' if window else 'unknown'
         if mode == "off":
             return {"prompt_tokens": None, "source": "unknown", "context_window_tokens": window or None,
+                    "context_window_source": metadata_source, "template_overhead_tokens": None,
+                    "output_reserve_tokens": output_reserve}
+
+        if (isinstance(provider_prompt_tokens, int) and not isinstance(provider_prompt_tokens, bool)
+                and provider_prompt_tokens >= 0):
+            return {"prompt_tokens": provider_prompt_tokens, "source": "provider", "exact": True,
+                    "context_window_tokens": window or None,
                     "context_window_source": metadata_source, "template_overhead_tokens": None,
                     "output_reserve_tokens": output_reserve}
 
@@ -237,10 +245,18 @@ class TokenCounter:
             except (httpx.HTTPError, ValueError, TypeError, OSError):
                 pass
 
-        serialized = _canonical(messages).decode("utf-8")
-        schemas = _canonical(tools).decode("utf-8")
+        serialized = wire_text if isinstance(wire_text, str) else _canonical(messages).decode("utf-8")
+        schemas = "" if isinstance(wire_text, str) else _canonical(tools).decode("utf-8")
         overhead = 32 + 6 * len(messages)
-        return {"prompt_tokens": estimate_text_tokens(serialized) + estimate_text_tokens(schemas) + overhead,
+        schema_tokens = estimate_text_tokens(schemas) if schemas else 0
+        return {"prompt_tokens": estimate_text_tokens(serialized) + schema_tokens + overhead,
                 "source": "estimate", "exact": False, "context_window_tokens": window or None,
                 "context_window_source": metadata_source, "template_overhead_tokens": overhead,
                 "output_reserve_tokens": output_reserve}
+
+    def measure_request(self, context, *, allow_network=True):
+        """Measure a request projection produced by the real wire client."""
+        return self.measure(context.get("messages", []), context.get("tools", ()),
+                            allow_network=allow_network,
+                            wire_text=context.get("prompt_wire"),
+                            provider_prompt_tokens=context.get("provider_prompt_tokens"))

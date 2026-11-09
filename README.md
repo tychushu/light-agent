@@ -106,8 +106,8 @@ At a new human-task boundary, `tool_history_keep_groups` proactively reduces
 older complete tool groups even below the budget threshold. It defaults to 6
 and accepts 0–100 globally or per API profile; 0 disables this cleanup. All human
 instructions, final answers, the current task's complete tool chain, recent
-groups and unknown side effects are retained. Reduction uses the same archive
-branch mechanism and never replays a tool. `/continue` and short resume-only input
+groups and unknown side effects are retained. Reduction archives the previous
+context within the same session and never replays a tool. `/continue` and short resume-only input
 such as `继续执行` or `keep going` are not new task boundaries, including in legacy
 histories; they do not trigger new-task cleanup.
 
@@ -117,8 +117,9 @@ default and tries to reduce usage to three quarters of that trigger, leaving
 headroom for subsequent steps. It works across conversation turns, even when the
 latest user message has no tools. Explicitly configured thresholds are respected.
 
-Compaction creates an independent active session and retains the full original
-history. It keeps the system prompt, every human instruction, recent answers,
+Automatic compaction keeps the session ID and title. One SQLite transaction saves
+the full preceding context as an archive and replaces the active context. It keeps
+the system prompt, every human instruction, recent answers,
 recent complete assistant/tool groups, and unknown side effects. Older tool
 results become bounded artifact references; older answers may become labeled
 excerpts if needed. Retained reasoning/protocol items are unchanged. This is a
@@ -128,10 +129,17 @@ Budget-driven reduction prefers `auto_compact_keep_groups` (default 6), then hal
 that depth, then 1, choosing the deepest candidate that reaches the target. Six
 is a preference, not a hard floor or a percentage-of-window allocation. Existing
 explicit values such as 2 still override the new defaults.
+Below the hard limit, a soft trim must free at least five percentage points and
+bring usage below the trigger. Explicit compaction and hard-limit recovery can
+apply smaller reductions.
 
 - `/compact`: run the same cross-turn reduction manually.
 - `/compact N`: explicitly retain only the latest N human turns (1–100).
 - `/compact task [N]`: reduce the current task's older complete tool groups.
+- `/session archives [ID|N]`: list saved compaction snapshots. `/session archive
+  ARCHIVE_ID` shows recent messages, and `/export ARCHIVE_ID` exports the full snapshot.
+- `/sessions` folds older linear compaction chains into a single row that opens the
+  latest session. `/sessions all [N]` lists the individual legacy entries.
 - `/recall TEXT`, `/history`, `/session load ID`, and `/export` access saved history.
 
 In interactive terminals the Status bar shows session ID, model, working path,
@@ -141,7 +149,7 @@ title, and current context, for example:
 Context=正常 | Chars=120,000/500,000 (24%) | Tokens≈40,000/未知窗口 | Auto=75%
 ```
 
-`Chars` counts serialized messages plus tool schemas and automatic-task rules.
+`Chars` counts the serialized request, including tool schemas and automatic-task rules.
 It is a local budget, **not** a model token window. `Tokens≈` is an estimate;
 unknown windows are shown explicitly. Set `context_window_tokens` per profile
 when the actual endpoint limit is known. With a known window, status includes its
@@ -149,6 +157,9 @@ token percentage and output reserve. Status redraws never make network requests.
 `token_count_mode = "local"` can lazily use llama.cpp metadata/tokenization before
 requests; cloud profiles use estimates. `/stats` separates provider usage from
 preflight estimates. `token_count_mode = "off"` disables token counting.
+For a validated long-window cloud route, `max_context_chars = 1000000` under its
+profile raises the character trigger to 750,000 at the default threshold.
+Provider token usage can be reused for an identical request and profile.
 
 Set `auto_compact = false` and `auto_compact_task = false` to disable automatic
 reduction. The latter is an optional single-task reduction preference, off by

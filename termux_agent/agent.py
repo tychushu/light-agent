@@ -59,6 +59,7 @@ class Agent:
         self.event = event
         self.checkpoint = None
         self.branch_after_compact = None
+        self.archive_after_compact = None
         self.archive_id = None
         self.base_system = base_system if base_system is not None else (
             load_system_prompt() + ("\n\n" + instructions if instructions else ""))
@@ -438,9 +439,22 @@ class Agent:
                 if rules else projected)
 
     def _context_budget(self, request_messages, *, allow_network=True):
-        chars = context_chars(request_messages, self.tools)
-        token = self.token_counter.measure(request_messages, self.tools,
-                                           allow_network=allow_network and not self.history_only)
+        network = allow_network and not self.history_only
+        # Exact-class matching keeps custom mock clients and Client subclasses on
+        # their historical measurement contract.
+        wire_context = (self.client.request_context(request_messages, self.tools)
+                        if type(self.client) is Client and callable(getattr(self.client, 'request_context', None))
+                        else None)
+        if wire_context is not None:
+            chars = wire_context['chars']
+            if self.config.token_count_mode == 'local' and self.config.api_kind == 'local':
+                # llama.cpp applies its template to Chat-shaped messages.
+                token = self.token_counter.measure(request_messages, self.tools, allow_network=network)
+            else:
+                token = self.token_counter.measure_request(wire_context, allow_network=network)
+        else:
+            chars = context_chars(request_messages, self.tools)
+            token = self.token_counter.measure(request_messages, self.tools, allow_network=network)
         reserve = max(self.config.output_reserve_tokens,
                       getattr(self.config, 'max_output_tokens', 0) or 0)
         window = token.get('context_window_tokens')
@@ -479,8 +493,9 @@ class Agent:
         if not force and (not (self.config.auto_compact or self.config.auto_compact_task)
                           or ratio < self.config.auto_compact_threshold):
             return False
-        archive_id = self.archive_id or 'memory-' + uuid.uuid4().hex[:12]
+        archive_id = self._next_compaction_archive()
         best, best_details, best_ratio = source, None, ratio
+        best_chars = chars
         # Keep a gap below the trigger to avoid branching on every subsequent call.
         target = self.config.auto_compact_threshold * 0.75
         # Bare "继续执行" messages are not tasks: one real task plus resumes is still one task.
@@ -510,18 +525,36 @@ class Agent:
             candidate_ratio = self._context_ratio(after_chars, after_token)
             if candidate_ratio < best_ratio:
                 best, best_details, best_ratio = result, details, candidate_ratio
+                best_chars = after_chars
             if best_ratio <= target:
                 break
         if best_details is None:
             return False
+        # A soft trim should buy room for another tool result. Small reductions
+        # can still help a forced recovery or a request at the hard limit.
+        if not force and ratio < 1 and (ratio - best_ratio < 0.05 or best_ratio >= self.config.auto_compact_threshold):
+            return False
         result, details = best, best_details
-        details.update(before_chars=chars,
-                       after_chars=context_chars(self._request_messages(rules, messages=result), self.tools))
+        details.update(before_chars=chars, after_chars=best_chars)
         return self._publish_compaction(source, result, details, archive_id)
 
+    def _next_compaction_archive(self):
+        if self.archive_after_compact is not None:
+            return 'archive-' + uuid.uuid4().hex[:12]
+        return self.archive_id or 'memory-' + uuid.uuid4().hex[:12]
+
     def _publish_compaction(self, source, result, details, archive_id):
-        persistent = self.branch_after_compact is not None and (
-            self.branch_after_compact(archive_id, result, details) is not False)
+        atomic = self.archive_after_compact is not None
+        if atomic:
+            try:
+                self.archive_after_compact(archive_id, source, result)
+            except BaseException as exc:
+                self.last_run['checkpoint_error'] = type(exc).__name__
+                raise
+            persistent = True
+        else:
+            persistent = self.branch_after_compact is not None and (
+                self.branch_after_compact(archive_id, result, details) is not False)
         if not persistent:
             if not any(item.get('id') == archive_id for item in self.in_memory_archives):
                 if len(self.in_memory_archives) >= 16:
@@ -534,14 +567,15 @@ class Agent:
         self._task_compactions += 1
         self._last_compaction_call = self._total_calls
         self._emit('task_compacted', {'archive': archive_id, 'persistent': persistent, **details})
-        self._checkpoint()
+        if not atomic:
+            self._checkpoint()
         return True
 
     def _trim_tool_history(self, rules=''):
         if (not self.config.tool_history_keep_groups
                 or not (self.config.auto_compact or self.config.auto_compact_task)):
             return False
-        archive_id = self.archive_id or 'memory-' + uuid.uuid4().hex[:12]
+        archive_id = self._next_compaction_archive()
         result, details = compact_tool_history_messages(
             self.messages, self.config.tool_history_keep_groups, archive_id)
         if details.get('skipped_no_reduction'):
@@ -910,8 +944,7 @@ class Agent:
         if resume:
             prospective = self._resume_messages(text)
             first_budget = self._context_budget(self._request_messages(rules, messages=prospective))
-            # Ordering invariant: compaction must choose/persist the new branch
-            # before the first resume checkpoint can write a loaded source row.
+            # Persist the archive and replacement before the first resume checkpoint.
             if self._compact_for_context(messages=prospective, rules=rules, budget=first_budget):
                 first_budget = None
                 # _publish_compaction already checkpointed the changed state.
@@ -1415,6 +1448,7 @@ class Agent:
         self.client.last_request = None
 
     def stats(self) -> dict[str, Any]:
+        chars, token, _ = self._context_budget(self._request_messages())
         totals = {}
         missing = {}
         for field in ("prompt_tokens", "completion_tokens", "total_tokens", "reasoning_tokens"):
@@ -1477,10 +1511,9 @@ class Agent:
                 "tool_schema_chars": len(json.dumps(self.tools, ensure_ascii=False, separators=(",", ":"))),
                 "request_history_chars": list(self._request_history_chars),
                 "current_history_chars": self._history_chars(),
-                "context_budget": {'chars': context_chars(self.messages, self.tools),
+                "context_budget": {'chars': chars,
                                    'limit': self.config.max_context_chars,
-                                   'tokens': self.token_counter.measure(self.messages, self.tools,
-                                                                        allow_network=not self.history_only),
+                                   'tokens': token,
                                    'unit': 'characters fallback plus labeled token estimate/server count'}}
 
     def debug_context(self) -> dict[str, Any]:

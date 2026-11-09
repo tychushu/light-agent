@@ -54,7 +54,8 @@ continue/resume  未完成任务的简短续跑输入；不新建任务，引号
 /copy [text]    复制指定文字或最后一次回答到 Android 剪贴板
 /paste          显示 Android 剪贴板文字
 !command        直接运行 Shell，不调用模型；审批规则仍生效
-/sessions [N]   列出会话：时间、ID、标题、API / 模型、消息数、路径；默认 50，最多 500
+/sessions [N]   列出会话及 API / 模型，折叠旧压缩链；默认 50，最多 500
+/sessions all [N]  展开旧版压缩分支
 /sessions find TEXT  按标题关键词查找已保存会话
 /resume [ID|N]  恢复会话；N 使用最后一次会话列表中的序号
 /resume         列出最近 50 个会话，TTY 中可直接选择序号或 ID
@@ -66,6 +67,8 @@ continue/resume  未完成任务的简短续跑输入；不新建任务，引号
 /session rename-id ID NAME  修改其他会话标题，不切换会话
 /session fork [NAME]  将当前对话复制为独立会话，可指定标题
 /session save        保存当前会话
+/session archives [ID|N]  列出会话的压缩归档
+/session archive ARCHIVE_ID  查看压缩前快照的最近消息；完整内容可用 /export 导出
 /session delete [ID|N]  按列表序号或 ID 删除；不带参数进入选择，需确认
 /history [N] [skip]  查看最近 N 条消息，skip 可向前翻页
 /sub TASK       直接委派一个子任务；/sub 查看执行上限
@@ -375,8 +378,8 @@ def main():
         built.client.on_stream = stream_output
         built.client.on_retry = retry_output
         built.checkpoint = lambda: save_current(checkpoint=True)
-        built.branch_after_compact = lambda archive_id, messages, details: branch_after_compact(
-            archive_id, messages, details)
+        if not options.no_session:
+            built.archive_after_compact = lambda *args: save_compaction(*args)
         return built
 
     try:
@@ -425,13 +428,11 @@ def main():
         return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
 
     def current_branch(archive_id=None):
-        value = dict(branch_state) if active_branch else {
-            'kind': 'active',
-            'source_session_id': session_id,
-            'source_title': source_meta.get('title') if source_meta else None,
-            'source_updated': source_meta.get('updated') if source_meta else None,
-            'source_revision': source_meta.get('revision') if source_meta else None,
-        }
+        value = dict(branch_state)
+        if not active_branch:
+            value.setdefault('source_session_id', session_id)
+            for name in ('title', 'updated', 'revision'):
+                value.setdefault('source_' + name, (source_meta or {}).get(name))
         value['kind'] = 'active'
         if archive_id:
             value['archive_session_id'] = archive_id
@@ -485,16 +486,22 @@ def main():
             # automatic compaction; in-memory IDs are invalid SQLite session IDs.
             agent.archive_id = session_id
 
-    def branch_after_compact(archive_id, messages, details):
-        nonlocal session_id, revision, saved_fingerprint
-        if not store:
-            return False
-        title = current_title()
-        value = snapshot(agent, current_scope(), branch=current_branch(archive_id))
-        value['messages'] = copy.deepcopy(messages)
-        draft = store.draft(archive_id)
-        create_active_branch(value, title[:95] + ' · compact task', archive_id=archive_id, draft=draft)
-        return True
+    def save_compaction(archive_id, source, messages):
+        nonlocal revision, saved_fingerprint, active_branch, loaded_row, source_fingerprint, branch_state
+        scope = current_scope()
+        branch = current_branch()
+        original = snapshot(agent, scope, branch=branch, messages=source)
+        reduced = snapshot(agent, scope, checkpoint=True, branch=branch, messages=messages)
+        # Include the transition counters in the same commit as the new context.
+        reduced['counters']['_task_compactions'] += 1
+        if reduced['task_state'] is not None:
+            reduced['task_state']['compactions'] += 1
+        fingerprint = payload_fingerprint(reduced)
+        revision = store.compact(session_id, revision, archive_id, original, reduced)
+        saved_fingerprint = fingerprint
+        active_branch, loaded_row, source_fingerprint = True, None, None
+        branch_state = branch
+        agent.archive_id = session_id
 
     def show_interruption(exc):
         nonlocal stream_wrote
@@ -589,7 +596,7 @@ def main():
         start_new_session(candidate, instructions)
         return True
 
-    def show_session_listing(limit=50, query=None, empty_text=None):
+    def show_session_listing(limit=50, query=None, empty_text=None, all_rows=False):
         """Query, render and cache one exact metadata listing without loading rows."""
         nonlocal last_session_ids
         empty_text = tr(empty_text or '没有已保存会话。')
@@ -597,7 +604,7 @@ def main():
             display(tr('Persistence disabled by --no-session.'))
             last_session_ids = ()
             return ()
-        rows = store.listing(limit, query=query) if query is not None else store.listing(limit)
+        rows = store.listing(limit, query=query, all_rows=all_rows, active_id=session_id)
         last_session_ids = tuple(row['id'] for row in rows)
         if not formatter.enabled:
             display(rows)
@@ -674,7 +681,11 @@ def main():
             raise ValueError(tr('Switch to another session before deleting the active one'))
         metadata = store.deletion_target(target)
         # A title is display data, not a prompt or a control sequence.
-        display({"delete_session": target, "title": metadata[0]}, "Session")
+        confirmation = {"delete_session": target, "title": metadata[0]}
+        archives = store.archives(target)
+        if archives:
+            confirmation['delete_archives'] = len(archives)
+        display(confirmation, "Session")
         confirmed = len(parts) == 2
         if not confirmed and sys.stdin.isatty():
             try:
@@ -879,7 +890,6 @@ def main():
                     target = session_id
                     if args and args[0] not in ('markdown', 'json'):
                         target = args.pop(0)
-                        store.check_id(target)
                     if len(args) > 2:
                         raise ValueError(tr('Use /export [ID] [markdown|json] [PATH]'))
                     if target == session_id:
@@ -1140,6 +1150,9 @@ def main():
                 try:
                     value = prompt[9:].strip()
                     query = None
+                    all_rows = value == 'all' or value.startswith('all ')
+                    if all_rows:
+                        value = value[3:].strip()
                     if value == "find" or value.startswith("find "):
                         if not value[4:].strip():
                             raise ValueError(tr('Use /sessions find TEXT'))
@@ -1152,7 +1165,7 @@ def main():
                     if not store:
                         display(tr('Persistence disabled by --no-session.'))
                         continue
-                    show_session_listing(limit, query)
+                    show_session_listing(limit, query, all_rows=all_rows)
                 except (ValueError, sqlite3.Error) as exc:
                     display(tr('Error: {v0}', v0=exc))
             elif prompt == "/resume" or prompt.startswith("/resume "):
@@ -1206,6 +1219,15 @@ def main():
                         display({"id": session_id, "title": current_title()})
                     elif command == "load":
                         resume_session(value)
+                    elif command == 'archives':
+                        identifier = resolve_session_target(value) if value.strip() else session_id
+                        display(store.archives(identifier), 'Archive')
+                    elif command == 'archive':
+                        archive = store.load_archive(value.strip())
+                        display({k: archive[k] for k in ('id', 'session_id', 'title', 'revision')}, 'Archive')
+                        for message in archive['payload']['messages'][1:][-20:]:
+                            role, rendered = history_entry(message, config.silent_writes)
+                            display(rendered, role, stamp='--:--')
                     elif command == "rename":
                         rename_current(value)
                     elif command == "rename-id":

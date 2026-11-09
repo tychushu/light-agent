@@ -17,8 +17,8 @@ SUBCOMMANDS = {
     "/api": ("list", "add", "switch", "show", "default", "remove", "next", "prev"),
     "/agent": ("directory", "reload", "off"),
     "/skill": ("list", "info", "load", "unload", "clear"),
-    "/session": ("new", "fork", "load", "rename", "rename-id", "delete", "save"),
-    "/sessions": ("find",),
+    "/session": ("new", "fork", "load", "rename", "rename-id", "delete", "save", "archives", "archive"),
+    "/sessions": ("find", "all"),
     "/export": ("markdown", "json"),
     "/silent": ("on", "off"),
     "/auto": ("on", "off", "steps"),
@@ -79,6 +79,7 @@ def session_table(rows, width, current_id='', home='', redact=None, language='zh
     api_values = []
     count_values = []
     directory_values = []
+    titles = []
     for row in rows:
         profile = str(row.get('api') or '-')
         model = row.get('model') or ''
@@ -89,6 +90,10 @@ def session_table(rows, width, current_id='', home='', redact=None, language='zh
         if home and (directory == home or directory.startswith(home + '/')):
             directory = '~' + directory[len(home):]
         directory_values.append(clean(directory))
+        title = clean(row.get('title') or 'New session')
+        count = row.get('compaction_count', 0)
+        suffix = (f' · 压缩{count}次' if language == 'zh' else f' · {count} compacted') if count else ''
+        titles.append((title, suffix))
     budget = max(28, int(width) - 1)  # Reserve the final column against auto-wrap.
     separator = '  ' if budget >= 99 else ' '
     ordinal_width = max(1, len(str(max(1, len(rows)))))
@@ -103,7 +108,7 @@ def session_table(rows, width, current_id='', home='', redact=None, language='zh
     desired_api = max([10, *(_cell_width(value) for value in api_values)])
     api_width = min(desired_api, 48, max(1, min(remaining - 2, remaining * 2 // 3)))
     available = remaining - api_width
-    desired_title = max([1, *(_cell_width(clean(row.get('title') or 'New session')) for row in rows)])
+    desired_title = max([1, *(_cell_width(title + suffix) for title, suffix in titles)])
     desired_path = max([1, *(_cell_width(value) for value in directory_values)])
     if desired_title + desired_path <= available:
         extra = available - desired_title - desired_path
@@ -139,14 +144,15 @@ def session_table(rows, width, current_id='', home='', redact=None, language='zh
         return separator.join(cells).rstrip()
 
     result = [render(headers)]
-    for ordinal, (row, api, count, directory) in enumerate(
-            zip(rows, api_values, count_values, directory_values), 1):
+    for ordinal, (row, api, count, directory, (title, suffix)) in enumerate(
+            zip(rows, api_values, count_values, directory_values, titles), 1):
         updated = clean(row.get('updated') or '-')
         if len(updated) >= 16 and updated[4:5] == '-':
             updated = updated[:16] if time_width == 16 else (updated[5:16] if time_width == 12 else updated[11:16])
         marker = '*' if row.get('id') == current_id else ' '
-        result.append(render((str(ordinal), updated, marker + clean(row.get('id') or '-'),
-                              clean(row.get('title') or 'New session'),
+        if suffix and title_width > _cell_width(suffix):
+            title = _table_cell(title, title_width - _cell_width(suffix), pad=False) + suffix
+        result.append(render((str(ordinal), updated, marker + clean(row.get('id') or '-'), title,
                               api, count, directory)))
     return result
 

@@ -179,11 +179,11 @@ def scrub_keys(value, extra=()):
     return scrub(value)
 
 
-def snapshot(agent, scope, checkpoint=False, branch=None):
+def snapshot(agent, scope, checkpoint=False, branch=None, messages=None):
     # scrub_keys below already produces an independent tree; avoid a second copy.
     value = {'version': 4, 'config': agent.config.public_dict(), 'scope': scope,
              'base_system': agent.base_system,
-             'messages': agent.messages, 'active_skills': agent.get_active_skills(),
+             'messages': agent.messages if messages is None else messages, 'active_skills': agent.get_active_skills(),
              'counters': {k: getattr(agent, k) for k in COUNTERS},
              'task_state': agent.task_state, 'last_run': agent.last_run,
              'incomplete_draft': agent.incomplete_draft,
@@ -358,6 +358,11 @@ class SessionStore:
                         '(id TEXT PRIMARY KEY, title TEXT, updated REAL, revision INTEGER, payload TEXT)')
         self.db.execute('CREATE TABLE IF NOT EXISTS drafts '
                         '(id TEXT PRIMARY KEY, revision INTEGER, updated REAL, payload TEXT)')
+        self.db.execute('CREATE TABLE IF NOT EXISTS session_archives '
+                        '(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT, '
+                        'updated REAL, revision INTEGER NOT NULL, payload TEXT NOT NULL, draft TEXT)')
+        self.db.execute('CREATE INDEX IF NOT EXISTS session_archives_owner '
+                        'ON session_archives(session_id, revision)')
         self.db.commit()
         self._secure_files()
 
@@ -373,11 +378,16 @@ class SessionStore:
         if not re.fullmatch('[0-9a-f]{12}', identifier):
             raise ValueError('Use the exact 12-character session ID from /sessions')
 
-    def save(self, identifier, revision, payload, clear_draft=True, title=None):
-        self.check_id(identifier)
+    @staticmethod
+    def _payload_text(payload):
         text = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
         if len(text.encode()) > 20 * 1024 * 1024:
             raise ValueError('Session exceeds 20 MiB; start a new session')
+        return text
+
+    def save(self, identifier, revision, payload, clear_draft=True, title=None):
+        self.check_id(identifier)
+        text = self._payload_text(payload)
         with self.db:
             if revision == 0:
                 first = next((m.get('content', '') for m in payload['messages'] if m['role'] == 'user'), '')
@@ -397,6 +407,53 @@ class SessionStore:
                                 (revision + 1, identifier, revision))
         self._secure_files()
         return revision + 1
+
+    def compact(self, identifier, revision, archive_id, original, reduced):
+        """Replace active context and save its full predecessor in one transaction."""
+        self.check_id(identifier)
+        self.check_archive_id(archive_id)
+        before, after = self._payload_text(original), self._payload_text(reduced)
+        updated = time.time()
+        with self.db:
+            if revision == 0:
+                first = next((m.get('content', '') for m in original['messages'] if m['role'] == 'user'), '')
+                title = (' '.join(first.split())[:60] if isinstance(first, str) else '') or 'New session'
+                self.db.execute('INSERT INTO sessions VALUES (?,?,?,?,?)', (identifier, title, updated, 1, after))
+            else:
+                result = self.db.execute('UPDATE sessions SET payload=?,updated=?,revision=revision+1 '
+                                         'WHERE id=? AND revision=?', (after, updated, identifier, revision))
+                if result.rowcount != 1:
+                    raise ValueError('Session changed/deleted in another process; reload before compacting')
+            self.db.execute('INSERT INTO session_archives '
+                            'SELECT ?, s.id, s.title, ?, ?, ?, d.payload FROM sessions s '
+                            'LEFT JOIN drafts d ON d.id=s.id AND d.revision=? WHERE s.id=?',
+                            (archive_id, updated, revision, before, revision, identifier))
+            self.db.execute('UPDATE drafts SET revision=? WHERE id=? AND revision=?',
+                            (revision + 1, identifier, revision))
+        return revision + 1
+
+    @staticmethod
+    def check_archive_id(identifier):
+        if not re.fullmatch(r'archive-[0-9a-f]{12}', identifier):
+            raise ValueError('Use the exact archive ID from /session archives')
+
+    def archives(self, identifier):
+        self.check_id(identifier)
+        return [{'id': archive_id, 'revision': revision,
+                 'updated': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated))}
+                for archive_id, revision, updated in self.db.execute(
+                    'SELECT id,revision,updated FROM session_archives WHERE session_id=? ORDER BY revision DESC',
+                    (identifier,))]
+
+    def load_archive(self, identifier):
+        self.check_archive_id(identifier)
+        row = self.db.execute('SELECT title,updated,revision,payload,draft,session_id '
+                              'FROM session_archives WHERE id=?', (identifier,)).fetchone()
+        if row is None:
+            raise ValueError('Archive not found')
+        return {'id': identifier, 'title': row[0], 'updated': row[1], 'revision': row[2],
+                'payload': json.loads(row[3]), 'draft': validate_draft(json.loads(row[4])) if row[4] else None,
+                'session_id': row[5]}
 
     def save_draft(self, identifier, revision, draft):
         self.check_id(identifier)
@@ -432,22 +489,38 @@ class SessionStore:
             raise ValueError('Session not found')
         return row[0], json.loads(row[1])
 
-    def listing(self, limit=50, query=None):
-        sql = 'SELECT id,title,updated,revision,payload FROM sessions'
-        params = []
-        if query is not None:
-            query = validate_title(query)
-            sql += " WHERE instr(lower(coalesce(title,'')),lower(?)) > 0"
-            params.append(query)
-        sql += ' ORDER BY updated DESC LIMIT ?'
-        rows = self.db.execute(sql, (*params, limit))
+    def listing(self, limit=50, query=None, *, all_rows=False, active_id=None):
+        from .session_listing import collapse_compaction_rows
+        # Extract only the fields needed for grouping and display. Resolve links
+        # before applying the title filter and page limit.
+        rows = self.db.execute('''
+            SELECT s.id, s.title, s.updated,
+                   json_extract(s.payload,'$.config.api_profile'), json_extract(s.payload,'$.config.model'),
+                   json_extract(s.payload,'$.scope.directory'), json_array_length(s.payload,'$.messages'),
+                   json_extract(s.payload,'$.branch.archive_session_id'),
+                   json_extract(s.payload,'$.config.base_url'),
+                   COALESCE(json_extract(s.payload,'$.config.wire_api'),'chat_completions'),
+                   json_extract(s.payload,'$.scope.config_path'), json_extract(s.payload,'$.scope.session_file'),
+                   json_extract(s.payload,'$.scope.instruction_path'), json_extract(s.payload,'$.scope.disabled'),
+                   (SELECT count(*) FROM session_archives a WHERE a.session_id=s.id)
+            FROM sessions s ORDER BY s.updated DESC, s.id
+        ''')
         result = []
-        for identifier, title, updated, revision, text in rows:
-            payload = json.loads(text)
-            result.append({'id': identifier, 'title': title, 'updated': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated)),
-                           'api': payload['config']['api_profile'], 'model': payload['config']['model'],
-                           'directory': payload['scope']['directory'], 'messages': len(payload['messages'])})
-        return result
+        for identifier, title, updated, api, model, directory, messages, parent, *extra in rows:
+            identity, count = extra[:-1], extra[-1]
+            row = {'id': identifier, 'title': title, 'updated': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated)),
+                   'api': api, 'model': model, 'directory': directory, 'messages': messages}
+            if count:
+                row['compaction_count'] = count
+            if not all_rows:
+                row.update(_archive_session_id=parent, _scope_identity=(api, model, directory, *identity))
+            result.append(row)
+        if not all_rows:
+            result = collapse_compaction_rows(result, active_id=active_id)
+        if query is not None:
+            query = validate_title(query).casefold()
+            result = [row for row in result if query in (row.get('title') or '').casefold()]
+        return result[:limit]
 
     def ids(self, limit=100):
         return [row[0] for row in self.db.execute(
@@ -461,7 +534,8 @@ class SessionStore:
             raise ValueError('Recall limit must be between 1 and 100')
         results = []
         for identifier, title, updated, text in self.db.execute(
-                'SELECT id,title,updated,payload FROM sessions ORDER BY updated DESC'):
+                'SELECT id,title,updated,payload FROM sessions UNION ALL '
+                'SELECT id,title,updated,payload FROM session_archives ORDER BY updated DESC'):
             payload = json.loads(text)
             index, snippet = None, None
             if query in (title or '').casefold():
@@ -488,23 +562,25 @@ class SessionStore:
         return results
 
     def export(self, identifier, format='markdown', path=None):
-        self.check_id(identifier)
         if format not in ('markdown', 'json'):
             raise ValueError('Export format must be markdown or json')
-        row = self.db.execute('SELECT title,updated,revision,payload FROM sessions WHERE id=?', (identifier,)).fetchone()
-        if row is None:
-            raise ValueError('Session not found')
-        revision, payload = row[2], json.loads(row[3])
-        data = {'id': identifier, 'title': row[0], 'updated': row[1], 'revision': revision,
-                'payload': payload, 'draft': self.draft(identifier)}
+        if identifier.startswith('archive-'):
+            data = self.load_archive(identifier)
+        else:
+            self.check_id(identifier)
+            row = self.db.execute('SELECT title,updated,revision,payload FROM sessions WHERE id=?', (identifier,)).fetchone()
+            if row is None:
+                raise ValueError('Session not found')
+            data = {'id': identifier, 'title': row[0], 'updated': row[1], 'revision': row[2],
+                    'payload': json.loads(row[3]), 'draft': self.draft(identifier)}
         text = json.dumps(data, ensure_ascii=False, indent=2) + '\n'
         if format == 'markdown':
             from .history import history_entry
             def block(body):
                 fence = '`' * max(3, max((len(m.group()) + 1 for m in re.finditer(r'`+', body)), default=3))
                 return fence + 'text\n' + body + '\n' + fence + '\n'
-            parts = [f'# {row[0] or "Session"}\n\nSession: {identifier}\n']
-            for index, message in enumerate(payload['messages']):
+            parts = [f'# {data["title"] or "Session"}\n\nSession: {identifier}\n']
+            for index, message in enumerate(data['payload']['messages']):
                 body = history_entry(message, silent_writes=False, limit=20 * 1024 * 1024)[1]
                 if message.get('reasoning_content'):
                     body += '\n\n[Reasoning]\n' + str(message['reasoning_content'])
@@ -566,6 +642,7 @@ class SessionStore:
                 raise ValueError('Session changed or deleted; list sessions and confirm again' if expected is not None
                                  else 'Session not found')
             self.db.execute('DELETE FROM drafts WHERE id=?', (identifier,))
+            self.db.execute('DELETE FROM session_archives WHERE session_id=?', (identifier,))
 
     def close(self):
         self.db.close()
