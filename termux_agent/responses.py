@@ -4,8 +4,16 @@ import json
 from .streaming import iter_sse_data, limited_draft
 
 
-def _failure(value, label, client=None, event_type=None):
-    from .client import (ProviderError, ContextLengthError, RateLimitError,
+# Responses lifecycle events that are pure connection metadata: they carry no
+# body, reasoning, output item, tool fragment or side effect. Any other event
+# on the stream before a failure disqualifies a same-wire replay.
+_METADATA_EVENTS = frozenset({
+    'response.created', 'response.in_progress', 'response.queued',
+})
+
+
+def _failure(value, label, client=None, event_type=None, *, empty_stream=False):
+    from .client import (ProviderError, ContextLengthError, RateLimitError, EmptyStreamRateLimit,
                          upstream_error_fields, upstream_error_text, is_context_error)
     from .retry import rate_limit_error
     error = upstream_error_fields(value)
@@ -22,7 +30,8 @@ def _failure(value, label, client=None, event_type=None):
         # Some gateways send a bare failure event; say so rather than leaving an empty label.
         detail = upstream_error_text(f'上游未提供错误详情，事件 {event_type}', api_key, 120)
     if rate_limit_error(value):
-        return RateLimitError(f'{label}（{detail}）' if detail else label, pre_accept=False)
+        cls = EmptyStreamRateLimit if empty_stream else RateLimitError
+        return cls(f'{label}（{detail}）' if detail else label, pre_accept=False)
     return ProviderError(f'{label}（{detail}）' if detail else label, pre_accept=False, transient=False)
 
 
@@ -94,23 +103,59 @@ def message(client, result):
 
 
 def read_sse(client, response):
-    from .client import ClientError
+    from .client import ClientError, EmptyStreamRateLimit
     items, content, reasoning, arguments = {}, [], [], {}
+    # Text/thinking fragments are kept per output_index so a failure-frame
+    # snapshot can be merged item by item (stable id first) instead of via a
+    # whole-string suffix scan that mixes unrelated messages.
+    text_fragments, reasoning_fragments, text_ids = {}, {}, {}
     terminal = None
+    pristine = True  # only connection metadata seen so far
 
     def consume(data):
-        nonlocal terminal
-        if data.strip() in ('[DONE]', 'null', ''):
+        nonlocal terminal, pristine
+        stripped = data.strip()
+        if stripped in ('[DONE]', 'null', ''):
+            if stripped == '[DONE]':
+                # A termination marker closes empty-stream retry eligibility:
+                # a later error frame is not a fresh connection failure.
+                pristine = False
             return
         try:
             event = json.loads(data)
         except ValueError:
             raise ClientError('LLM endpoint returned malformed SSE JSON') from None
         if not isinstance(event, dict):
+            pristine = False
             return
         kind = event.get('type', '')
+        if not isinstance(kind, str):
+            # A non-string type is an unknown event: keep the original
+            # ignore-and-continue decoding, but forfeit this round's retry.
+            pristine = False
+            kind = ''
         if kind in ('error', 'response.failed'):
-            raise _failure(event.get('response', event), 'Responses 流式请求失败', client=client, event_type=kind)
+            value = event.get('response', event)
+            failure_output = value.get('output') if isinstance(value, dict) else None
+            if failure_output:
+                # The failure frame itself carries output items: that is partial
+                # work, so it can never be replayed. Preserve it as an inert draft.
+                pristine = False
+                if isinstance(failure_output, list):
+                    absorb_output(failure_output)
+            # Only an output-free (pristine) stream may be replayed with the
+            # same wire request. Any partial body, thinking, output item, tool
+            # fragment, or unknown possibly-side-effect event keeps this failure
+            # terminal and preserves its draft.
+            raise _failure(value, 'Responses 流式请求失败', client=client,
+                           event_type=kind, empty_stream=pristine)
+        if kind in _METADATA_EVENTS:
+            # Pure lifecycle metadata, provided it carries no output items.
+            payload = event.get('response')
+            if isinstance(payload, dict) and payload.get('output'):
+                pristine = False
+            return
+        pristine = False
         if kind in ('response.completed', 'response.incomplete'):
             terminal = event.get('response')
             if not isinstance(terminal, dict):
@@ -126,6 +171,10 @@ def read_sse(client, response):
             if not isinstance(item, dict):
                 raise ClientError('Invalid Responses output item')
             items[index] = deepcopy(item)
+            if item.get('type') in ('message', 'reasoning'):
+                ident = item.get('id')
+                if isinstance(ident, str) and ident:
+                    text_ids[index] = ident
             if item.get('type') == 'function_call':
                 value = item.get('arguments', '')
                 if not isinstance(value, str):
@@ -146,9 +195,17 @@ def read_sse(client, response):
             delta = event.get('delta')
             if not isinstance(delta, str):
                 raise ClientError('Invalid Responses text delta')
-            target = content if kind == 'response.output_text.delta' else reasoning
+            is_text = kind == 'response.output_text.delta'
+            target = content if is_text else reasoning
             target.append(delta)
-            client._emit('content' if target is content else 'reasoning', delta)
+            (text_fragments if is_text else reasoning_fragments).setdefault(index, []).append(delta)
+            # A gateway may omit output_item.added and attach the stable item
+            # identity to each delta instead; keep it so two items sharing a
+            # text prefix are still told apart.
+            ident = event.get('item_id')
+            if isinstance(ident, str) and ident:
+                text_ids.setdefault(index, ident)
+            client._emit('content' if is_text else 'reasoning', delta)
 
     def collected_output():
         result = []
@@ -165,9 +222,170 @@ def read_sse(client, response):
             for item in collected_output() if item.get('type') == 'function_call']
         return limited_draft(''.join(content), ''.join(reasoning), calls)
 
+    def absorb_output(output):
+        """Merge a failure frame's own output snapshot item by item.
+
+        Text/thinking fragments are tracked per output_index from the stream.
+        A snapshot item is aligned by stable id -> output_index -> unclaimed
+        fragment prefix, then merged into that one item's fragments; fragments
+        the snapshot does not cover keep their original index order. Tools are
+        aligned by id/call_id/index and stay inert, one entry per call_id.
+        """
+        def item_text(item):
+            parts = item.get('content')
+            parts = parts if isinstance(parts, list) else []
+            if item.get('type') == 'reasoning':
+                summary = item.get('summary')
+                if isinstance(summary, list):
+                    parts = parts + summary
+            pieces = []
+            for part in parts:
+                if isinstance(part, str):
+                    pieces.append(part)
+                elif isinstance(part, dict) and isinstance(part.get('text'), str):
+                    pieces.append(part['text'])
+            return ''.join(pieces)
+
+        def stable_id(item):
+            for name in ('id', 'item_id', 'call_id'):
+                value = item.get(name)
+                if isinstance(value, str) and value:
+                    return value
+            return None
+
+        def foreign_identity(index, ident):
+            # An index already bound to a different stable id owns its own
+            # draft: a new/unrelated snapshot item must not claim it through
+            # either the output_index or the text-prefix fallback.
+            known = text_ids.get(index)
+            return bool(ident and known and known != ident)
+
+        def same_identity(a, b):
+            for name in ('id', 'call_id'):
+                left, right = a.get(name), b.get(name)
+                if (isinstance(left, str) and left and isinstance(right, str)
+                        and right and left == right):
+                    return True
+            return False
+
+        def conflicting_identity(a, b):
+            for name in ('id', 'call_id'):
+                left, right = a.get(name), b.get(name)
+                if (isinstance(left, str) and left and isinstance(right, str)
+                        and right and left != right):
+                    return True
+            return False
+
+        def merge_fragments(store, index, snap):
+            # Merge one item's own fragments only; never scan the whole string.
+            existing = ''.join(store.get(index, []))
+            if snap == existing or existing.startswith(snap):
+                return  # streamed deltas already cover this text
+            if snap.startswith(existing):
+                store[index] = [snap]  # complete snapshot, no double append
+                return
+            # Divergent: keep this item's streamed fragments as-is. Uncovered
+            # items keep their own fragments; nothing is duplicated here.
+            store.setdefault(index, [])
+
+        def align_text(item, offset, store, claimed):
+            snap = item_text(item)
+            ident = stable_id(item)
+            # Stable ID wins over positional guessing.
+            if ident:
+                for index, known in text_ids.items():
+                    if known == ident and index not in claimed:
+                        return index
+                for index, existing in items.items():
+                    if (isinstance(existing, dict) and index not in claimed
+                            and same_identity(existing, item)):
+                        return index
+            explicit = item.get('output_index')
+            if (isinstance(explicit, int) and not isinstance(explicit, bool)
+                    and explicit >= 0 and explicit not in claimed
+                    and not foreign_identity(explicit, ident)):
+                return explicit
+            # Otherwise claim the item whose own fragments match this snapshot,
+            # but never one whose known identity differs from this item's.
+            for index in [offset] + sorted(store):
+                if index in claimed or foreign_identity(index, ident):
+                    continue
+                existing = ''.join(store.get(index, []))
+                if existing and (snap.startswith(existing) or existing.startswith(snap)):
+                    return index
+            return None
+
+        next_index = max(set(text_fragments) | set(reasoning_fragments) | set(items), default=-1) + 1
+        claimed_text, claimed_reasoning = set(), set()
+
+        # Pass 1: text / thinking items, merged per item in index order.
+        for offset, item in enumerate(output):
+            if not isinstance(item, dict) or item.get('type') not in ('message', 'reasoning'):
+                continue
+            is_reasoning = item.get('type') == 'reasoning'
+            store = reasoning_fragments if is_reasoning else text_fragments
+            claimed = claimed_reasoning if is_reasoning else claimed_text
+            target = align_text(item, offset, store, claimed)
+            if target is None:
+                target = next_index
+                next_index += 1
+            claimed.add(target)
+            merge_fragments(store, target, item_text(item))
+
+        # Pass 2: tool items, aligned by stable id/call_id first.
+        for offset, item in enumerate(output):
+            if not isinstance(item, dict) or item.get('type') != 'function_call':
+                continue
+            target = None
+            for index, other in items.items():
+                if (isinstance(other, dict) and other.get('type') == 'function_call'
+                        and same_identity(other, item)):
+                    target = index
+                    break
+            if target is None:
+                explicit = item.get('output_index')
+                if (isinstance(explicit, int) and not isinstance(explicit, bool)
+                        and explicit >= 0):
+                    at = items.get(explicit)
+                    if (isinstance(at, dict) and at.get('type') == 'function_call'
+                            and not conflicting_identity(at, item)):
+                        target = explicit
+            if target is None:
+                at = items.get(offset)
+                if (isinstance(at, dict) and at.get('type') == 'function_call'
+                        and not conflicting_identity(at, item)):
+                    target = offset
+            if target is None:
+                target = max(items, default=-1) + 1
+            merged = dict(items.get(target) or {})
+            for name, value in item.items():
+                if name in ('content', 'summary', 'arguments', 'output_index'):
+                    continue
+                if not merged.get(name) and value is not None:
+                    merged[name] = deepcopy(value)
+            items[target] = merged
+            value = item.get('arguments', '')
+            value = value if isinstance(value, str) else ''
+            prior = ''.join(arguments.get(target, []))
+            if value and value.startswith(prior):
+                arguments[target] = [value]  # complete args, no doubled fragment
+            elif prior.startswith(value):
+                pass  # streamed deltas are already more complete
+            else:
+                arguments.setdefault(target, [])
+
+        # Recompose the flat draft text from the merged per-item fragments.
+        content[:] = [piece for index in sorted(text_fragments)
+                      for piece in text_fragments[index]]
+        reasoning[:] = [piece for index in sorted(reasoning_fragments)
+                        for piece in reasoning_fragments[index]]
+
     try:
         for data in iter_sse_data(response, client.config.max_response_bytes):
             consume(data)
+    except EmptyStreamRateLimit:
+        # No draft to keep: an output-free stream has nothing to preserve.
+        raise
     except Exception as exc:
         exc.assistant_message = draft()
         raise

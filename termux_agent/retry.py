@@ -113,39 +113,104 @@ def server_retry_delay(headers, now, *, rate_limited=False, axis=None):
     return max((v for v in values if v is not None), default=None)
 
 
+class _DeadlineScope:
+    """One armed SIGALRM period.
+
+    Each period independently captures and later restores exactly the signal
+    state it replaced, so an alarm installed by a callback after ``accepted()``
+    released the previous scope is preserved rather than overwritten/cleared.
+    ``_closed`` is set before any signal operation that can raise the timeout,
+    so a signal delivered synchronously while arming still finds live cleanup.
+    """
+
+    def __init__(self, expired):
+        # Detect external ownership BEFORE mutating signal state: refuse to
+        # replace an alarm we do not own (a permanent setup refusal, not an
+        # elapsed deadline).
+        self._timer = signal.getitimer(signal.ITIMER_REAL)
+        if self._timer[0] > 0:
+            raise RetryDeadlineSetupError(
+                "LLM retry deadline cannot replace an existing process alarm")
+        self._handler = signal.getsignal(signal.SIGALRM)
+        self._expired = expired
+        self._closed = False
+
+    def install(self, seconds):
+        # Cleanup state (registered scope, _closed False) is already in place.
+        signal.signal(signal.SIGALRM, self._expired)
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        # Preserve an alarm/handler a callback installed after we armed: only
+        # tear down signal state we still own.
+        if signal.getsignal(signal.SIGALRM) is not self._expired:
+            return
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, self._handler)
+        signal.setitimer(signal.ITIMER_REAL, *self._timer)
+
+
+class _DeadlineGuard:
+    """Callable guard: ``()`` releases the alarm, ``rearm`` opens a fresh scope."""
+
+    def __init__(self, expired):
+        self._expired = expired
+        self._scope = None
+
+    def __call__(self):
+        self._release()
+
+    def rearm(self, seconds):
+        self._release()
+        self._arm(seconds)
+
+    def start(self, seconds):
+        self._arm(seconds)
+
+    def _arm(self, seconds):
+        if self._expired is None:  # request_deadline(None): no alarms at all
+            return
+        scope = _DeadlineScope(self._expired)  # may refuse before any mutation
+        self._scope = scope                     # cleanup ready BEFORE install
+        scope.install(seconds)                  # may raise via synchronous signal
+
+    def _release(self):
+        scope, self._scope = self._scope, None
+        if scope is not None:
+            scope.close()
+
+    def close(self):
+        self._release()
+
+
 @contextmanager
 def request_deadline(seconds: float | None):
-    """Interrupt pre-response I/O on the native Unix CLI; preserve other alarms."""
+    """Interrupt pre-response I/O on the native Unix CLI; preserve other alarms.
+
+    Calling the yielded guard cancels the one-shot alarm once a response body is
+    accepted. A same-request retry can ``rearm`` it; each arm is an independent
+    scope that captures/restores its own signal state and refuses to overwrite
+    an alarm owned by someone else.
+    """
     if seconds is None:
-        yield lambda: None
+        yield _DeadlineGuard(None)
         return
     if (not hasattr(signal, "setitimer")
             or threading.current_thread() is not threading.main_thread()):
         raise RetryDeadlineSetupError("LLM retry deadline requires the main thread of a Unix client")
-    previous_timer = signal.getitimer(signal.ITIMER_REAL)
-    if previous_timer[0] > 0:
-        raise RetryDeadlineSetupError("LLM retry deadline cannot replace an existing process alarm")
-    previous_handler = signal.getsignal(signal.SIGALRM)
-    restored = False
 
     def expired(signum, frame):
         raise RetryDeadlineError("LLM retry deadline exceeded")
 
-    def cancel():
-        nonlocal restored
-        if restored:
-            return
-        signal.setitimer(signal.ITIMER_REAL, 0)
-        signal.signal(signal.SIGALRM, previous_handler)
-        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
-        restored = True
-
-    signal.signal(signal.SIGALRM, expired)
+    guard = _DeadlineGuard(expired)
     try:
-        signal.setitimer(signal.ITIMER_REAL, seconds)
-        yield cancel
+        guard.start(seconds)
+        yield guard
     finally:
-        cancel()
+        guard.close()
 
 
 def retry_after(value: str | None, now: float) -> float | None:

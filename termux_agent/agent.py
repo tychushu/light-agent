@@ -820,7 +820,12 @@ class Agent:
 
     def _defer_retry(self, exc, error):
         delay = getattr(exc, 'retry_after_seconds', None)
-        if (error.get('transient') is not True or not isinstance(delay, (int, float))
+        # An accepted empty-stream rate limit is transient in nature but is
+        # marked transient=False to forbid an outer replay. Its explicit
+        # cooldown must still be kept so a manual resume backs off; pre_accept
+        # stays False, so _auto_resume_plan will not turn it into a replay.
+        deferrable = error.get('transient') is True or isinstance(exc, RateLimitError)
+        if (not deferrable or not isinstance(delay, (int, float))
                 or isinstance(delay, bool) or not math.isfinite(delay) or delay < 0):
             return
         until = time.time() + delay

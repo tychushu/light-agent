@@ -85,6 +85,17 @@ class RateLimitError(ProviderError):
         self.pre_accept = pre_accept
 
 
+class EmptyStreamRateLimit(RateLimitError):
+    """Structured temporary rate limit on an output-free accepted stream.
+
+    Raised by the Responses decoder only when no body, reasoning, output item,
+    tool fragment or unknown side-effect event preceded the failure. The client
+    may replay the identical wire request. It is still an accepted-stream
+    failure (pre_accept=False), so if retries are exhausted nothing is
+    auto-resumed and the real accepted state is preserved.
+    """
+
+
 class ContextLengthError(ClientError):
     def __init__(self, text, *, pre_accept=True):
         super().__init__(text)
@@ -334,14 +345,34 @@ class Client:
             total = min(total, owner_remaining)
         deadline = self._clock() + total
         try:
-            remaining = deadline - self._clock()
-            if remaining <= 0:
-                raise NetworkError("LLM retry deadline exceeded")
-            with request_deadline(remaining) as accepted:
-                return self._chat_attempts(wire, url, headers, thinking_retry, deadline, accepted, body['stream'])
-        except RetryDeadlineError as exc:
-            self._check_owner_budget()
-            raise NetworkError(str(exc), transient=not isinstance(exc, RetryDeadlineSetupError)) from None
+            try:
+                remaining = deadline - self._clock()
+                if remaining <= 0:
+                    raise NetworkError("LLM retry deadline exceeded")
+                with request_deadline(remaining) as accepted:
+                    return self._chat_attempts(wire, url, headers, thinking_retry, deadline, accepted, body['stream'])
+            except RetryDeadlineError as exc:
+                self._check_owner_budget()
+                # pre_accept must reflect the real receive phase: an accepted stream
+                # interrupted during the empty-stream retry wait is post-accept, not
+                # a pre-accept replay. Carry any cooldown the interrupted wait kept.
+                cooldown = getattr(exc, 'retry_after_seconds', None)
+                if not (isinstance(cooldown, (int, float)) and not isinstance(cooldown, bool)
+                        and cooldown > 0):
+                    cooldown = None
+                raise NetworkError(str(exc), pre_accept=not self.last_accepted,
+                                   transient=not isinstance(exc, RetryDeadlineSetupError),
+                                   retry_after_seconds=cooldown) from None
+        except Exception as exc:
+            # Single exception exit: once a response body was accepted, EVERY
+            # later failure on this logical request (retry connection timeout,
+            # structured HTTP 429, monotonic deadline after a wait, ...) is
+            # post-accept. Fix the original exception in place so its type,
+            # transient flag and cooldown value are preserved untouched; a
+            # failure before the first acceptance keeps pre_accept=True.
+            if self.last_accepted and hasattr(exc, 'pre_accept'):
+                exc.pre_accept = False
+            raise
 
     def _chat_attempts(self, wire, url, headers, thinking_retry, deadline, accepted, stream):
         waited = 0.0
@@ -427,6 +458,38 @@ class Client:
                 raw = b''.join(response_chunks(response, self.config.max_response_bytes))
                 result = json.loads(raw)
                 return self._checked_message(self._message(result))
+            except EmptyStreamRateLimit as exc:
+                # A structured temporary rate limit on an output-free Responses
+                # stream: no content, thinking, output item, tool fragment or
+                # unknown side-effect event was seen, so replaying the identical
+                # wire request cannot duplicate output or re-run a tool. Reuse
+                # the bounded wait/attempt/deadline path; keep last_accepted True.
+                after = response.headers
+                response.close()
+                if attempt + 1 < max_attempts:
+                    # accepted() cancelled the one-shot signal timer. Restore a
+                    # fresh total deadline BEFORE the wait and its checkpoint /
+                    # on_retry callbacks, so a slow callback or sleep is bounded
+                    # exactly like the HTTP 429 path. The re-armed timer also
+                    # covers the next HTTP attempt.
+                    remaining = deadline - self._clock()
+                    if remaining > 0:
+                        accepted.rearm(remaining)
+                    try:
+                        waited = self._wait_retry(attempt, str(exc), 'rate-limit', 429,
+                                                  after, deadline, waited)
+                    except RateLimitError as retry_error:
+                        # Wait-budget exhaustion here is still an accepted-stream
+                        # failure: keep pre_accept truthful and keep the cooldown.
+                        retry_error.pre_accept = False
+                        raise
+                    continue
+                # Attempts exhausted: surface a normal accepted-stream rate limit,
+                # but keep an explicit cooldown so a manual resume waits it out.
+                delay = server_retry_delay(after, self._wall_clock(), rate_limited=True)
+                if delay is None:
+                    delay = backoff(max(0, attempt), self._randomizer(), rate_limited=True)
+                raise RateLimitError(str(exc), retry_after_seconds=delay, pre_accept=False)
             except httpx.HTTPStatusError as exc:
                 raise self._classified_error(exc.response) from None
             except httpx.TimeoutException as exc:
@@ -469,13 +532,19 @@ class Client:
                 "status": status, "cause": cause, "wait_seconds": delay}
         if self._retry_state:
             self._retry_state({**info, 'phase': 'wait'})
-        if self.on_retry:
-            self.on_retry(info)
-        if delay >= deadline - self._clock():
-            raise exhausted(f"{error}; retry deadline exceeded")
-        before = self._clock()
-        self._sleep(delay)
-        self._check_owner_budget()
+        try:
+            if self.on_retry:
+                self.on_retry(info)
+            if delay >= deadline - self._clock():
+                raise exhausted(f"{error}; retry deadline exceeded")
+            before = self._clock()
+            self._sleep(delay)
+            self._check_owner_budget()
+        except RetryDeadlineError as exc:
+            # A total-deadline signal interrupted this wait. Keep the cooldown
+            # already computed/recorded so a manual resume still backs off.
+            exc.retry_after_seconds = delay
+            raise
         return waited + max(delay, self._clock() - before)
 
     def _error_sample(self, response, deadline=None):

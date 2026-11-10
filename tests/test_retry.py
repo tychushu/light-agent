@@ -17,6 +17,8 @@ from unittest.mock import patch
 from termux_agent.agent import Agent
 from termux_agent.client import Client, ClientError
 from termux_agent.config import Config
+from termux_agent.retry import (request_deadline, RetryDeadlineError,
+                                RetryDeadlineSetupError)
 
 
 THINKING_MESSAGE = (
@@ -626,6 +628,74 @@ class RetryBehaviorTests(unittest.TestCase):
             signal.setitimer(signal.ITIMER_REAL, 0)
             signal.signal(signal.SIGALRM, previous_handler)
             signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+    @unittest.skipUnless(hasattr(signal, "setitimer") and hasattr(signal, "ITIMER_REAL"),
+                         "Unix real-time interval timers are required")
+    def test_rearm_refuses_external_active_alarm_and_exit_preserves_it(self):
+        before_handler = signal.getsignal(signal.SIGALRM)
+        before_timer = signal.getitimer(signal.ITIMER_REAL)
+        if before_timer[0] > 0:
+            self.skipTest("an unrelated process alarm is already active")
+
+        def cleanup():
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, before_handler)
+            signal.setitimer(signal.ITIMER_REAL, *before_timer)
+
+        self.addCleanup(cleanup)
+
+        def external(signum, frame):
+            pass
+
+        with request_deadline(30.0) as guard:
+            guard()                                    # accepted(): release our alarm
+            signal.signal(signal.SIGALRM, external)    # an external owner takes over
+            signal.setitimer(signal.ITIMER_REAL, 12.0)
+            with self.assertRaises(RetryDeadlineSetupError):
+                guard.rearm(30.0)                      # must refuse to overwrite it
+            self.assertIs(signal.getsignal(signal.SIGALRM), external)
+            self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+        # Exiting the scope must not clear the alarm we do not own.
+        self.assertIs(signal.getsignal(signal.SIGALRM), external)
+        self.assertGreater(signal.getitimer(signal.ITIMER_REAL)[0], 0)
+
+    @unittest.skipUnless(hasattr(signal, "setitimer") and hasattr(signal, "ITIMER_REAL"),
+                         "Unix real-time interval timers are required")
+    def test_rearm_immediate_signal_restores_original_handler_and_timer(self):
+        before_handler = signal.getsignal(signal.SIGALRM)
+        before_timer = signal.getitimer(signal.ITIMER_REAL)
+        if before_timer[0] > 0:
+            self.skipTest("an unrelated process alarm is already active")
+
+        def cleanup():
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, before_handler)
+            signal.setitimer(signal.ITIMER_REAL, *before_timer)
+
+        self.addCleanup(cleanup)
+        real_setitimer = signal.setitimer
+        real_getsignal = signal.getsignal
+        state = {'inject': False}
+
+        def arming_setitimer(which, seconds, interval=0.0):
+            result = real_setitimer(which, seconds, interval)
+            # Fault injection: the signal arrives synchronously while arming,
+            # before the caller could mark the scope as needing cleanup.
+            if state['inject'] and which == signal.ITIMER_REAL and seconds > 0:
+                state['inject'] = False
+                handler = real_getsignal(signal.SIGALRM)
+                if callable(handler):
+                    handler(signal.SIGALRM, None)
+            return result
+
+        with patch('termux_agent.retry.signal.setitimer', side_effect=arming_setitimer):
+            with self.assertRaises(RetryDeadlineError):
+                with request_deadline(30.0) as guard:
+                    guard()                       # accepted(): release
+                    state['inject'] = True
+                    guard.rearm(30.0)             # signal fires inside setitimer
+        self.assertIs(signal.getsignal(signal.SIGALRM), before_handler)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
 
     def test_started_sse_stream_is_never_replayed_after_read_error(self):
         class InterruptedStream(httpx.SyncByteStream):

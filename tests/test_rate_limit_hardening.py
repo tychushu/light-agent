@@ -116,7 +116,12 @@ class RateHardeningTests(unittest.TestCase):
                 def respond(request):
                     seen.append(request)
                     value=({'type':'error',**error} if wire=='responses' else {'error':error})
-                    if stream:return httpx.Response(200,text='data: '+json.dumps(value)+'\n\n',headers={'content-type':'text/event-stream'})
+                    body='data: '+json.dumps(value)+'\n\n'
+                    if stream and wire=='responses':
+                        # An accepted stream that already emitted output must never
+                        # be replayed; only an output-free empty stream may retry.
+                        body=('data: '+json.dumps({'type':'response.output_text.delta','delta':'partial'})+'\n\n')+body
+                    if stream:return httpx.Response(200,text=body,headers={'content-type':'text/event-stream'})
                     return httpx.Response(200,json={'error':error})
                 with httpx.Client(transport=httpx.MockTransport(respond)) as http:
                     client=Client(Config(wire_api=wire,stream=stream),http_client=http,

@@ -162,10 +162,12 @@ class ResponsesTests(unittest.TestCase):
                 self.assertEqual(len(requests), 1)
 
     def test_stream_error_passes_through_upstream_message(self):
+        # An output-free stream with a rate limit is now a bounded empty-stream
+        # retry; keep one attempt so this stays a pure diagnostic passthrough test.
         events = [{'type': 'error', 'code': 'rate_limit_exceeded', 'message': 'upstream rate limit hit'}]
         with httpx.Client(transport=httpx.MockTransport(lambda q: httpx.Response(200, text=sse(events)))) as http:
             with self.assertRaises(ClientError) as caught:
-                Client(Config(wire_api='responses'), http_client=http).chat([], [])
+                Client(Config(wire_api='responses', retry_max_attempts=1), http_client=http).chat([], [])
         self.assertIn('upstream rate limit hit', str(caught.exception))
         self.assertIn('rate_limit_exceeded', str(caught.exception))
 
@@ -217,3 +219,171 @@ class ResponsesTests(unittest.TestCase):
                                     'arguments': '{"path":"note", "content":"PRIVATE_BODY"}'}]}
             agent = Agent(client.config, client=client)
             self.assertNotIn('PRIVATE_BODY', json.dumps(agent.debug_context()))
+
+    def _failed_with_output(self, events):
+        requests = []
+
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(200, text=sse(events))
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http:
+            client = Client(Config(wire_api='responses'), http_client=http)
+            with self.assertRaises(ClientError) as caught:
+                client.chat([], [])
+        self.assertEqual(len(requests), 1)  # a partial stream is never replayed
+        return caught.exception.assistant_message
+
+    def test_failed_frame_output_merges_with_streamed_deltas_without_duplicates(self):
+        # The failure frame's output repeats the same text and call_id already
+        # streamed as deltas; align/merge by index and call_id, do not duplicate.
+        events = [
+            {'type': 'response.output_text.delta', 'output_index': 0, 'delta': 'partial answer'},
+            {'type': 'response.output_item.added', 'output_index': 1, 'item': {
+                'type': 'function_call', 'call_id': 'call_1', 'name': 'read_file', 'arguments': ''}},
+            {'type': 'response.function_call_arguments.delta', 'output_index': 1, 'delta': '{"path":'},
+            {'type': 'response.failed', 'response': {'status': 'failed',
+                'error': {'code': 'rate_limit_exceeded'},
+                'output': [
+                    # Reordered: the tool must align by call_id, not by position.
+                    {'type': 'function_call', 'call_id': 'call_1', 'name': 'read_file',
+                     'arguments': '{"path":"/tmp/a"}'},
+                    {'type': 'message', 'id': 'msg_1', 'role': 'assistant',
+                     'content': [{'type': 'output_text', 'text': 'partial answer'}]},
+                ]}},
+        ]
+        draft = self._failed_with_output(events)
+        self.assertEqual(draft['content'], 'partial answer')       # no duplicated text
+        self.assertNotIn('tool_calls', draft)                       # draft stays inert
+        calls = draft.get('_incomplete_tool_calls', [])
+        self.assertEqual(len(calls), 1)                            # no duplicated tool
+        self.assertEqual(calls[0]['id'], 'call_1')
+        self.assertEqual(calls[0]['function']['arguments'], '{"path":"/tmp/a"}')
+
+    def test_failed_frame_output_keeps_non_overlapping_delta_fragments(self):
+        # A snapshot text extending the delta prefix is merged, and tool argument
+        # fragments longer than the snapshot are preserved rather than halved.
+        events = [
+            {'type': 'response.output_text.delta', 'delta': 'partial'},
+            {'type': 'response.output_item.added', 'output_index': 0, 'item': {
+                'type': 'function_call', 'call_id': 'c', 'name': 'write_file', 'arguments': ''}},
+            {'type': 'response.function_call_arguments.delta', 'output_index': 0,
+             'delta': '{"path":"/tmp/a","extra":true}'},
+            {'type': 'response.failed', 'response': {'status': 'failed',
+                'error': {'code': 'rate_limit_exceeded'},
+                'output': [
+                    {'type': 'message', 'content': [{'type': 'output_text', 'text': 'partial answer'}]},
+                    {'type': 'function_call', 'call_id': 'c', 'name': 'write_file',
+                     'arguments': '{"path":"/tmp/a"}'},
+                ]}},
+        ]
+        draft = self._failed_with_output(events)
+        self.assertEqual(draft['content'], 'partial answer')
+        calls = draft.get('_incomplete_tool_calls', [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]['function']['arguments'], '{"path":"/tmp/a","extra":true}')
+
+    def test_failed_frame_output_merges_indexed_messages_without_suffix_scan(self):
+        # A at index 0 (id msg_1, delta 'Partial'), a tool at index 1, and B at
+        # index 2 (id msg_2, delta 'Uncovered fragment'). The failure snapshot
+        # only repeats A's text and the tool's complete arguments. Merging must
+        # stay per item: A becomes 'Partial answer', B survives, order preserved.
+        events = [
+            {'type': 'response.output_item.added', 'output_index': 0,
+             'item': {'type': 'message', 'id': 'msg_1', 'role': 'assistant', 'content': []}},
+            {'type': 'response.output_text.delta', 'output_index': 0, 'delta': 'Partial'},
+            {'type': 'response.output_item.added', 'output_index': 1,
+             'item': {'type': 'function_call', 'call_id': 'c1', 'name': 'write_file', 'arguments': ''}},
+            {'type': 'response.function_call_arguments.delta', 'output_index': 1, 'delta': '{"path":'},
+            {'type': 'response.output_item.added', 'output_index': 2,
+             'item': {'type': 'message', 'id': 'msg_2', 'role': 'assistant', 'content': []}},
+            {'type': 'response.output_text.delta', 'output_index': 2, 'delta': 'Uncovered fragment'},
+            {'type': 'response.failed', 'response': {'status': 'failed',
+                'error': {'code': 'rate_limit_exceeded'},
+                'output': [
+                    {'type': 'message', 'id': 'msg_1', 'role': 'assistant',
+                     'content': [{'type': 'output_text', 'text': 'Partial answer'}]},
+                    {'type': 'function_call', 'call_id': 'c1', 'name': 'write_file',
+                     'arguments': '{"path":"/tmp/a"}'},
+                ]}},
+        ]
+        draft = self._failed_with_output(events)
+        self.assertEqual(draft['content'], 'Partial answerUncovered fragment')
+        self.assertNotIn('tool_calls', draft)                 # inert draft
+        calls = draft.get('_incomplete_tool_calls', [])
+        self.assertEqual(len(calls), 1)                      # each call_id once
+        self.assertEqual(calls[0]['id'], 'c1')
+        self.assertEqual(calls[0]['function']['arguments'], '{"path":"/tmp/a"}')
+
+    def test_failed_frame_output_merges_reasoning_fragments_per_item(self):
+        events = [
+            {'type': 'response.output_item.added', 'output_index': 0,
+             'item': {'type': 'reasoning', 'id': 'rs_1', 'summary': []}},
+            {'type': 'response.reasoning_text.delta', 'output_index': 0, 'delta': 'Thou'},
+            {'type': 'response.output_text.delta', 'output_index': 1, 'delta': 'Body'},
+            {'type': 'response.output_item.added', 'output_index': 2,
+             'item': {'type': 'reasoning', 'id': 'rs_2', 'summary': []}},
+            {'type': 'response.reasoning_text.delta', 'output_index': 2, 'delta': 'Uncovered thought'},
+            {'type': 'response.failed', 'response': {'status': 'failed',
+                'error': {'code': 'rate_limit_exceeded'},
+                'output': [
+                    {'type': 'reasoning', 'id': 'rs_1',
+                     'content': [{'type': 'reasoning_text', 'text': 'Thought'}]},
+                ]}},
+        ]
+        draft = self._failed_with_output(events)
+        self.assertEqual(draft['reasoning_content'], 'ThoughtUncovered thought')
+        self.assertEqual(draft['content'], 'Body')
+
+    def test_failed_frame_output_without_item_metadata_stays_compatible(self):
+        # Simplified gateway: bare deltas with no ids/output_index at all.
+        events = [
+            {'type': 'response.output_text.delta', 'delta': 'plain'},
+            {'type': 'response.failed', 'response': {'status': 'failed',
+                'error': {'code': 'rate_limit_exceeded'},
+                'output': [
+                    {'type': 'message', 'role': 'assistant',
+                     'content': [{'type': 'output_text', 'text': 'plain text'}]},
+                ]}},
+        ]
+        draft = self._failed_with_output(events)
+        self.assertEqual(draft['content'], 'plain text')   # extended once, no duplication
+        self.assertEqual(draft.get('_incomplete_tool_calls', []), [])
+
+    def test_delta_item_id_aligns_same_prefix_items_when_added_is_omitted(self):
+        # Gateway omits output_item.added: two deltas share the 'same' prefix
+        # but carry distinct item_id. The failure snapshot only names id=b.
+        events = [
+            {'type': 'response.output_text.delta', 'output_index': 0,
+             'item_id': 'a', 'delta': 'same'},
+            {'type': 'response.output_text.delta', 'output_index': 2,
+             'item_id': 'b', 'delta': 'same'},
+            {'type': 'response.failed', 'response': {'status': 'failed',
+                'error': {'code': 'rate_limit_exceeded'},
+                'output': [
+                    {'type': 'message', 'id': 'b', 'role': 'assistant',
+                     'content': [{'type': 'output_text', 'text': 'same completed'}]},
+                ]}},
+        ]
+        draft = self._failed_with_output(events)
+        self.assertEqual(draft['content'], 'samesame completed')
+        self.assertNotIn('tool_calls', draft)
+        self.assertEqual(draft.get('_incomplete_tool_calls', []), [])
+
+    def test_new_snapshot_id_never_claims_an_index_with_a_known_different_id(self):
+        # index 0 is already bound to id=a; a failure-frame item with a NEW id=b
+        # and the same text prefix must not overwrite a's draft. Both survive.
+        events = [
+            {'type': 'response.output_text.delta', 'output_index': 0,
+             'item_id': 'a', 'delta': 'same'},
+            {'type': 'response.failed', 'response': {'status': 'failed',
+                'error': {'code': 'rate_limit_exceeded'},
+                'output': [
+                    {'type': 'message', 'id': 'b', 'role': 'assistant',
+                     'content': [{'type': 'output_text', 'text': 'same completed'}]},
+                ]}},
+        ]
+        draft = self._failed_with_output(events)
+        self.assertEqual(draft['content'], 'samesame completed')
+        self.assertNotIn('tool_calls', draft)
+        self.assertEqual(draft.get('_incomplete_tool_calls', []), [])
