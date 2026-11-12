@@ -9,6 +9,7 @@ import select
 import signal
 import sys
 import struct
+from textwrap import dedent
 import subprocess
 import tempfile
 import termios
@@ -96,7 +97,10 @@ class TerminalTests(unittest.TestCase):
 
     def test_real_cli_edits_commands_without_sending_them_to_model(self):
         code = ('import sys; from termux_agent.cli import main; '
-                'sys.argv=["ta","--no-session","--no-agent"]; main()')
+                'sys.argv=["ta","--no-session","--no-agent"]; main(); '
+                'import json,readline; '
+                'print("HISTORY="+json.dumps([readline.get_history_item(i) '
+                'for i in range(1,readline.get_current_history_length()+1)]))')
         prompt = "You     │ ".encode()
         text = self.exchange(code, [(prompt, b'/helpx\x08\n'),
                                    (prompt, b'!printf BANG_DIRECT\n'),
@@ -106,17 +110,60 @@ class TerminalTests(unittest.TestCase):
         self.assertIn('BANG_DIRECT', text)
         self.assertNotIn('Unknown command', text)
         self.assertNotIn('LLM 请求失败', text)
+        self.assertIn('HISTORY=[]', text)
+
+    def test_history_keeps_tasks_and_paths_without_commands_or_picker_answers(self):
+        code = dedent('''
+            import json
+            import pathlib
+            import readline
+            from termux_agent.cli import configure_readline, read_prompt, save_readline_history
+
+            path = pathlib.Path.home() / ".local/share/termux-agent/repl_history"
+            path.parent.mkdir(parents=True)
+            for value in ["/help", "old task", "/api cloud", "!ls", "CONTINUE", "~/old-notes.txt"]:
+                readline.add_history(value)
+            readline.write_history_file(str(path))
+            readline.clear_history()
+            assert configure_readline(path)
+            read_prompt("task> ")
+            read_prompt("command> ")
+            input("confirm> ")
+            input("select> ")
+            read_prompt("again> ")
+            read_prompt("path> ")
+            readline.add_history("/status")
+            save_readline_history()
+            memory = [readline.get_history_item(i) for i in range(1, readline.get_current_history_length() + 1)]
+            readline.clear_history()
+            readline.read_history_file(str(path))
+            saved = [readline.get_history_item(i) for i in range(1, readline.get_current_history_length() + 1)]
+            print("RESULT=" + json.dumps({"memory": memory, "saved": saved}))
+        ''')
+        text = self.exchange(code, [(b'task> ', b'new task\n'),
+                                    (b'command> ', b'/sessions\n'),
+                                    (b'confirm> ', b'y\n'), (b'select> ', b'2\n'),
+                                    (b'again> ', b'\x1b[A\n'),
+                                    (b'path> ', b'/tmp/notes.txt\n')])
+        result = json.loads(re.search(r'RESULT=({.*})', text).group(1))
+        expected = ['old task', '~/old-notes.txt', 'new task', 'new task', '/tmp/notes.txt']
+        self.assertEqual(result['memory'], expected)
+        self.assertEqual(result['saved'], expected)
 
     def test_triple_quote_and_backslash_multiline_input(self):
         code = ('from termux_agent.cli import configure_readline,read_prompt; import json; '
-                'assert configure_readline(); print("RESULT="+json.dumps(read_prompt("ta> ")))')
+                'assert configure_readline(); print("RESULT="+json.dumps(read_prompt("ta> "))); '
+                'import readline; print("HISTORY="+json.dumps('
+                '[readline.get_history_item(i) for i in range(1,readline.get_current_history_length()+1)]))')
         text = self.exchange(code, [(b'ta> ', b'"""\n'), (b'... ', b'line one\n'),
                                     (b'... ', b'line two\n'), (b'... ', b'"""\n')])
         result = re.search(r'RESULT=(".*")', text)
         self.assertEqual(json.loads(result.group(1)), 'line one\nline two')
+        self.assertEqual(json.loads(re.search(r'HISTORY=(\[.*\])', text).group(1)), ['line one\nline two'])
         text = self.exchange(code, [(b'ta> ', b'line one\\\n'), (b'... ', b'line two\n')])
         result = re.search(r'RESULT=(".*")', text)
         self.assertEqual(json.loads(result.group(1)), 'line one\nline two')
+        self.assertEqual(json.loads(re.search(r'HISTORY=(\[.*\])', text).group(1)), ['line one\nline two'])
 
     def test_readline_history_is_private_and_api_keys_are_redacted(self):
         code = ('from termux_agent.cli import configure_readline,save_readline_history; '

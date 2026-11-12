@@ -87,8 +87,17 @@ BARE_COMMANDS = {name: '/' + name for name in (
 )}
 
 
+def _history_input(value):
+    value = value.strip()
+    return bool(value) and not (
+        value.split(maxsplit=1)[0] in COMMANDS
+        or value.lower() in BARE_COMMANDS
+        or value.startswith('!')
+    )
+
+
 def configure_readline(history_file=None):
-    """Enable terminal editing for input(); no global tty changes or history file."""
+    """Enable terminal editing and remember only explicit task inputs."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return True
     try:
@@ -97,6 +106,7 @@ def configure_readline(history_file=None):
         return False
     global _readline, _history_file
     _readline = readline
+    readline.set_auto_history(False)
     if history_file:
         _history_file = Path(history_file)
         _history_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -107,6 +117,9 @@ def configure_readline(history_file=None):
             except (OSError, ValueError):
                 pass
         readline.set_history_length(2000)
+    for index in range(readline.get_current_history_length() - 1, -1, -1):
+        if not _history_input(readline.get_history_item(index + 1) or ''):
+            readline.remove_history_item(index)
     if "libedit" in (readline.__doc__ or ""):
         readline.parse_and_bind("bind -e")
         for binding in (r'bind "^H" em-delete-prev-char', r'bind "^?" em-delete-prev-char',
@@ -128,7 +141,7 @@ def save_readline_history():
     values = []
     for i in range(1, _readline.get_current_history_length() + 1):
         item = _readline.get_history_item(i)
-        if item:
+        if item and _history_input(item):
             for key in keys:
                 item = item.replace(key, "[REDACTED]")
             values.append(item)
@@ -146,12 +159,6 @@ def save_readline_history():
         temp.unlink(missing_ok=True)
 
 
-def _trim_readline(start):
-    if _readline:
-        while _readline.get_current_history_length() > start:
-            _readline.remove_history_item(start)
-
-
 def _continued(line):
     slashes = len(line) - len(line.rstrip("\\"))
     return slashes % 2 == 1
@@ -159,13 +166,10 @@ def _continued(line):
 
 def read_prompt(prompt="ta> ", continuation="... "):
     """Read ordinary or explicit triple-quote/backslash-continued input."""
-    start = _readline.get_current_history_length() if _readline else 0
     first = input(prompt)
     quoted = first == '"""'
-    if not quoted and not _continued(first):
-        return first
-    lines = [] if quoted else [first[:-1]]
-    try:
+    if quoted or _continued(first):
+        lines = [] if quoted else [first[:-1]]
         while True:
             line = input(continuation)
             if quoted and line == '"""':
@@ -174,12 +178,10 @@ def read_prompt(prompt="ta> ", continuation="... "):
             lines.append(line[:-1] if continued else line)
             if not quoted and not continued:
                 break
-    except BaseException:
-        _trim_readline(start)
-        raise
-    _trim_readline(start)
+    else:
+        lines = [first]
     result = "\n".join(lines)
-    if _readline:
+    if _readline and _history_input(result):
         _readline.add_history(result)
     return result
 

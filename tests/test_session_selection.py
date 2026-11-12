@@ -36,6 +36,9 @@ class FakeReadline:
     def get_current_history_length(self):
         return 0
 
+    def add_history(self, value):
+        pass
+
     def set_completer_delims(self, value):
         pass
 
