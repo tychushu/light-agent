@@ -70,6 +70,8 @@ class Config:
     tool_history_keep_groups: int = 6
     retry_total_timeout: float = 0.0
     max_response_bytes: int = 16 * 1024 * 1024
+    # Original profile model for a model selected explicitly within a session.
+    profile_model: str = ""
 
     @classmethod
     def load(cls, path: str | Path | None = None, profile: str | None = None) -> "Config":
@@ -209,6 +211,8 @@ class Config:
             raise ValueError("base_url must be an http(s) URL")
         if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("model must be a non-empty string")
+        if not isinstance(self.profile_model, str):
+            raise ValueError("profile_model must be a string")
         if not isinstance(self.max_steps, int) or isinstance(self.max_steps, bool) or self.max_steps < 1:
             raise ValueError("max_steps must be a positive integer")
         for key, low, high in (("max_task_calls", 1, 1024),

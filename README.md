@@ -101,6 +101,12 @@ Use `/api models` to fetch the current API's live model catalog, or
 and User-Agent with `GET {base_url}/models`. Each invocation refreshes the list,
 marks the configured model with `*`, and reports when that model is absent.
 For example, `/api models gateway` queries `profiles/gateway.toml`.
+Select a listed model with `/api model MODEL_ID` or `/api model N`. Numbers refer
+to the last displayed catalog, including its API profile. For a single-step
+lookup and selection, use `/api model MODEL_ID NAME`. Selection starts a new
+session and is saved with that session. The profile's default model stays in
+its TOML file. `/api NAME` returns to that profile's configured model.
+Tab completes model IDs and numbers from the last catalog without a request.
 `/api show NAME` and `/config` omit credential values. `ta --config PATH` selects
 another configuration file. `/api remove NAME` removes only added profiles,
 refuses the active profile, and retains a recovery copy.

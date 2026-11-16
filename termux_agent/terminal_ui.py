@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from pathlib import Path
+import shlex
 import shutil
 import unicodedata
 from .i18n import text as ui_text
@@ -14,7 +15,7 @@ COMMANDS = (
     "/history", "/silent", "/auto", "/run", "/sub", "/exit",
 )
 SUBCOMMANDS = {
-    "/api": ("list", "models", "add", "switch", "show", "default", "remove", "next", "prev"),
+    "/api": ("list", "models", "model", "add", "switch", "show", "default", "remove", "next", "prev"),
     "/agent": ("directory", "reload", "off"),
     "/skill": ("list", "info", "load", "unload", "clear"),
     "/session": ("new", "fork", "load", "rename", "rename-id", "delete", "save", "archives", "archive"),
@@ -267,7 +268,7 @@ class Columns:
 
 class Completer:
     def __init__(self, readline, profiles, skills, active_skills, session_ids,
-                 directory, session_choices=None):
+                 directory, session_choices=None, model_choices=None):
         self.readline = readline
         self.profiles = profiles
         self.skills = skills
@@ -275,6 +276,7 @@ class Completer:
         self.session_ids = session_ids
         self.directory = directory
         self.session_choices = session_choices
+        self.model_choices = model_choices
         self._cache_key = None
         self._matches = []
 
@@ -352,6 +354,11 @@ class Completer:
                     options = (*options, *self.session_ids())
             elif root == "/api" and words[1] in ("models", "show", "default", "remove", "switch"):
                 options = self.profiles()
+            elif root == '/api' and words[1] == 'model':
+                if len(words) == 2:
+                    choices = self.model_choices() if self.model_choices else ()
+                    return sorted({shlex.quote(name) for name in choices if name.startswith(prefix)})
+                options = self.profiles() if len(words) == 3 else ()
             elif root == "/session" and words[1] == "rename-id" and len(words) == 2:
                 options = self.session_ids()
             elif root == '/export' and len(words) == 2:

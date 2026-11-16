@@ -47,6 +47,7 @@ continue/resume  未完成任务的简短续跑输入；不新建任务，引号
 /run TASK       连续执行已授权任务，直到完成、阻塞或达到上限
 /api [name|number|next]  列出或切换 API 配置；切换后新建会话
 /api models [NAME]  动态查询指定 API 的可用模型；默认当前 API
+/api model [ID|N] [NAME]  选用模型并新建会话；序号使用最近一次模型列表
 /api add NAME URL MODEL [KEY_ENV] [local|cloud]  添加 API 配置
 /api default NAME   设置以后启动时默认使用的 API 配置
 /api show NAME      查看指定 API 配置，不显示密钥
@@ -248,6 +249,7 @@ def main():
     branch_state = {'kind': 'active'}
     formatter = Columns(sys.stdout, enabled=sys.stdout.isatty() and options.prompt is None)
     last_session_ids = ()
+    model_catalog = None
     cli_commands = tuple(dict.fromkeys((*COMMANDS, "/resume")))
 
     def redact(text):
@@ -258,6 +260,12 @@ def main():
         # Do not let model/tool text inject terminal control sequences.
         text = ''.join(c if c in '\n\t' or c.isprintable() else f'\\x{ord(c):02x}' for c in text)
         formatter.message(role, redact(text), stamp=stamp)
+
+    def model_choices():
+        if model_catalog is None:
+            return ()
+        models = model_catalog[1]
+        return (*models, *(str(i) for i in range(1, len(models) + 1)))
 
     def approve(name, args):
         nonlocal read_grant
@@ -407,6 +415,7 @@ def main():
             session_ids=lambda: store.ids() if store else [],
             directory=lambda: directory,
             session_choices=lambda: [str(i) for i in range(1, len(last_session_ids) + 1)],
+            model_choices=model_choices,
         )
         _readline.set_completer_delims(" \t\n")
         _readline.set_completer(completer)
@@ -557,8 +566,9 @@ def main():
         display(f"{session_id} · {title}", "Session")
 
     def reset_session_io():
-        nonlocal stream_draft, draft_saved_at, read_grant
+        nonlocal stream_draft, draft_saved_at, read_grant, model_catalog
         stream_draft, draft_saved_at, read_grant = {}, 0.0, False
+        model_catalog = None
         tool_started.clear()
 
     def reset_session_tracking(branch=None):
@@ -590,14 +600,78 @@ def main():
         reset_session_tracking()
 
     def switch_api(name, persist=False):
+        nonlocal model_catalog
         candidate = Config.load(config_path, name)
-        if name == config.api_profile and not history_mode():
+        model_catalog = None
+        if (catalog_identity(candidate) == catalog_identity(config) and candidate.model == config.model
+                and not config.profile_model and not history_mode()):
             if persist:
                 profile_store.set_default(name)
             return False
         if persist:
             profile_store.set_default(name)
         start_new_session(candidate, instructions)
+        return True
+
+    def catalog_identity(candidate):
+        return (candidate.api_profile, candidate.base_url.rstrip('/'), candidate.wire_api, candidate.api_key)
+
+    def fetch_models(candidate):
+        query = Client(candidate)
+        try:
+            return tuple(query.list_models())
+        finally:
+            query.close()
+
+    def show_models(name):
+        nonlocal model_catalog
+        model_catalog = None
+        candidate = Config.load(config_path, name)
+        models = fetch_models(candidate)
+        model_catalog = (candidate, models)
+        selected = config.model if name == config.api_profile else candidate.model
+        lines = [tr('API={v0} · 可用模型 {v1} 个', v0=name, v1=len(models)),
+                 candidate.base_url.rstrip('/') + '/models']
+        lines.extend(f'{i:>3} {"*" if model == selected else " "} {model}' for i, model in enumerate(models, 1))
+        if selected not in models:
+            lines.append(tr('配置中的模型 {v0} 不在当前返回列表中。', v0=selected))
+        lines.append(tr('用 /api model ID或序号 选用模型。'))
+        display('\n'.join(lines), 'Models')
+
+    def select_model(value):
+        nonlocal model_catalog
+        parts = shlex.split(value)
+        if not 1 <= len(parts) <= 2:
+            raise ValueError(tr('Use /api model ID|N [NAME]'))
+        choice = parts[0]
+        catalog = model_catalog
+        name = catalog[0].api_profile if catalog else config.api_profile
+        if len(parts) == 2:
+            name = parts[1]
+        candidate = Config.load(config_path, name)
+        if catalog and catalog_identity(catalog[0]) == catalog_identity(candidate):
+            models = catalog[1]
+        else:
+            if choice.isascii() and choice.isdigit():
+                raise ValueError(tr('先用 /api models [NAME] 查询，再按列表序号选用模型。'))
+            models = fetch_models(candidate)
+            catalog = None
+        if choice in models:
+            selected = choice
+        elif choice.isascii() and choice.isdigit() and 1 <= int(choice) <= len(models):
+            selected = models[int(choice) - 1]
+        else:
+            raise ValueError(tr('模型不在当前列表中；请用 /api models [NAME] 重新查询。'))
+        same_api = catalog_identity(candidate) == catalog_identity(config) and not history_mode()
+        profile_model = candidate.model if selected != candidate.model else ''
+        if same_api and selected == config.model and config.profile_model == profile_model:
+            return False
+        replacement = copy.copy(config) if same_api else candidate
+        replacement.profile_model = profile_model
+        replacement.model = selected
+        replacement.validate()
+        start_new_session(replacement, instructions)
+        model_catalog = catalog
         return True
 
     def show_session_listing(limit=50, query=None, empty_text=None, all_rows=False):
@@ -945,20 +1019,12 @@ def main():
                 try:
                     rows = profile_store.list()
                     if value == 'models' or value.startswith('models '):
-                        name = value[6:].strip() or config.api_profile
-                        candidate = Config.load(config_path, name)
-                        query = Client(candidate)
-                        try:
-                            models = query.list_models()
-                        finally:
-                            query.close()
-                        selected = config.model if name == config.api_profile else candidate.model
-                        lines = [tr('API={v0} · 可用模型 {v1} 个', v0=name, v1=len(models)),
-                                 candidate.base_url.rstrip('/') + '/models']
-                        lines.extend(f'{"*" if model == selected else " "} {model}' for model in models)
-                        if selected not in models:
-                            lines.append(tr('配置中的模型 {v0} 不在当前返回列表中。', v0=selected))
-                        display('\n'.join(lines), 'Models')
+                        show_models(value[6:].strip() or config.api_profile)
+                    elif value == 'model' or value.startswith('model '):
+                        choice = value[5:].strip()
+                        switched = select_model(choice) if choice else False
+                        display({'api': config.api_profile, 'model': config.model,
+                                 'switched': switched, 'session': session_id}, 'Models')
                     elif not value or value == "list":
                         display({"current": config.api_profile, "default": profile_store.get_default(),
                                  "profiles": [{"number": i, **row} for i, row in enumerate(rows, 1)]})

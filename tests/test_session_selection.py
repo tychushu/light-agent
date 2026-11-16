@@ -53,7 +53,7 @@ class CapturingCompleter:
     instances = []
 
     def __init__(self, readline, profiles, skills, active_skills, session_ids,
-                 directory, session_choices=None):
+                 directory, session_choices=None, model_choices=None):
         self.session_choices = session_choices
         self.instances.append(self)
 

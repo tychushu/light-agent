@@ -72,6 +72,54 @@ class SessionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             restore(payload, lambda *args: self.fail('must not construct client'))
 
+    def test_selected_model_survives_save_load_and_uses_the_restored_request_model(self):
+        from termux_agent.client import Client
+
+        self.agent.config.profile_model = self.agent.config.model
+        self.agent.config.model = 'selected-model'
+        payload = snapshot(self.agent, self.scope)
+        identifier = new_id()
+        self.store.save(identifier, 0, payload)
+        _, saved = self.store.load(identifier)
+        config, agent, _ = restore(saved, lambda cfg, text, base_system=None:
+                                  Agent(cfg, client=FakeClient(), instructions=text, base_system=base_system))
+        self.assertEqual(config.model, 'selected-model')
+        self.assertEqual(config.profile_model, 'test-model')
+        self.assertEqual(Config.load(self.config).model, 'test-model')
+        self.assertEqual(agent.messages, self.agent.messages)
+        self.assertEqual(self.store.listing()[0]['model'], 'selected-model')
+        client = Client(config)
+        try:
+            _, request = client.prepare_request(agent.messages, [])
+            self.assertEqual(request['model'], 'selected-model')
+        finally:
+            client.close()
+
+    def test_selected_model_still_requires_its_original_profile_and_protocol(self):
+        self.agent.config.profile_model = 'test-model'
+        self.agent.config.model = 'selected-model'
+        payload = snapshot(self.agent, self.scope)
+        replacements = [
+            'base_url="https://different.example/v1"\nmodel="test-model"\n',
+            'base_url="https://example.com/v1"\nmodel="new-default"\n',
+            'base_url="https://example.com/v1"\nmodel="test-model"\nwire_api="responses"\n',
+        ]
+        for replacement in replacements:
+            with self.subTest(config=replacement):
+                self.config.write_text(replacement)
+                with self.assertRaises(ValueError):
+                    restore(payload, lambda *args: self.fail('must not construct client'))
+
+    def test_legacy_sessions_keep_their_model_guard_without_an_override_marker(self):
+        payload = snapshot(self.agent, self.scope)
+        payload['config'].pop('profile_model')
+        config, _, _ = restore(payload, lambda cfg, text, base_system=None:
+                               Agent(cfg, client=FakeClient(), instructions=text, base_system=base_system))
+        self.assertEqual(config.profile_model, '')
+        payload['config']['model'] = 'unmarked-model'
+        with self.assertRaises(ValueError):
+            restore(payload, lambda *args: self.fail('must not construct client'))
+
     def test_tool_history_preserved_and_incomplete_rejected(self):
         calls = [{'id': 'a', 'type': 'function', 'function': {'name': 'shell', 'arguments': '{}'}}]
         self.agent.messages += [{'role': 'assistant', 'content': None, 'tool_calls': calls,

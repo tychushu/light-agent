@@ -256,12 +256,19 @@ def restore(payload, build_agent, *, history_fallback=False):
         raise ValueError('Unsupported session version')
     validate_messages(payload['messages'])
     scope, saved = payload['scope'], payload['config']
+    profile_model = saved.get('profile_model', '')
+    if not isinstance(profile_model, str):
+        raise ValueError('Invalid saved profile model')
     history_reason = ''
     try:
         config = Config.load(scope.get('config_path'), saved['api_profile'])
         if (config.base_url.rstrip('/'), config.model, config.wire_api) != (
-                saved['base_url'].rstrip('/'), saved['model'], saved.get('wire_api', 'chat_completions')):
+                saved['base_url'].rstrip('/'), profile_model or saved['model'], saved.get('wire_api', 'chat_completions')):
             raise ValueError('API profile endpoint/model/protocol changed; restore its original config or start a new session')
+        if profile_model:
+            config.model = saved['model']
+            config.profile_model = profile_model
+            config.validate()
     except (ValueError, OSError):
         if not history_fallback:
             raise

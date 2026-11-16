@@ -283,6 +283,116 @@ wire_api = "responses"
             calls.append('profiles')
             return ['magpie-agentrouter', 'cloud']
         completer = Completer(None, profiles, lambda: [], lambda: [], lambda: [], lambda: Path('.'))
-        self.assertEqual(completer.matches('/api mo', 5, 'mo'), ['models'])
+        self.assertEqual(completer.matches('/api mo', 5, 'mo'), ['model', 'models'])
         self.assertEqual(completer.matches('/api models mag', 12, 'mag'), ['magpie-agentrouter'])
         self.assertEqual(calls, ['profiles', 'profiles'])
+
+    def test_selecting_a_list_number_switches_to_its_api_without_mutating_the_old_config(self):
+        def respond(request):
+            return httpx.Response(200, json={'data': [{'id': 'remote-b'}, {'id': 'remote-a'}]})
+
+        output, agents, requests, _ = self.run_cli(
+            ['/api models cloud', '/api model 2', 'selected task', '/exit'], respond)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(len(agents), 2)
+        self.assertEqual(agents[0].config.model, 'local-model')
+        self.assertEqual(agents[0].prompts, [])
+        selected = agents[1].config
+        self.assertEqual((selected.api_profile, selected.model, selected.profile_model),
+                         ('cloud', 'remote-b', 'unlisted-model'))
+        self.assertEqual(selected.api_key, 'cloud-secret')
+        self.assertEqual(agents[1].prompts, ['selected task'])
+        self.assertIn('  2   remote-b', output)
+        self.assertIn('"switched": true', output)
+
+    def test_direct_selection_queries_the_requested_profile_and_supports_quoted_model_ids(self):
+        output, agents, requests, queried = self.run_cli(
+            ['/api model "remote model" cloud', '/exit'],
+            lambda request: httpx.Response(200, json={'data': [{'id': 'remote model'}]}))
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(queried[0].api_profile, 'cloud')
+        self.assertEqual(agents[-1].config.model, 'remote model')
+        self.assertEqual(agents[-1].config.profile_model, 'unlisted-model')
+        self.assertNotIn('cloud-secret', output)
+
+    def test_missing_catalog_or_unknown_id_and_invalid_number_leave_the_current_session_active(self):
+        def respond(request):
+            return httpx.Response(200, json={'data': [{'id': 'remote-a'}]})
+
+        output, agents, requests, _ = self.run_cli(
+            ['/api model 1', '/api models cloud', '/api model 9', '/api model missing',
+             '/api model too many arguments', 'original task', '/exit'], respond)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(len(agents), 1)
+        self.assertEqual(agents[0].config.model, 'local-model')
+        self.assertEqual(agents[0].prompts, ['original task'])
+        self.assertIn('先用 /api models', output)
+        self.assertIn('模型不在当前列表中', output)
+
+    def test_api_selection_invalidates_catalog_numbers_and_restores_its_default_model(self):
+        def respond(request):
+            return httpx.Response(200, json={'data': [{'id': 'remote-a'}]})
+
+        output, agents, requests, _ = self.run_cli(
+            ['/api models cloud', '/api local', '/api model 1',
+             '/api models cloud', '/api model 1', '/api cloud', 'default task', '/exit'], respond)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(len(agents), 3)
+        self.assertEqual(agents[1].config.model, 'remote-a')
+        self.assertEqual(agents[2].config.model, 'unlisted-model')
+        self.assertEqual(agents[2].config.profile_model, '')
+        self.assertEqual(agents[2].prompts, ['default task'])
+        self.assertIn('先用 /api models', output)
+
+    def test_numeric_model_ids_take_precedence_and_selecting_the_same_model_is_a_noop(self):
+        def respond(request):
+            return httpx.Response(200, json={'data': [{'id': '123'}, {'id': 'remote-b'}]})
+
+        output, agents, requests, _ = self.run_cli(
+            ['/api models cloud', '/api model 123', '/api model 123', '/api model', '/exit'], respond)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(len(agents), 2)
+        self.assertEqual(agents[-1].config.model, '123')
+        self.assertIn('"switched": false', output)
+
+    def test_failed_refresh_invalidates_catalog_without_sending_a_model_request(self):
+        count = 0
+        def respond(request):
+            nonlocal count
+            count += 1
+            if count == 1:
+                return httpx.Response(200, json={'data': [{'id': 'remote-a'}]})
+            return httpx.Response(503, json={'error': {'message': 'unavailable'}})
+
+        output, agents, requests, _ = self.run_cli(
+            ['/api models cloud', '/api models cloud', '/api model 1', '/exit'], respond)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(len(agents), 1)
+        self.assertIn('HTTP 503', output)
+        self.assertIn('先用 /api models', output)
+
+    def test_changed_credentials_cannot_reuse_a_cached_catalog_number(self):
+        def respond(request):
+            os.environ['CLOUD_KEY'] = 'rotated-secret'
+            return httpx.Response(200, json={'data': [{'id': 'remote-a'}]})
+
+        output, agents, requests, _ = self.run_cli(
+            ['/api models cloud', '/api model 1', '/exit'], respond)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(len(agents), 1)
+        self.assertIn('先用 /api models', output)
+        self.assertNotIn('rotated-secret', output)
+
+    def test_model_id_and_number_completion_uses_only_the_displayed_catalog(self):
+        calls = []
+        def choices():
+            calls.append('cached')
+            return ['1', '2', 'auto/fast', 'model with spaces']
+
+        completer = Completer(None, lambda: ['cloud'], lambda: [], lambda: [], lambda: [],
+                              lambda: Path('.'), model_choices=choices)
+        self.assertEqual(completer.matches('/api model au', 11, 'au'), ['auto/fast'])
+        self.assertEqual(completer.matches('/api model 2', 11, '2'), ['2'])
+        self.assertEqual(completer.matches('/api model mo', 11, 'mo'), ["'model with spaces'"])
+        self.assertEqual(completer.matches('/api model auto/fast cl', 21, 'cl'), ['cloud'])
+        self.assertEqual(len(calls), 3)

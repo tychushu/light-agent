@@ -89,6 +89,9 @@ local，不因注释或空行变成全局。共享限制放在第一个表头前
 - `/api models [NAME]` 动态查询可用模型，默认当前 API。每次从该配置的 `{base_url}/models`
   获取最新列表，使用对应鉴权和 User-Agent，以 `*` 标记配置模型，并提示模型已不在列表中的情况。
   例如 `/api models gateway` 查询 `profiles/gateway.toml`。
+- `/api model ID或序号` 选用最近一次模型列表中的模型及其 API，切换后新建会话。
+  `/api model 模型ID NAME` 可以一步查询指定 API 并选用模型。所选模型随会话保存，
+  配置文件中的默认模型继续保留；`/api NAME` 返回配置模型。Tab 补全最近列表中的模型 ID 和序号。
 - `/api default NAME`：设置以后启动时默认使用的 API。
 - `/api add NAME URL MODEL [KEY_ENV] [local|cloud]`：创建独立配置文件。
 - `/api show NAME`、`/config`：查看设置，不显示密钥值。

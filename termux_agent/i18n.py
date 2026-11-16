@@ -4,6 +4,9 @@ import re
 # Source templates stay beside their callers; values are interpolated only after
 # translation. Never use substring replacement on a transcript or a tool result.
 EN = {
+    '用 /api model ID或序号 选用模型。': 'Use /api model ID or N to select a model.',
+    '先用 /api models [NAME] 查询，再按列表序号选用模型。': 'Run /api models [NAME] before selecting a model by number.',
+    '模型不在当前列表中；请用 /api models [NAME] 重新查询。': 'Model is absent from the catalog; refresh it with /api models [NAME].',
     'API={v0} · 可用模型 {v1} 个': 'API={v0} · {v1} available models',
     '配置中的模型 {v0} 不在当前返回列表中。': 'Configured model {v0} is absent from the current catalog.',
     '自动续跑 {v0}/{v1}：{v2}': 'Auto-resume {v0}/{v1}: {v2}',
@@ -210,6 +213,7 @@ def help_text(source, language='zh'):
 
 
 HELP_EN = {
+    '选用模型并新建会话；序号使用最近一次模型列表': 'Select a model in a new session; numbers refer to the last model list',
     '动态查询指定 API 的可用模型；默认当前 API': 'Fetch available models from an API; defaults to the current API',
     '显示命令帮助（Show commands）': 'Show command help',
     '补全命令、API 配置、会话 ID 和技能名称': 'Complete commands, API profiles, session IDs and Skill names',
