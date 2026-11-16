@@ -180,6 +180,60 @@ class Client:
     def set_control_markers(self, markers):
         self.control_markers = tuple(markers)
 
+    def list_models(self) -> list[str]:
+        """Fetch the live model catalog without changing conversation counters."""
+        url = self.config.base_url.rstrip('/') + '/models'
+        headers = {'Accept': 'application/json', 'User-Agent': self.config.user_agent}
+        if self.config.api_key:
+            headers['Authorization'] = 'Bearer ' + self.config.api_key
+        timeout = min(self.config.timeout, 15.0)
+        deadline = self._clock() + timeout
+        remaining = self.config.max_response_bytes
+        models, cursors = set(), set()
+        params = None
+        try:
+            with request_deadline(timeout):
+                for _ in range(20):
+                    with self._http.stream('GET', url, headers=headers, params=params,
+                                           timeout=timeout, follow_redirects=False) as response:
+                        if not response.is_success:
+                            sample = self._error_sample(response, deadline)
+                            raise self._classified_error(response, sample)
+                        if 'text/html' in response.headers.get('content-type', '').lower():
+                            raise ProviderError('Models endpoint returned HTML instead of JSON', transient=False)
+                        raw = b''.join(response_chunks(response, remaining))
+                        remaining -= len(raw)
+                        value = json.loads(raw)
+                    if isinstance(value, dict) and value.get('error'):
+                        raise self._body_error(value)
+                    if not isinstance(value, dict) or not isinstance(value.get('data'), list):
+                        raise ProviderError('Models endpoint must return a data array', transient=False)
+                    for item in value['data']:
+                        identifier = item.get('id') if isinstance(item, dict) else None
+                        if (not isinstance(identifier, str) or not identifier.strip()
+                                or len(identifier) > 1024 or not identifier.isprintable()
+                                or (self.config.api_key and self.config.api_key in identifier)):
+                            raise ProviderError('Models endpoint returned an invalid model ID', transient=False)
+                        models.add(identifier)
+                    more = value.get('has_more', False)
+                    if more is False:
+                        return sorted(models)
+                    cursor = value.get('last_id')
+                    if more is not True or not isinstance(cursor, str) or not cursor or cursor in cursors:
+                        raise ProviderError('Models endpoint returned invalid pagination', transient=False)
+                    cursors.add(cursor)
+                    params = {'after': cursor}
+                raise ProviderError('Models endpoint exceeded 20 pages', transient=False)
+        except ResponseLimitError:
+            raise ProviderError('Model catalog exceeds max_response_bytes', transient=False) from None
+        except RetryDeadlineError as exc:
+            raise NetworkError('Model discovery could not complete before its deadline',
+                               transient=not isinstance(exc, RetryDeadlineSetupError)) from None
+        except httpx.HTTPError as exc:
+            raise NetworkError(f'Model discovery failed ({type(exc).__name__})') from None
+        except ValueError:
+            raise ProviderError('Models endpoint returned invalid JSON', transient=False) from None
+
     def _prepare_responses_request(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> tuple[str, dict[str, Any]]:
         url = self.config.base_url.rstrip("/") + "/responses"
         def parts(content, role):

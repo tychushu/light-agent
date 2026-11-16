@@ -86,6 +86,9 @@ local，不因注释或空行变成全局。共享限制放在第一个表头前
 用于终端显示的思考文字不会作为第二份 saved Responses 历史重复添加。
 
 - `/api`：列出配置；`/api NAME`、`/api N`、`/api next`：切换并新建会话。
+- `/api models [NAME]` 动态查询可用模型，默认当前 API。每次从该配置的 `{base_url}/models`
+  获取最新列表，使用对应鉴权和 User-Agent，以 `*` 标记配置模型，并提示模型已不在列表中的情况。
+  例如 `/api models gateway` 查询 `profiles/gateway.toml`。
 - `/api default NAME`：设置以后启动时默认使用的 API。
 - `/api add NAME URL MODEL [KEY_ENV] [local|cloud]`：创建独立配置文件。
 - `/api show NAME`、`/config`：查看设置，不显示密钥值。

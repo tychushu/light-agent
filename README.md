@@ -96,6 +96,11 @@ second copy of the saved Responses items.
 
 Switch with `/api NAME`, `/api N`, or `/api next`; switching saves the conversation
 and starts a fresh session. `/api default NAME` sets the startup choice.
+Use `/api models` to fetch the current API's live model catalog, or
+`/api models NAME` for another profile. The request uses that profile's credentials
+and User-Agent with `GET {base_url}/models`. Each invocation refreshes the list,
+marks the configured model with `*`, and reports when that model is absent.
+For example, `/api models gateway` queries `profiles/gateway.toml`.
 `/api show NAME` and `/config` omit credential values. `ta --config PATH` selects
 another configuration file. `/api remove NAME` removes only added profiles,
 refuses the active profile, and retains a recovery copy.

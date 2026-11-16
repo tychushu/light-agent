@@ -4,6 +4,8 @@ import re
 # Source templates stay beside their callers; values are interpolated only after
 # translation. Never use substring replacement on a transcript or a tool result.
 EN = {
+    'API={v0} · 可用模型 {v1} 个': 'API={v0} · {v1} available models',
+    '配置中的模型 {v0} 不在当前返回列表中。': 'Configured model {v0} is absent from the current catalog.',
     '自动续跑 {v0}/{v1}：{v2}': 'Auto-resume {v0}/{v1}: {v2}',
     '；等待 {v0:g} 秒后继续': '; resuming in {v0:g}s',
     '按 /continue 续跑原任务，不新建任务：{v0}': 'Resuming the unfinished task as /continue would, not starting a new one: {v0}',
@@ -208,6 +210,7 @@ def help_text(source, language='zh'):
 
 
 HELP_EN = {
+    '动态查询指定 API 的可用模型；默认当前 API': 'Fetch available models from an API; defaults to the current API',
     '显示命令帮助（Show commands）': 'Show command help',
     '补全命令、API 配置、会话 ID 和技能名称': 'Complete commands, API profiles, session IDs and Skill names',
     '补全本地路径；回车将 UTF-8 文本文件内容提交给模型': 'Complete a local path; Enter submits its UTF-8 text to the model',

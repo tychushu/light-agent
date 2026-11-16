@@ -14,7 +14,7 @@ COMMANDS = (
     "/history", "/silent", "/auto", "/run", "/sub", "/exit",
 )
 SUBCOMMANDS = {
-    "/api": ("list", "add", "switch", "show", "default", "remove", "next", "prev"),
+    "/api": ("list", "models", "add", "switch", "show", "default", "remove", "next", "prev"),
     "/agent": ("directory", "reload", "off"),
     "/skill": ("list", "info", "load", "unload", "clear"),
     "/session": ("new", "fork", "load", "rename", "rename-id", "delete", "save", "archives", "archive"),
@@ -350,7 +350,7 @@ class Completer:
                     options = (*options, *self._agent_files(prefix))
                 elif root == '/export':
                     options = (*options, *self.session_ids())
-            elif root == "/api" and words[1] in ("show", "default", "remove", "switch"):
+            elif root == "/api" and words[1] in ("models", "show", "default", "remove", "switch"):
                 options = self.profiles()
             elif root == "/session" and words[1] == "rename-id" and len(words) == 2:
                 options = self.session_ids()

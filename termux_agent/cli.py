@@ -14,6 +14,7 @@ from pathlib import Path
 from .instructions import load_instructions
 
 from .agent import Agent
+from .client import Client, ClientError
 from .config import Config
 from .sessions import SessionStore, new_id, snapshot, restore, validate_title, has_unknown_tool_results
 from .skills import SkillRegistry
@@ -45,6 +46,7 @@ continue/resume  未完成任务的简短续跑输入；不新建任务，引号
 /auto [on|off|steps N]  开关自动连续执行，或设置模型调用上限
 /run TASK       连续执行已授权任务，直到完成、阻塞或达到上限
 /api [name|number|next]  列出或切换 API 配置；切换后新建会话
+/api models [NAME]  动态查询指定 API 的可用模型；默认当前 API
 /api add NAME URL MODEL [KEY_ENV] [local|cloud]  添加 API 配置
 /api default NAME   设置以后启动时默认使用的 API 配置
 /api show NAME      查看指定 API 配置，不显示密钥
@@ -942,7 +944,22 @@ def main():
                 value = prompt[4:].strip()
                 try:
                     rows = profile_store.list()
-                    if not value or value == "list":
+                    if value == 'models' or value.startswith('models '):
+                        name = value[6:].strip() or config.api_profile
+                        candidate = Config.load(config_path, name)
+                        query = Client(candidate)
+                        try:
+                            models = query.list_models()
+                        finally:
+                            query.close()
+                        selected = config.model if name == config.api_profile else candidate.model
+                        lines = [tr('API={v0} · 可用模型 {v1} 个', v0=name, v1=len(models)),
+                                 candidate.base_url.rstrip('/') + '/models']
+                        lines.extend(f'{"*" if model == selected else " "} {model}' for model in models)
+                        if selected not in models:
+                            lines.append(tr('配置中的模型 {v0} 不在当前返回列表中。', v0=selected))
+                        display('\n'.join(lines), 'Models')
+                    elif not value or value == "list":
                         display({"current": config.api_profile, "default": profile_store.get_default(),
                                  "profiles": [{"number": i, **row} for i, row in enumerate(rows, 1)]})
                     elif value.startswith("add "):
@@ -1010,7 +1027,7 @@ def main():
                         switched = switch_api(name, persist)
                         display({"api": name, "switched": switched,
                                  "default": profile_store.get_default()})
-                except (ValueError, OSError, sqlite3.Error) as exc:
+                except (ValueError, OSError, sqlite3.Error, ClientError) as exc:
                     display(tr('Error: {v0}', v0=exc))
             elif prompt == "/agent" or prompt.startswith("/agent "):
                 value = prompt[6:].strip()
