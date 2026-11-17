@@ -1,4 +1,5 @@
 """Local SQLite sessions: atomic snapshots, revision checks, no API credentials."""
+import contextlib
 import copy
 import json
 import os
@@ -184,7 +185,7 @@ def scrub_keys(value, extra=()):
 
 def snapshot(agent, scope, checkpoint=False, branch=None, messages=None):
     # scrub_keys below already produces an independent tree; avoid a second copy.
-    value = {'version': 4, 'config': agent.config.public_dict(), 'scope': scope,
+    value = {'version': 5, 'config': agent.config.public_dict(), 'scope': scope,
              'base_system': agent.base_system,
              'messages': agent.messages if messages is None else messages, 'active_skills': agent.get_active_skills(),
              'counters': {k: getattr(agent, k) for k in COUNTERS},
@@ -255,7 +256,7 @@ class HistoryClient:
 
 def restore(payload, build_agent, *, history_fallback=False):
     payload = copy.deepcopy(payload)
-    if payload.get('version') not in (1, 2, 3, 4):
+    if payload.get('version') not in (1, 2, 3, 4, 5):
         raise ValueError('Unsupported session version')
     validate_messages(payload['messages'])
     scope, saved = payload['scope'], payload['config']
@@ -344,7 +345,79 @@ def restore(payload, build_agent, *, history_fallback=False):
     return config, agent, scope
 
 
+_SESSIONS_SYNC_TRIGGERS_SQL = (
+    '''
+    CREATE TRIGGER IF NOT EXISTS sessions_sync_insert
+    AFTER INSERT ON sessions
+    WHEN json_valid(NEW.payload) AND json_type(NEW.payload, '$.messages') = 'array'
+    BEGIN
+        DELETE FROM session_messages
+        WHERE session_id = NEW.id
+          AND seq >= json_array_length(NEW.payload, '$.messages');
+        INSERT OR REPLACE INTO session_messages (session_id, seq, message)
+        SELECT NEW.id, CAST(j.key AS INTEGER), j.value
+        FROM json_each(NEW.payload, '$.messages') AS j
+        LEFT JOIN session_messages AS sm
+          ON sm.session_id = NEW.id AND sm.seq = CAST(j.key AS INTEGER)
+        WHERE sm.message IS NULL OR sm.message != j.value;
+    END
+    ''',
+    '''
+    CREATE TRIGGER IF NOT EXISTS sessions_sync_update_v2
+    AFTER UPDATE OF id, payload ON sessions
+    BEGIN
+        DELETE FROM session_messages
+        WHERE session_id = NEW.id AND NEW.id IS NOT OLD.id;
+        UPDATE session_messages
+        SET session_id = NEW.id
+        WHERE session_id = OLD.id AND NEW.id IS NOT OLD.id;
+        DELETE FROM session_messages
+        WHERE session_id = NEW.id
+          AND NEW.payload IS NOT OLD.payload
+          AND json_valid(NEW.payload)
+          AND json_type(NEW.payload, '$.messages') = 'array'
+          AND seq >= json_array_length(NEW.payload, '$.messages');
+        INSERT OR REPLACE INTO session_messages (session_id, seq, message)
+        SELECT NEW.id, CAST(j.key AS INTEGER), j.value
+        FROM json_each(
+            CASE
+                WHEN NEW.payload IS NOT OLD.payload
+                     AND json_valid(NEW.payload)
+                     AND json_type(NEW.payload, '$.messages') = 'array'
+                THEN NEW.payload
+                ELSE '{}'
+            END,
+            '$.messages'
+        ) AS j
+        LEFT JOIN session_messages AS sm
+          ON sm.session_id = NEW.id AND sm.seq = CAST(j.key AS INTEGER)
+        WHERE sm.message IS NULL OR sm.message != j.value;
+    END
+    ''',
+    '''
+    CREATE TRIGGER IF NOT EXISTS sessions_sync_delete
+    AFTER DELETE ON sessions
+    BEGIN
+        DELETE FROM session_messages WHERE session_id = OLD.id;
+    END
+    ''',
+)
+
+_REQUIRED_SCHEMA_OBJECTS = frozenset((
+    'sessions',
+    'session_messages',
+    'drafts',
+    'session_archives',
+    'session_archives_owner',
+    'sessions_sync_insert',
+    'sessions_sync_update_v2',
+    'sessions_sync_delete',
+))
+
+
 class SessionStore:
+    _MAX_PAYLOAD_BYTES = 20 * 1024 * 1024
+
     def __init__(self, root=None):
         root = Path(root) if root else Path.home() / '.local/share/termux-agent'
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -364,17 +437,82 @@ class SessionStore:
         except sqlite3.Error:
             self.db.close()
             raise
-        self.db.execute('CREATE TABLE IF NOT EXISTS sessions '
-                        '(id TEXT PRIMARY KEY, title TEXT, updated REAL, revision INTEGER, payload TEXT)')
-        self.db.execute('CREATE TABLE IF NOT EXISTS drafts '
-                        '(id TEXT PRIMARY KEY, revision INTEGER, updated REAL, payload TEXT)')
-        self.db.execute('CREATE TABLE IF NOT EXISTS session_archives '
-                        '(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT, '
-                        'updated REAL, revision INTEGER NOT NULL, payload TEXT NOT NULL, draft TEXT)')
-        self.db.execute('CREATE INDEX IF NOT EXISTS session_archives_owner '
-                        'ON session_archives(session_id, revision)')
-        self.db.commit()
+        self._init_schema()
         self._secure_files()
+
+    @contextlib.contextmanager
+    def _read_snapshot(self):
+        if self.db.in_transaction:
+            yield
+            return
+        self.db.execute('BEGIN')
+        try:
+            yield
+        except BaseException:
+            if self.db.in_transaction:
+                self.db.rollback()
+            raise
+        else:
+            if self.db.in_transaction:
+                self.db.commit()
+
+    def _init_schema(self):
+        existing = {
+            row[0] for row in self.db.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view', 'index', 'trigger')"
+            )
+        }
+        if not _REQUIRED_SCHEMA_OBJECTS.issubset(existing) or 'sessions_v5_view' in existing:
+            self.db.execute('DROP VIEW IF EXISTS sessions_v5_view')
+            for old_trigger in ('sessions_legacy_insert', 'sessions_legacy_update',
+                                'sessions_legacy_id_update', 'sessions_legacy_delete',
+                                'sessions_sync_update', 'sessions_sync_id_update'):
+                self.db.execute(f'DROP TRIGGER IF EXISTS {old_trigger}')
+            self.db.execute('CREATE TABLE IF NOT EXISTS sessions '
+                            '(id TEXT PRIMARY KEY, title TEXT, updated REAL, revision INTEGER, payload TEXT)')
+            self.db.execute('CREATE TABLE IF NOT EXISTS session_messages '
+                            '(session_id TEXT NOT NULL, seq INTEGER NOT NULL, message TEXT NOT NULL, '
+                            'PRIMARY KEY (session_id, seq))')
+            self.db.execute('CREATE TABLE IF NOT EXISTS drafts '
+                            '(id TEXT PRIMARY KEY, revision INTEGER, updated REAL, payload TEXT)')
+            self.db.execute('CREATE TABLE IF NOT EXISTS session_archives '
+                            '(id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT, '
+                            'updated REAL, revision INTEGER NOT NULL, payload TEXT NOT NULL, draft TEXT)')
+            self.db.execute('CREATE INDEX IF NOT EXISTS session_archives_owner '
+                            'ON session_archives(session_id, revision)')
+            for sql in _SESSIONS_SYNC_TRIGGERS_SQL:
+                self.db.execute(sql)
+            self.db.commit()
+        self._backfill_legacy_messages()
+
+    def _backfill_legacy_messages(self):
+        # Populate session_messages for unmigrated v1-v4 rows without modifying
+        # the sessions table so already-open v1-v4 connections keep working seamlessly.
+        query = '''
+            SELECT 1 FROM sessions s
+            WHERE NOT EXISTS(SELECT 1 FROM session_messages sm WHERE sm.session_id = s.id)
+              AND json_valid(s.payload)
+              AND json_type(s.payload, '$.messages') = 'array'
+              AND json_array_length(s.payload, '$.messages') > 0
+            LIMIT 1
+        '''
+        if not self.db.execute(query).fetchone():
+            return
+        self.db.execute('BEGIN IMMEDIATE')
+        try:
+            self.db.execute('''
+                INSERT OR IGNORE INTO session_messages (session_id, seq, message)
+                SELECT s.id, CAST(j.key AS INTEGER), j.value
+                FROM sessions s, json_each(s.payload, '$.messages') AS j
+                WHERE NOT EXISTS(SELECT 1 FROM session_messages sm WHERE sm.session_id = s.id)
+                  AND json_valid(s.payload)
+                  AND json_type(s.payload, '$.messages') = 'array'
+                  AND json_array_length(s.payload, '$.messages') > 0
+            ''')
+            self.db.commit()
+        except BaseException:
+            self.db.rollback()
+            raise
 
     def _secure_files(self):
         for suffix in ('', '-wal', '-shm'):
@@ -388,10 +526,10 @@ class SessionStore:
         if not re.fullmatch('[0-9a-f]{12}', identifier):
             raise ValueError('Use the exact 12-character session ID from /sessions')
 
-    @staticmethod
-    def _payload_text(payload):
+    @classmethod
+    def _payload_text(cls, payload):
         text = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
-        if len(text.encode()) > 20 * 1024 * 1024:
+        if len(text.encode()) > cls._MAX_PAYLOAD_BYTES:
             raise ValueError('Session exceeds 20 MiB; start a new session')
         return text
 
@@ -494,27 +632,44 @@ class SessionStore:
 
     def load(self, identifier):
         self.check_id(identifier)
-        row = self.db.execute('SELECT revision,payload FROM sessions WHERE id=?', (identifier,)).fetchone()
-        if row is None:
-            raise ValueError('Session not found')
-        return row[0], json.loads(row[1])
+        with self._read_snapshot():
+            row = self.db.execute('SELECT revision,payload FROM sessions WHERE id=?', (identifier,)).fetchone()
+            if row is None:
+                raise ValueError('Session not found')
+            revision, text = row
+            payload = json.loads(text)
+            msg_rows = self.db.execute(
+                'SELECT message FROM session_messages WHERE session_id=? ORDER BY seq ASC',
+                (identifier,),
+            ).fetchall()
+        if msg_rows:
+            payload['messages'] = [json.loads(r[0]) for r in msg_rows]
+        elif not isinstance(payload.get('messages'), list):
+            payload['messages'] = []
+        return revision, payload
 
     def listing(self, limit=50, query=None, *, all_rows=False, active_id=None):
         from .session_listing import collapse_compaction_rows
         # Extract only the fields needed for grouping and display. Resolve links
         # before applying the title filter and page limit.
-        rows = self.db.execute('''
-            SELECT s.id, s.title, s.updated,
-                   json_extract(s.payload,'$.config.api_profile'), json_extract(s.payload,'$.config.model'),
-                   json_extract(s.payload,'$.scope.directory'), json_array_length(s.payload,'$.messages'),
-                   json_extract(s.payload,'$.branch.archive_session_id'),
-                   json_extract(s.payload,'$.config.base_url'),
-                   COALESCE(json_extract(s.payload,'$.config.wire_api'),'chat_completions'),
-                   json_extract(s.payload,'$.scope.config_path'), json_extract(s.payload,'$.scope.session_file'),
-                   json_extract(s.payload,'$.scope.instruction_path'), json_extract(s.payload,'$.scope.disabled'),
-                   (SELECT count(*) FROM session_archives a WHERE a.session_id=s.id)
-            FROM sessions s ORDER BY s.updated DESC, s.id
-        ''')
+        with self._read_snapshot():
+            rows = self.db.execute('''
+                SELECT s.id, s.title, s.updated,
+                       json_extract(s.payload,'$.config.api_profile'), json_extract(s.payload,'$.config.model'),
+                       json_extract(s.payload,'$.scope.directory'),
+                       CASE
+                           WHEN EXISTS(SELECT 1 FROM session_messages sm WHERE sm.session_id=s.id)
+                           THEN (SELECT count(*) FROM session_messages sm WHERE sm.session_id=s.id)
+                           ELSE json_array_length(s.payload,'$.messages')
+                       END,
+                       json_extract(s.payload,'$.branch.archive_session_id'),
+                       json_extract(s.payload,'$.config.base_url'),
+                       COALESCE(json_extract(s.payload,'$.config.wire_api'),'chat_completions'),
+                       json_extract(s.payload,'$.scope.config_path'), json_extract(s.payload,'$.scope.session_file'),
+                       json_extract(s.payload,'$.scope.instruction_path'), json_extract(s.payload,'$.scope.disabled'),
+                       (SELECT count(*) FROM session_archives a WHERE a.session_id=s.id)
+                FROM sessions s ORDER BY s.updated DESC, s.id
+            ''').fetchall()
         result = []
         for identifier, title, updated, api, model, directory, messages, parent, *extra in rows:
             identity, count = extra[:-1], extra[-1]
@@ -543,32 +698,42 @@ class SessionStore:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError('Recall limit must be between 1 and 100')
         results = []
-        for identifier, title, updated, text in self.db.execute(
-                'SELECT id,title,updated,payload FROM sessions UNION ALL '
-                'SELECT id,title,updated,payload FROM session_archives ORDER BY updated DESC'):
-            payload = json.loads(text)
-            index, snippet = None, None
-            if query in (title or '').casefold():
-                snippet = title
-            else:
-                for index, message in enumerate(payload['messages'][1:], 1):
-                    raw = json.dumps({'content': message.get('content'), 'tool_calls': message.get('tool_calls')},
-                                     ensure_ascii=False)
-                    if query in raw.casefold():
-                        visible = history_entry(message, silent_writes, limit=20 * 1024 * 1024)[1]
-                        position = visible.casefold().find(query)
-                        if position < 0:
-                            snippet = '命中已保存内容；按静默显示规则隐藏正文。'
-                        else:
-                            start = max(0, position - 60)
-                            snippet = ('…' if start else '') + visible[start:start + 200]
+        with self._read_snapshot():
+            candidates = self.db.execute(
+                'SELECT id,title,updated,payload,0 FROM sessions UNION ALL '
+                'SELECT id,title,updated,payload,1 FROM session_archives ORDER BY updated DESC'
+            ).fetchall()
+            for identifier, title, updated, text, is_archive in candidates:
+                index, snippet = None, None
+                if query in (title or '').casefold():
+                    snippet = title
+                else:
+                    if is_archive:
+                        messages = json.loads(text).get('messages', [])[1:]
+                    else:
+                        msg_rows = self.db.execute(
+                            'SELECT message FROM session_messages WHERE session_id=? AND seq >= 1 ORDER BY seq ASC',
+                            (identifier,),
+                        ).fetchall()
+                        messages = [json.loads(r[0]) for r in msg_rows] if msg_rows else json.loads(text).get('messages', [])[1:]
+                    for index, message in enumerate(messages, 1):
+                        raw = json.dumps({'content': message.get('content'), 'tool_calls': message.get('tool_calls')},
+                                         ensure_ascii=False)
+                        if query in raw.casefold():
+                            visible = history_entry(message, silent_writes, limit=20 * 1024 * 1024)[1]
+                            position = visible.casefold().find(query)
+                            if position < 0:
+                                snippet = '命中已保存内容；按静默显示规则隐藏正文。'
+                            else:
+                                start = max(0, position - 60)
+                                snippet = ('…' if start else '') + visible[start:start + 200]
+                            break
+                if snippet is not None:
+                    results.append({'id': identifier, 'title': title,
+                                    'updated': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated)),
+                                    'message': index, 'snippet': ' '.join(snippet.split())[:220]})
+                    if len(results) >= limit:
                         break
-            if snippet is not None:
-                results.append({'id': identifier, 'title': title,
-                                'updated': time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(updated)),
-                                'message': index, 'snippet': ' '.join(snippet.split())[:220]})
-                if len(results) >= limit:
-                    break
         return results
 
     def export(self, identifier, format='markdown', path=None):
@@ -578,11 +743,14 @@ class SessionStore:
             data = self.load_archive(identifier)
         else:
             self.check_id(identifier)
-            row = self.db.execute('SELECT title,updated,revision,payload FROM sessions WHERE id=?', (identifier,)).fetchone()
-            if row is None:
-                raise ValueError('Session not found')
-            data = {'id': identifier, 'title': row[0], 'updated': row[1], 'revision': row[2],
-                    'payload': json.loads(row[3]), 'draft': self.draft(identifier)}
+            with self._read_snapshot():
+                row = self.db.execute('SELECT title,updated FROM sessions WHERE id=?', (identifier,)).fetchone()
+                if row is None:
+                    raise ValueError('Session not found')
+                revision, payload = self.load(identifier)
+                draft = self.draft(identifier)
+            data = {'id': identifier, 'title': row[0], 'updated': row[1], 'revision': revision,
+                    'payload': payload, 'draft': draft}
         text = json.dumps(data, ensure_ascii=False, indent=2) + '\n'
         if format == 'markdown':
             from .history import history_entry
@@ -651,6 +819,7 @@ class SessionStore:
             if result.rowcount != 1:
                 raise ValueError('Session changed or deleted; list sessions and confirm again' if expected is not None
                                  else 'Session not found')
+            self.db.execute('DELETE FROM session_messages WHERE session_id=?', (identifier,))
             self.db.execute('DELETE FROM drafts WHERE id=?', (identifier,))
             self.db.execute('DELETE FROM session_archives WHERE session_id=?', (identifier,))
 

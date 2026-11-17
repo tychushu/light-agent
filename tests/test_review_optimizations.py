@@ -6,6 +6,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -13,7 +14,7 @@ from unittest.mock import patch
 from termux_agent import approval, security
 from termux_agent.api_profiles import ProfileStore
 from termux_agent.config import Config
-from termux_agent.sessions import SessionStore, scrub_keys, snapshot
+from termux_agent.sessions import SessionStore, restore, scrub_keys, snapshot
 from termux_agent.tools import execute
 
 try:
@@ -449,6 +450,321 @@ class ClientAndAgentOptimizationTests(unittest.TestCase):
                 os.chdir(prev_cwd)
             # load_session builds 1 snapshot (instead of 2); exit finally save_current builds 1.
             self.assertEqual(len(snap_calls), 2)
+
+
+@unittest.skipIf(httpx is None, "httpx is required for P3 tests")
+class P3ArchitectureEvolutionTests(unittest.TestCase):
+    def test_v5_session_store_append_only_messages_preserve_prefix_rowids(self):
+        from termux_agent.agent import Agent
+        from termux_agent.client import Client
+
+        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {'HOME': td}):
+            root = Path(td)
+            cfg_path = root / 'config.toml'
+            cfg_path.write_text('base_url="http://127.0.0.1:9/v1"\nmodel="m"\ntoken_count_mode="off"\n',
+                                encoding='utf-8')
+            cfg = Config.load(cfg_path)
+            scope = {'directory': str(root), 'config_path': str(cfg_path),
+                     'session_file': None, 'disabled': True,
+                     'instructions': '', 'instruction_path': None}
+            store = SessionStore(root / 'store')
+            self.addCleanup(store.close)
+
+            with httpx.Client() as http:
+                agent = Agent(cfg, client=Client(cfg, http_client=http), base_system='rules')
+                for idx in range(12):
+                    agent.messages.append({'role': 'user', 'content': f'user-{idx}'})
+                    agent.messages.append({'role': 'assistant', 'content': f'assistant-{idx}'})
+                rev = store.save('aaaaaaaaaaaa', 0, snapshot(agent, scope))
+                self.assertEqual(rev, 1)
+
+                prefix_before = store.db.execute(
+                    'SELECT seq, rowid FROM session_messages WHERE session_id=? ORDER BY seq ASC',
+                    ('aaaaaaaaaaaa',),
+                ).fetchall()
+                self.assertEqual(len(prefix_before), len(agent.messages))
+
+                # Pending tool call checkpoint inserts synthetic unknown result at tail without touching prefix.
+                agent.messages.append({
+                    'role': 'assistant', 'content': '',
+                    'tool_calls': [{'id': 'c1', 'type': 'function',
+                                    'function': {'name': 'read_file', 'arguments': '{"path":"a.txt"}'}}],
+                })
+                rev = store.save('aaaaaaaaaaaa', rev, snapshot(agent, scope, checkpoint=True))
+                self.assertEqual(rev, 2)
+                after_chk = store.db.execute(
+                    'SELECT seq, rowid FROM session_messages WHERE session_id=? ORDER BY seq ASC',
+                    ('aaaaaaaaaaaa',),
+                ).fetchall()
+                self.assertEqual(after_chk[:len(prefix_before)], prefix_before)
+                self.assertEqual(len(after_chk), len(prefix_before) + 2)
+
+                # Resolving the tool call replaces only the synthetic tail entry, still keeping earlier rowids intact.
+                agent.messages.append({'role': 'tool', 'tool_call_id': 'c1', 'content': '{"text":"ok","eof":true}'})
+                agent.messages.append({'role': 'assistant', 'content': 'done'})
+                rev = store.save('aaaaaaaaaaaa', rev, snapshot(agent, scope))
+                self.assertEqual(rev, 3)
+                after_final = store.db.execute(
+                    'SELECT seq, rowid FROM session_messages WHERE session_id=? ORDER BY seq ASC',
+                    ('aaaaaaaaaaaa',),
+                ).fetchall()
+                # Prefix including assistant tool_calls stays untouched (exact same SQLite rowids).
+                self.assertEqual(after_final[:len(prefix_before) + 1], after_chk[:len(prefix_before) + 1])
+
+                loaded_rev, loaded = store.load('aaaaaaaaaaaa')
+                self.assertEqual((loaded_rev, loaded['version']), (3, 5))
+                self.assertEqual(loaded['messages'], agent.messages)
+
+                # SQLite compatibility view reconstructs full JSON payload and accepts metadata updates.
+                store.db.execute('UPDATE sessions SET updated=? WHERE id=?', (123456.0, 'aaaaaaaaaaaa'))
+                store.db.commit()
+                view_row = store.db.execute(
+                    'SELECT updated, revision, payload FROM sessions WHERE id=?',
+                    ('aaaaaaaaaaaa',),
+                ).fetchone()
+                self.assertEqual((view_row[0], view_row[1]), (123456.0, 3))
+                self.assertEqual(json.loads(view_row[2])['messages'], agent.messages)
+
+    def test_v5_session_store_migrates_legacy_v1_to_v4_table(self):
+        from termux_agent.agent import Agent
+        from termux_agent.client import Client
+
+        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {'HOME': td}):
+            root = Path(td)
+            cfg_path = root / 'config.toml'
+            cfg_path.write_text('base_url="http://127.0.0.1:9/v1"\nmodel="m"\ntoken_count_mode="off"\n',
+                                encoding='utf-8')
+            store_dir = root / 'store'
+            store_dir.mkdir(mode=0o700)
+            db_path = store_dir / 'sessions.sqlite3'
+            legacy_payload = {
+                'version': 4,
+                'config': {'api_profile': 'default', 'model': 'm', 'base_url': 'http://127.0.0.1:9/v1',
+                           'wire_api': 'chat_completions'},
+                'scope': {'directory': str(root), 'config_path': str(cfg_path),
+                          'session_file': None, 'disabled': True,
+                          'instructions': '', 'instruction_path': None},
+                'base_system': 'rules',
+                'messages': [
+                    {'role': 'system', 'content': 'rules'},
+                    {'role': 'user', 'content': 'legacy question'},
+                    {'role': 'assistant', 'content': 'legacy answer'},
+                ],
+                'active_skills': {},
+                'counters': {'_total_calls': 2},
+                'task_state': None,
+                'last_run': {'status': 'complete', 'stop_reason': 'complete', 'auto': False,
+                             'continuations': 0, 'steps': 1},
+            }
+            conn = sqlite3.connect(db_path)
+            conn.execute('CREATE TABLE sessions (id TEXT PRIMARY KEY, title TEXT, updated REAL, revision INTEGER, payload TEXT)')
+            conn.execute('CREATE TABLE drafts (id TEXT PRIMARY KEY, revision INTEGER, updated REAL, payload TEXT)')
+            conn.execute('CREATE TABLE session_archives (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, title TEXT, '
+                         'updated REAL, revision INTEGER NOT NULL, payload TEXT NOT NULL, draft TEXT)')
+            conn.execute('INSERT INTO sessions VALUES (?,?,?,?,?)',
+                         ('bbbbbbbbbbbb', 'Legacy v4', 100.0, 2, json.dumps(legacy_payload)))
+            conn.commit()
+            conn.close()
+
+            store = SessionStore(store_dir)
+            self.addCleanup(store.close)
+            kind = store.db.execute("SELECT type FROM sqlite_master WHERE name='sessions'").fetchone()
+            self.assertEqual(kind, ('table',))
+            msg_count = store.db.execute(
+                'SELECT count(*) FROM session_messages WHERE session_id=?', ('bbbbbbbbbbbb',)).fetchone()[0]
+            self.assertEqual(msg_count, 3)
+
+            # Simulate an already-open legacy v4 writer checkpointing after v5 opened the DB.
+            legacy_conn = sqlite3.connect(db_path, timeout=5)
+            self.addCleanup(legacy_conn.close)
+            legacy_v4_next = copy.deepcopy(legacy_payload)
+            legacy_v4_next['messages'].append({'role': 'user', 'content': 'legacy followup'})
+            with legacy_conn:
+                res = legacy_conn.execute(
+                    'UPDATE sessions SET payload=?, updated=?, revision=revision+1 WHERE id=? AND revision=?',
+                    (json.dumps(legacy_v4_next), 200.0, 'bbbbbbbbbbbb', 2),
+                )
+                self.assertEqual(res.rowcount, 1)
+
+            rev_after_legacy, loaded_after_legacy = store.load('bbbbbbbbbbbb')
+            self.assertEqual(rev_after_legacy, 3)
+            self.assertEqual(loaded_after_legacy['messages'], legacy_v4_next['messages'])
+
+            # After a v5 save, ordinary SQL queries (including qualified, quoted, CTE, literals)
+            # and raw sqlite3 readers continue to observe full messages cleanly.
+            v5_next = copy.deepcopy(legacy_v4_next)
+            v5_next['version'] = 5
+            v5_next['messages'].append({'role': 'assistant', 'content': 'v5 answer'})
+            rev_v5 = store.save('bbbbbbbbbbbb', 3, v5_next)
+            self.assertEqual(rev_v5, 4)
+
+            for sql in (
+                'SELECT payload FROM sessions WHERE id=?',
+                'SELECT s.payload FROM sessions AS s WHERE id=?',
+                'SELECT sessions.payload FROM sessions WHERE id=?',
+                'SELECT payload FROM main.sessions WHERE id=?',
+                'SELECT payload FROM "sessions" WHERE id=?',
+                'WITH q AS (SELECT payload FROM sessions WHERE id=?) SELECT payload FROM q',
+            ):
+                row = store.db.execute(sql, ('bbbbbbbbbbbb',)).fetchone()
+                self.assertEqual(json.loads(row[0])['messages'], v5_next['messages'], sql)
+
+            self.assertEqual(store.db.execute("SELECT 'FROM sessions'").fetchone()[0], 'FROM sessions')
+
+            raw_row = legacy_conn.execute('SELECT payload FROM sessions WHERE id=?', ('bbbbbbbbbbbb',)).fetchone()
+            self.assertEqual(json.loads(raw_row[0])['messages'], v5_next['messages'])
+
+            listing = store.listing()
+            self.assertEqual(listing[0]['id'], 'bbbbbbbbbbbb')
+            self.assertEqual(listing[0]['messages'], 5)
+            self.assertEqual(store.recall('v5 answer')[0]['id'], 'bbbbbbbbbbbb')
+
+            rev, restored_payload = store.load('bbbbbbbbbbbb')
+            self.assertEqual(rev, 4)
+            self.assertEqual(restored_payload['messages'], v5_next['messages'])
+
+            with httpx.Client() as http:
+                _, agent, _ = restore(
+                    restored_payload,
+                    lambda cfg, text, base_system=None, client=None: Agent(
+                        cfg, client=client or Client(cfg, http_client=http), instructions=text, base_system=base_system),
+                )
+            self.assertEqual(agent._total_calls, 2)
+            self.assertEqual(agent.counters.total_calls, 2)
+
+    def test_v5_load_reads_metadata_and_messages_from_single_wal_snapshot(self):
+        def make_payload(marker):
+            return {
+                'version': 5, 'config': {}, 'scope': {}, 'marker': marker,
+                'messages': [
+                    {'role': 'system', 'content': 'rules'},
+                    {'role': 'user', 'content': f'user-{marker}'},
+                    {'role': 'assistant', 'content': f'assistant-{marker}'},
+                ],
+            }
+
+        with tempfile.TemporaryDirectory() as td:
+            store_dir = Path(td) / 'store'
+            reader = SessionStore(store_dir)
+            writer = SessionStore(store_dir)
+            self.addCleanup(reader.close)
+            self.addCleanup(writer.close)
+            reader.save('cccccccccccc', 0, make_payload(1))
+
+            state = {'armed': True, 'writer_rev': None}
+
+            def trace(statement):
+                if state['armed'] and statement.startswith('SELECT message FROM session_messages'):
+                    state['armed'] = False
+                    state['writer_rev'] = writer.save('cccccccccccc', 1, make_payload(2))
+
+            reader.db.set_trace_callback(trace)
+            try:
+                rev, loaded = reader.load('cccccccccccc')
+            finally:
+                reader.db.set_trace_callback(None)
+
+            self.assertEqual(state['writer_rev'], 2)
+            self.assertEqual((rev, loaded['marker']), (1, 1))
+            self.assertEqual(loaded['messages'], make_payload(1)['messages'])
+
+    def test_v5_simultaneous_id_and_payload_update_leaves_no_stale_messages(self):
+        original = {
+            'version': 5, 'config': {}, 'scope': {},
+            'messages': [
+                {'role': 'system', 'content': 'rules'},
+                {'role': 'user', 'content': 'q1'},
+                {'role': 'assistant', 'content': 'a1'},
+            ],
+        }
+        shortened = {
+            'version': 5, 'config': {}, 'scope': {},
+            'messages': [{'role': 'system', 'content': 'rules'}],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            store = SessionStore(Path(td) / 'store')
+            self.addCleanup(store.close)
+            store.save('dddddddddddd', 0, original)
+            text = json.dumps(shortened, ensure_ascii=False, separators=(',', ':'))
+            res = store.db.execute(
+                'UPDATE sessions SET id=?, payload=?, revision=revision+1 WHERE id=?',
+                ('eeeeeeeeeeee', text, 'dddddddddddd'),
+            )
+            self.assertEqual(res.rowcount, 1)
+            store.db.commit()
+
+            old_rows = store.db.execute(
+                'SELECT * FROM session_messages WHERE session_id=?', ('dddddddddddd',)).fetchall()
+            self.assertEqual(old_rows, [])
+            rev, loaded = store.load('eeeeeeeeeeee')
+            self.assertEqual(rev, 2)
+            self.assertEqual(loaded['messages'], shortened['messages'])
+
+    def test_agent_counters_dataclass_syncs_with_attributes_and_snapshot(self):
+        from termux_agent.agent import Agent, AgentCounters
+        from termux_agent.client import Client
+
+        cfg = Config(base_url='http://127.0.0.1:9/v1', model='m', token_count_mode='off')
+        with httpx.Client() as http:
+            agent = Agent(cfg, client=Client(cfg, http_client=http))
+            self.addCleanup(agent.close)
+            self.assertIsInstance(agent.counters, AgentCounters)
+            agent._total_calls = 4
+            agent._rtk_shell_results = 3
+            agent._usage_history.append({'total_tokens': 12})
+            agent.counters.context_recoveries = 2
+            self.assertEqual(agent.counters.total_calls, 4)
+            self.assertEqual(agent.counters.rtk_shell_results, 3)
+            self.assertEqual(agent.counters.usage_history, [{'total_tokens': 12}])
+            self.assertEqual(agent._context_recoveries, 2)
+
+            snap = snapshot(agent, {'directory': '.', 'config_path': None, 'session_file': None,
+                                    'disabled': True, 'instructions': '', 'instruction_path': None})
+            self.assertEqual(snap['version'], 5)
+            _, rebuilt, _ = restore(
+                snap,
+                lambda c, t, base_system=None, client=None: Agent(
+                    c, client=Client(c, http_client=http), instructions=t, base_system=base_system),
+                history_fallback=True,
+            )
+            self.addCleanup(rebuilt.close)
+            self.assertEqual(rebuilt.counters.total_calls, 4)
+            self.assertEqual(rebuilt.counters.rtk_shell_results, 3)
+            self.assertEqual(rebuilt.counters.context_recoveries, 2)
+            self.assertEqual(rebuilt._usage_history, [{'total_tokens': 12}])
+
+    def test_repl_controller_dispatches_commands_and_preserves_monkeypatches(self):
+        import io
+        from types import SimpleNamespace
+        from termux_agent import cli
+
+        with tempfile.TemporaryDirectory() as td, patch.dict(os.environ, {'HOME': td}):
+            root = Path(td)
+            cfg_path = root / 'config.toml'
+            cfg_path.write_text('base_url="http://127.0.0.1:9/v1"\nmodel="m"\ntoken_count_mode="off"\n',
+                                encoding='utf-8')
+            store_root = root / 'store'
+            prompts = iter(['/title Custom P3', '/session save', '/exit'])
+            out = io.StringIO()
+            prev_cwd = Path.cwd()
+            try:
+                with patch.object(cli.sys, 'argv', ['ta', '--config', str(cfg_path), '--directory', str(root), '--no-agent']), \
+                     patch.object(cli.sys, 'stdout', out), \
+                     patch.object(cli.sys.stdin, 'isatty', return_value=False), \
+                     patch.object(cli.sys.stdout, 'isatty', return_value=False), \
+                     patch.object(cli, 'SessionStore', lambda: SessionStore(store_root)), \
+                     patch('builtins.input', side_effect=prompts):
+                    cli.main()
+            finally:
+                os.chdir(prev_cwd)
+
+            store = SessionStore(store_root)
+            self.addCleanup(store.close)
+            rows = store.listing()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['title'], 'Custom P3')
+            self.assertIsInstance(cli.ReplController, type)
+            self.assertTrue(issubclass(SimpleNamespace, object))
 
 
 if __name__ == '__main__':

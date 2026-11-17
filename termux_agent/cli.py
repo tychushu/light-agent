@@ -186,6 +186,1233 @@ def read_prompt(prompt="ta> ", continuation="... "):
     return result
 
 
+class ReplController:
+    """Interactive terminal REPL controller owning active session, UI, and persistence state."""
+
+    _HISTORY_ALLOWED_COMMANDS = (
+        '/help', '/sessions', '/session', '/resume', '/history', '/stats', '/status',
+        '/config', '/debug', '/debug-context', '/silent', '/api', '/title',
+        '/recall', '/export', '/copy', '/paste', '/exit',
+    )
+
+    def __init__(self, options, *, language, config_path, directory, session_file, disabled,
+                 instructions, instruction_path, config, parser):
+        self.options = options
+        self.language = language
+        self.config_path = config_path
+        self.directory = directory
+        self.session_file = session_file
+        self.disabled = disabled
+        self.instructions = instructions
+        self.instruction_path = instruction_path
+        self.config = config
+        self.parser = parser
+        self.debug = False
+        self.registry = SkillRegistry()  # Lazy: no scan/read until /skill is requested.
+        self.profile_store = ProfileStore(config_path)
+        self.tool_started = {}
+        self.stream_wrote = False
+        self.read_grant = False
+        self.stream_draft = {}
+        self.draft_saved_at = 0.0
+        self.saved_fingerprint = None
+        self.loaded_row = None
+        self.source_meta = None
+        self.active_branch = True
+        self.source_fingerprint = None
+        self.branch_state = {'kind': 'active'}
+        self.formatter = Columns(sys.stdout, enabled=sys.stdout.isatty() and options.prompt is None)
+        self.last_session_ids = ()
+        self.model_catalog = None
+        self.cli_commands = tuple(dict.fromkeys((*COMMANDS, "/resume")))
+        self.session_id = new_id()
+        self.revision = 0
+        self.agent = None
+        self.store = None
+        self._init_runtime()
+
+    def _init_runtime(self):
+        try:
+            self.agent = None if self.options.session else self.build_agent(self.config, self.instructions)
+        except (ValueError, OSError) as exc:
+            self.parser.error(str(exc))
+        try:
+            self.store = None if self.options.no_session else SessionStore()
+        except (OSError, sqlite3.Error) as exc:
+            if self.agent is not None:
+                getattr(self.agent, 'close', self.agent.client.close)()
+            self.parser.error(self.tr('Session store unavailable: {v0}', v0=exc))
+        self._configure_completer()
+
+    def _configure_completer(self):
+        if not _readline:
+            return
+        completer = Completer(
+            _readline,
+            profiles=lambda: [row["name"] for row in self.profile_store.list()],
+            skills=lambda: [skill.name for skill in self.registry.list_skills()],
+            active_skills=lambda: list(self.agent.active_skills),
+            session_ids=lambda: self.store.ids() if self.store else [],
+            directory=lambda: self.directory,
+            session_choices=lambda: [str(i) for i in range(1, len(self.last_session_ids) + 1)],
+            model_choices=self.model_choices,
+        )
+        _readline.set_completer_delims(" \t\n")
+        _readline.set_completer(completer)
+        if "libedit" in (_readline.__doc__ or ""):
+            _readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            _readline.parse_and_bind("set show-all-if-ambiguous off")
+            _readline.parse_and_bind("tab: menu-complete")
+
+    def tr(self, template, **values):
+        return ui_text(template, self.language, **values)
+
+    def redact(self, text):
+        return redact_text(text, (self.config.api_key,))
+
+    def display(self, value, role="Info", stamp=None):
+        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+        # Do not let model/tool text inject terminal control sequences.
+        text = ''.join(c if c in '\n\t' or c.isprintable() else f'\\x{ord(c):02x}' for c in text)
+        self.formatter.message(role, self.redact(text), stamp=stamp)
+
+    def model_choices(self):
+        if self.model_catalog is None:
+            return ()
+        models = self.model_catalog[1]
+        return (*models, *(str(i) for i in range(1, len(models) + 1)))
+
+    def approve(self, name, args):
+        if name == "read_file" and self.read_grant:
+            return True
+        visible = safe_tool_arguments(name, args) if self.config.silent_writes else args
+        self.display({"approval_required": name, "arguments": visible,
+                      "reason": self.tr(approval_reason(name, args))}, "Approve")
+        if not sys.stdin.isatty():
+            self.display(self.tr('Denied: approval requires an interactive terminal.'))
+            return False
+        try:
+            prompt = self.tr("Allow this tool call? [y/N/a=all reads this task] "
+                             if name == "read_file" else "Allow this tool call? [y/N] ")
+            choice = input(prompt).strip().lower()
+            if name == "read_file" and choice in ("a", "all"):
+                self.read_grant = True
+                return True
+            return choice in {"y", "yes"}
+        except (EOFError, KeyboardInterrupt):
+            return False
+
+    def event(self, kind, payload):
+        if kind == 'request_start':
+            self.stream_draft, self.draft_saved_at = {}, 0.0
+            return
+        if kind == 'context_warning':
+            self.display(
+                self.tr('上下文字符预算已用 {v0:.0%}；可用 /compact 缩短上下文（字符预算不等于模型 token 窗口）。',
+                        v0=payload['chars'] / payload['limit']),
+                'Context',
+            )
+            return
+        if kind == 'step_start':
+            if self.debug:
+                self.display({"step": payload.get("step"), "segment": payload.get("segment"),
+                              "task_logical_calls": payload.get("task_logical_calls"),
+                              "max_task_logical_calls": payload.get("max_task_logical_calls")}, "Progress")
+            return
+        if kind == 'segment_extension':
+            if self.debug:
+                self.display({"segment_extension": payload}, "Progress")
+            return
+        if kind == 'auto_resume':
+            wait = payload.get('wait_seconds') or 0
+            self.display(
+                self.tr('自动续跑 {v0}/{v1}：{v2}', v0=payload['count'], v1=payload['max'], v2=payload['reason'])
+                + (self.tr('；等待 {v0:g} 秒后继续', v0=wait) if wait else ''),
+                'Resume',
+            )
+            return
+        if kind == 'resume_routed':
+            self.display(self.tr('按 /continue 续跑原任务，不新建任务：{v0}', v0=payload.get('goal', '')), 'Resume')
+            return
+        if kind == 'task_compacted':
+            self.display(
+                self.tr('已压缩上下文 {v0:,} → {v1:,} 字符；完整历史：{v2}',
+                        v0=payload['before_chars'], v1=payload['after_chars'], v2=payload['archive'])
+                + ('' if payload['persistent'] else self.tr('（仅内存；退出后丢失）')),
+                'Context',
+            )
+            return
+        if kind in ("subagent_start", "subagent_end"):
+            detail = (f"model={payload['model']} · steps≤{payload['max_steps']}"
+                      if kind == "subagent_start" else payload["status"])
+            self.display(f"{payload['id']} · {detail}", "Sub")
+            return
+        if kind == "subagent_retry":
+            self.retry_output(payload, payload["id"])
+            return
+        if kind == "continuation":
+            self.display({"automatic_continuation": payload})
+            return
+        name = payload.get("name")
+        writing = name in WRITE_TOOLS
+        if self.debug or kind == "tool_start" or (writing and kind == "tool_result"):
+            visible = hide_write_payloads(payload) if self.config.silent_writes else payload
+            self.display({kind: visible}, "SubTool" if payload.get("subagent") else "Tool")
+        if kind == "tool_start":
+            self.tool_started[payload.get("name")] = time.monotonic()
+        elif kind == "tool_result":
+            elapsed = time.monotonic() - self.tool_started.pop(payload.get("name"), time.monotonic())
+            if elapsed >= 10 and shutil.which("termux-vibrate"):
+                try:
+                    subprocess.Popen(["termux-vibrate", "-d", "100"], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_environment())
+                except OSError:
+                    pass
+
+    def stream_output(self, kind, value):
+        safe = "".join(c if c in "\n\t" or c.isprintable() else f"\\x{ord(c):02x}" for c in value)
+        self.formatter.feed("Think" if kind == "reasoning" else "Agent", self.redact(safe))
+        self.stream_wrote = True
+        if self.store and self.revision and self.active_branch:
+            field = 'reasoning_content' if kind == 'reasoning' else 'content'
+            combined = self.stream_draft.get(field, '') + self.redact(value)
+            if len(combined) > 64000:
+                self.stream_draft['truncated'] = True
+            self.stream_draft[field] = combined[-64000:]
+            now = time.monotonic()
+            if not self.draft_saved_at or now - self.draft_saved_at >= 2:
+                self.store.save_draft(self.session_id, self.revision, self.stream_draft)
+                self.draft_saved_at = now
+
+    def show_answer(self, value):
+        streamed = getattr(self.agent.client, "streamed", False)
+        if self.stream_wrote:
+            self.formatter.finish()
+        stopped = getattr(self.agent, 'last_run', {}).get("status") in (
+            "limit", "incomplete", "context_limit", "blocked", "stalled", "error", "empty_response")
+        failure = stopped or value.startswith(("LLM 请求失败", "LLM 请求已中断", "已达到最大模型请求",
+                                                "同一任务的硬预算", "自动任务", "任务因审批", "工具执行已中断"))
+        if value and (not streamed or not getattr(self.agent.client, "streamed_text", False) or failure):
+            self.display(value, "Agent")
+        self.stream_wrote = False
+
+    def retry_output(self, info, label="API"):
+        cause = f"HTTP {info['status']}" if info.get("status") else info["cause"]
+        self.display(
+            self.tr('{v0} retry {v1}/{v2} · {v3} · wait {v4:g}s',
+                    v0=label, v1=info['attempt'], v2=info['max_attempts'], v3=cause, v4=info['wait_seconds']),
+            "Retry",
+        )
+
+    def build_agent(self, next_config, text, base_system=None, client=None):
+        kwargs = {"approve": self.approve, "event": self.event}
+        if text:
+            kwargs["instructions"] = text
+        if base_system is not None:
+            kwargs["base_system"] = base_system
+        if client is not None:
+            kwargs['client'] = client
+        built = Agent(next_config, **kwargs)
+        built.client.on_stream = self.stream_output
+        built.client.on_retry = self.retry_output
+        built.checkpoint = lambda: self.save_current(checkpoint=True)
+        if not self.options.no_session:
+            built.archive_after_compact = lambda *args: self.save_compaction(*args)
+        return built
+
+    def history_mode(self, current=None):
+        return getattr(self.agent if current is None else current, 'history_only', False) is True
+
+    def current_scope(self):
+        return {"directory": str(self.directory), "config_path": self.config_path,
+                "session_file": self.session_file, "disabled": self.disabled,
+                "instructions": self.instructions, "instruction_path": self.instruction_path}
+
+    @staticmethod
+    def payload_fingerprint(value):
+        # The marker describes how a snapshot was written, not changed task data.
+        # A finish checkpoint must deduplicate the following ordinary save too.
+        data = {k: v for k, v in value.items() if k != 'checkpoint'}
+        encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+        return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+    def current_branch(self, archive_id=None):
+        value = dict(self.branch_state)
+        if not self.active_branch:
+            value.setdefault('source_session_id', self.session_id)
+            for name in ('title', 'updated', 'revision'):
+                value.setdefault('source_' + name, (self.source_meta or {}).get(name))
+        value['kind'] = 'active'
+        if archive_id:
+            value['archive_session_id'] = archive_id
+        return value
+
+    def create_active_branch(self, value, title, archive_id=None, draft=None):
+        identifier = new_id()
+        branch = self.current_branch(archive_id)
+        value['branch'] = branch
+        self.store.save(identifier, 0, value, title=title)
+        if draft:
+            self.store.save_draft(identifier, 1, draft)
+        self.session_id, self.revision = identifier, 1
+        self.active_branch = True
+        self.loaded_row = None
+        self.source_fingerprint = None
+        self.branch_state = branch
+        self.source_meta = {'title': branch.get('source_title'), 'updated': branch.get('source_updated'),
+                            'revision': branch.get('source_revision')}
+        self.saved_fingerprint = self.payload_fingerprint(value)
+        if self.agent is not None:
+            self.agent.archive_id = identifier
+        return identifier
+
+    def save_current(self, force=False, checkpoint=False):
+        if self.agent is not None and self.history_mode():
+            return
+        if self.store and self.agent is not None and (force or self.revision or len(self.agent.messages) > 1):
+            branch = self.current_branch()
+            value = snapshot(self.agent, self.current_scope(), checkpoint=checkpoint, branch=branch)
+            fingerprint = self.payload_fingerprint(value)
+            if not force and not checkpoint:
+                if fingerprint == self.saved_fingerprint:
+                    return
+                if not self.active_branch:
+                    plain = {k: v for k, v in value.items() if k != 'branch'}
+                    if self.payload_fingerprint(plain) == self.source_fingerprint:
+                        return
+            clear_draft = checkpoint and getattr(self.agent, 'last_run', {}).get('status') not in ('error', 'interrupted')
+            self.revision = self.store.save(self.session_id, self.revision, value, clear_draft=clear_draft)
+            if not self.active_branch:
+                self.active_branch, self.loaded_row = True, None
+                self.branch_state = branch
+            self.saved_fingerprint = fingerprint
+            # Fresh sessions need a real persisted archive ID before their first
+            # automatic compaction; in-memory IDs are invalid SQLite session IDs.
+            self.agent.archive_id = self.session_id
+
+    def save_compaction(self, archive_id, source, messages):
+        scope = self.current_scope()
+        branch = self.current_branch()
+        original = snapshot(self.agent, scope, branch=branch, messages=source)
+        reduced = snapshot(self.agent, scope, checkpoint=True, branch=branch, messages=messages)
+        # Include the transition counters in the same commit as the new context.
+        reduced['counters']['_task_compactions'] += 1
+        if reduced['task_state'] is not None:
+            reduced['task_state']['compactions'] += 1
+        fingerprint = self.payload_fingerprint(reduced)
+        self.revision = self.store.compact(self.session_id, self.revision, archive_id, original, reduced)
+        self.saved_fingerprint = fingerprint
+        self.active_branch, self.loaded_row, self.source_fingerprint = True, None, None
+        self.branch_state = branch
+        self.agent.archive_id = self.session_id
+
+    def show_interruption(self, exc):
+        if self.stream_wrote:
+            self.formatter.finish()
+            self.stream_wrote = False
+        self.display(self.tr('Interrupted.'))
+        for note in getattr(exc, '__notes__', ()):
+            if note.startswith('Interruption checkpoint failed: '):
+                self.display(
+                    self.tr('中断检查点保存失败（{v0}）；请核实最新状态。',
+                            v0=note.removeprefix('Interruption checkpoint failed: ')),
+                    'Recovery',
+                )
+
+    def submit_input(self, value, automatic=None):
+        if self.history_mode():
+            self.display(self.tr('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。'), 'History')
+            return False
+        self.read_grant = False
+        try:
+            submission = load_text_submission(value, COMMANDS, self.config.max_input_file_chars)
+            if submission is not None:
+                self.display({"file": str(submission.path), "chars": len(submission.text),
+                              "api": self.config.api_profile})
+                value = submission.text
+            answer = self.agent.run(value) if automatic is None else self.agent.run(value, auto_continue=automatic)
+            self.show_answer(answer)
+            self.save_current()
+            return True
+        except KeyboardInterrupt as exc:
+            self.show_interruption(exc)
+        except Exception as exc:
+            if self.stream_wrote:
+                self.formatter.finish()
+                self.stream_wrote = False
+            self.display(self.tr('Error: {v0}', v0=exc))
+        return False
+
+    def current_title(self):
+        try:
+            title = self.store.title(self.session_id) if self.store and self.revision else None
+        except sqlite3.Error:
+            return '[unavailable]'
+        return ' '.join(str(title).split()) if title else 'New session'
+
+    def rename_current(self, value):
+        title = validate_title(value)
+        self.save_current(force=True)
+        self.store.rename(self.session_id, title, self.revision)
+        self.display(f"{self.session_id} · {title}", "Session")
+
+    def reset_session_io(self):
+        self.stream_draft, self.draft_saved_at, self.read_grant = {}, 0.0, False
+        self.model_catalog = None
+        self.tool_started.clear()
+
+    def reset_session_tracking(self, branch=None):
+        self.session_id, self.revision = new_id(), 0
+        self.active_branch, self.loaded_row, self.source_fingerprint = True, None, None
+        self.branch_state, self.saved_fingerprint = branch or {'kind': 'active'}, None
+        self.source_meta = None
+        self.agent.archive_id = None
+        self.reset_session_io()
+
+    def start_new_session(self, next_config, next_instructions):
+        """Publish a fully built replacement only after saving the current session."""
+        replacement = self.build_agent(next_config, next_instructions)
+        try:
+            self.save_current()
+            getattr(self.agent, 'close', self.agent.client.close)()
+        except BaseException as primary:
+            try:
+                getattr(replacement, 'close', replacement.client.close)()
+            except BaseException as cleanup:
+                primary.add_note('Replacement cleanup failed: ' + type(cleanup).__name__)
+            raise
+        self.config, self.agent = next_config, replacement
+        self.language, self.instructions = self.config.ui_language, next_instructions
+        self.registry = SkillRegistry()
+        self.reset_session_tracking()
+
+    @staticmethod
+    def catalog_identity(candidate):
+        return (candidate.api_profile, candidate.base_url.rstrip('/'), candidate.wire_api, candidate.api_key)
+
+    def switch_api(self, name, persist=False):
+        candidate = Config.load(self.config_path, name)
+        self.model_catalog = None
+        if (self.catalog_identity(candidate) == self.catalog_identity(self.config)
+                and candidate.model == self.config.model
+                and not self.config.profile_model and not self.history_mode()):
+            if persist:
+                self.profile_store.set_default(name)
+            return False
+        if persist:
+            self.profile_store.set_default(name)
+        self.start_new_session(candidate, self.instructions)
+        return True
+
+    @staticmethod
+    def fetch_models(candidate):
+        query = Client(candidate)
+        try:
+            return tuple(query.list_models())
+        finally:
+            query.close()
+
+    def show_models(self, name):
+        self.model_catalog = None
+        candidate = Config.load(self.config_path, name)
+        models = self.fetch_models(candidate)
+        self.model_catalog = (candidate, models)
+        selected = self.config.model if name == self.config.api_profile else candidate.model
+        lines = [self.tr('API={v0} · 可用模型 {v1} 个', v0=name, v1=len(models)),
+                 candidate.base_url.rstrip('/') + '/models']
+        lines.extend(f'{i:>3} {"*" if model == selected else " "} {model}' for i, model in enumerate(models, 1))
+        if selected not in models:
+            lines.append(self.tr('配置中的模型 {v0} 不在当前返回列表中。', v0=selected))
+        lines.append(self.tr('用 /api model ID或序号 选用模型。'))
+        self.display('\n'.join(lines), 'Models')
+
+    def select_model(self, value):
+        parts = shlex.split(value)
+        if not 1 <= len(parts) <= 2:
+            raise ValueError(self.tr('Use /api model ID|N [NAME]'))
+        choice = parts[0]
+        catalog = self.model_catalog
+        name = catalog[0].api_profile if catalog else self.config.api_profile
+        if len(parts) == 2:
+            name = parts[1]
+        candidate = Config.load(self.config_path, name)
+        if catalog and self.catalog_identity(catalog[0]) == self.catalog_identity(candidate):
+            models = catalog[1]
+        else:
+            if choice.isascii() and choice.isdigit():
+                raise ValueError(self.tr('先用 /api models [NAME] 查询，再按列表序号选用模型。'))
+            models = self.fetch_models(candidate)
+            catalog = None
+        if choice in models:
+            selected = choice
+        elif choice.isascii() and choice.isdigit() and 1 <= int(choice) <= len(models):
+            selected = models[int(choice) - 1]
+        else:
+            raise ValueError(self.tr('模型不在当前列表中；请用 /api models [NAME] 重新查询。'))
+        same_api = self.catalog_identity(candidate) == self.catalog_identity(self.config) and not self.history_mode()
+        profile_model = candidate.model if selected != candidate.model else ''
+        if same_api and selected == self.config.model and self.config.profile_model == profile_model:
+            return False
+        replacement = copy.copy(self.config) if same_api else candidate
+        replacement.profile_model = profile_model
+        replacement.model = selected
+        replacement.validate()
+        self.start_new_session(replacement, self.instructions)
+        self.model_catalog = catalog
+        return True
+
+    def show_session_listing(self, limit=50, query=None, empty_text=None, all_rows=False):
+        """Query, render and cache one exact metadata listing without loading rows."""
+        empty_text = self.tr(empty_text or '没有已保存会话。')
+        if not self.store:
+            self.display(self.tr('Persistence disabled by --no-session.'))
+            self.last_session_ids = ()
+            return ()
+        rows = self.store.listing(limit, query=query, all_rows=all_rows, active_id=self.session_id)
+        self.last_session_ids = tuple(row['id'] for row in rows)
+        if not self.formatter.enabled:
+            self.display(rows)
+            if not rows and empty_text:
+                self.display(empty_text)
+        else:
+            if rows:
+                self.display(
+                    self.tr('{v0} saved sessions', v0=len(rows))
+                    + (self.tr(' · title contains {v0}', v0=query) if query else ''),
+                    'Sessions',
+                )
+            else:
+                self.display(empty_text, 'Sessions')
+            self.formatter.sessions(rows, self.session_id, Path.home(), self.redact, language=self.language)
+        return self.last_session_ids
+
+    def resolve_session_target(self, value):
+        value = value.strip()
+        if not value:
+            raise ValueError(self.tr('Use /resume ID|N or /session load ID|N'))
+        if len(value) == 12 and all(char in "0123456789abcdef" for char in value):
+            return value
+        if value.isascii() and value.isdigit():
+            if not self.last_session_ids:
+                raise ValueError(self.tr('先用 /sessions 或 /resume 查看会话，再按序号选择。'))
+            index = int(value)
+            if not 1 <= index <= len(self.last_session_ids):
+                raise ValueError(self.tr('会话序号超出最后一次显示的列表范围。'))
+            return self.last_session_ids[index - 1]
+        self.store.check_id(value)
+        return value
+
+    def resume_session(self, value):
+        identifier = self.resolve_session_target(value)
+        if identifier != self.session_id or self.history_mode():
+            self.load_session(identifier)
+        self.display({"id": self.session_id, "title": self.current_title(),
+                      "api": self.config.api_profile, "directory": str(self.directory)})
+
+    def resume_picker(self):
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            self.display(self.tr('输入 /resume 序号或 ID 恢复；序号只对应上面显示的列表。'))
+            return
+        try:
+            value = input(self.tr('选择序号或ID（回车取消）')).strip()
+        except (EOFError, KeyboardInterrupt):
+            self.display(self.tr('已取消会话选择。'))
+            return
+        if not value:
+            self.display(self.tr('已取消会话选择。'))
+            return
+        self.resume_session(value)
+
+    def delete_session(self, value):
+        parts = value.split()
+        if not parts:
+            rows = self.show_session_listing(50, empty_text="没有已保存会话。")
+            if not rows:
+                return
+            if not (sys.stdin.isatty() and sys.stdout.isatty()):
+                self.display(self.tr('用 /session delete 序号或ID 删除；非交互执行需显式添加 --yes。'))
+                return
+            try:
+                selection = input(self.tr('删除序号或ID（回车取消）')).strip()
+            except (EOFError, KeyboardInterrupt):
+                self.display(self.tr('已取消删除。'))
+                return
+            if not selection:
+                self.display(self.tr('已取消删除。'))
+                return
+            parts = [selection]
+        if len(parts) > 2 or parts[0] == '--yes' or (len(parts) == 2 and parts[1] != '--yes'):
+            raise ValueError(self.tr('Use /session delete ID|N [--yes]'))
+        target = self.resolve_session_target(parts[0])
+        if target == self.session_id:
+            raise ValueError(self.tr('Switch to another session before deleting the active one'))
+        metadata = self.store.deletion_target(target)
+        # A title is display data, not a prompt or a control sequence.
+        confirmation = {"delete_session": target, "title": metadata[0]}
+        archives = self.store.archives(target)
+        if archives:
+            confirmation['delete_archives'] = len(archives)
+        self.display(confirmation, "Session")
+        confirmed = len(parts) == 2
+        if not confirmed and sys.stdin.isatty():
+            try:
+                confirmed = input(self.tr('Delete session {v0}? [y/N] ', v0=target)).strip().lower() in ('y', 'yes')
+            except (EOFError, KeyboardInterrupt):
+                confirmed = False
+        if confirmed:
+            self.store.delete(target, expected=metadata)
+            self.display(self.tr('Session deleted.'))
+        else:
+            self.display(self.tr('Deletion cancelled; use --yes for explicit noninteractive deletion.'))
+
+    def load_session(self, identifier, save_existing=True, active=False):
+        with self.store._read_snapshot():
+            self.loaded_row = self.store.db.execute(
+                'SELECT title,updated,revision FROM sessions WHERE id=?', (identifier,)).fetchone()
+            next_revision, payload = self.store.load(identifier)
+        next_config, replacement, scope = restore(payload, self.build_agent, history_fallback=True)
+        target_directory = Path(scope['directory'])
+        if self.history_mode(replacement) and not target_directory.is_dir():
+            target_directory = Path.cwd()
+        try:
+            if save_existing:
+                self.save_current()
+            os.chdir(target_directory)
+        except Exception:
+            getattr(replacement, 'close', replacement.client.close)()
+            raise
+        if self.agent is not None:
+            getattr(self.agent, 'close', self.agent.client.close)()
+        self.config, self.agent = next_config, replacement
+        self.language = self.config.ui_language
+        self.directory, self.config_path = target_directory, scope['config_path']
+        self.session_file, self.disabled = scope['session_file'], scope['disabled']
+        self.instructions, self.instruction_path = scope['instructions'], scope['instruction_path']
+        self.session_id, self.revision = identifier, next_revision
+        self.active_branch = active
+        self.branch_state = dict(payload.get('branch') or {'kind': 'active'})
+        current_snap = snapshot(replacement, self.current_scope(), branch=self.branch_state)
+        if self.active_branch:
+            self.loaded_row = None
+            self.source_fingerprint = None
+        else:
+            self.source_meta = {
+                'title': self.loaded_row[0], 'updated': self.loaded_row[1], 'revision': self.loaded_row[2],
+            }
+            self.source_fingerprint = self.payload_fingerprint({k: v for k, v in current_snap.items() if k != 'branch'})
+        self.saved_fingerprint = self.payload_fingerprint(current_snap)
+        replacement.archive_id = identifier
+        self.reset_session_io()
+        self.registry = SkillRegistry()
+        self.profile_store = ProfileStore(self.config_path)
+        if self.history_mode():
+            self.display(
+                self.tr('历史查看模式：') + self.agent.client.reason
+                + self.tr('可用 /history、/recall、/export 查看；用 /api NAME 新建会话，原历史保持保存。'),
+                'History',
+            )
+        draft = self.store.draft(identifier)
+        incomplete = self.agent.incomplete_draft
+        unfinished_checkpoint = payload.get('checkpoint') and self.agent.last_run.get('status') not in ('complete', 'idle')
+        if unfinished_checkpoint or draft or incomplete or has_unknown_tool_results(self.agent.messages):
+            self.display(self.tr('恢复了未完成任务的检查点；工具状态不明时先核实实际结果。'), 'Recovery')
+        if draft:
+            self.display(
+                self.tr('上次流式草稿（未完成，未加入模型上下文；/export 可完整导出）：\n')
+                + (draft.get('content') or draft.get('reasoning_content') or '')[:4000],
+                'Draft',
+            )
+        if incomplete:
+            text = incomplete.get('content') or incomplete.get('reasoning_content') or ''
+            self.display(
+                self.tr('恢复了未完成输出草稿；未完成工具调用只保留在草稿中，未加入模型上下文：\n') + text[:4000],
+                'Draft',
+            )
+
+    def compact_current(self, keep):
+        from .context import compact_messages
+        if not 1 <= keep <= 100:
+            raise ValueError(self.tr('Use /compact [1–100 recent user turns]'))
+        original = self.session_id
+        title = self.current_title()
+        payload = snapshot(self.agent, self.current_scope())
+        messages, omitted = compact_messages(payload['messages'], keep, original)
+        if not omitted:
+            self.display(self.tr('消息轮次未超过保留数量，无需精简。'), 'Context')
+            return
+        payload['messages'] = messages
+        identifier = new_id()
+        self.store.save(identifier, 0, payload)
+        self.store.rename(identifier, title[:100] + ' · compact')
+        self.load_session(identifier, save_existing=False, active=True)
+        self.display(
+            self.tr('完整历史保留于 {v0}；当前会话 {v1} 已省略 {v2} 条早期消息。',
+                    v0=original, v1=identifier, v2=omitted),
+            'Context',
+        )
+
+    def _print_startup_banner(self):
+        self.display(self.tr('Termux Agent — /help for commands'))
+        self.display({"api": self.config.api_profile, "directory": str(self.directory),
+                      "agent_file": self.instruction_path,
+                      "session": self.session_id if self.store else "in-memory"})
+        # Effective limits of the active profile: a key placed under another [apis.*]
+        # table silently falls back to defaults, and this line makes that visible.
+        self.display({
+            "auto_continue": self.config.auto_continue,
+            "max_steps": self.config.max_steps,
+            "max_task_calls": self.config.max_task_calls,
+            "max_task_seconds": self.config.max_task_seconds,
+            "auto_resume": self.config.auto_resume_max if self.config.auto_continue and self.config.auto_resume else 0,
+        })
+        if self.formatter.enabled:
+            self.display(self.tr('Tab 补全命令和 ~/本地路径；文件路径回车提交文本。'))
+
+    def _cmd_compact(self, value):
+        try:
+            if not self.store:
+                raise ValueError(self.tr('/compact 需要会话持久化，请去掉 --no-session'))
+            if value == 'task' or value.startswith('task '):
+                from .context import compact_task_messages
+                keep = int(value[4:].strip() or 2)
+                original = self.session_id
+                title = self.current_title()
+                payload = snapshot(self.agent, self.current_scope())
+                messages, details = compact_task_messages(payload['messages'], keep, original)
+                if not details['omitted_groups'] and not details['reduced_calls']:
+                    self.display(
+                        self.tr('当前任务没有可压缩的完整工具组；用 /compact 精简更早的历史，或 /compact 1 仅保留最近一轮。'),
+                        'Context',
+                    )
+                else:
+                    payload['messages'] = messages
+                    identifier = self.create_active_branch(
+                        payload, title[:95] + ' · compact task', archive_id=original,
+                        draft=self.store.draft(original))
+                    self.load_session(identifier, save_existing=False, active=True)
+                    self.display(
+                        self.tr('完整任务历史保留于 {v0}；当前会话 {v1}：{v2}',
+                                v0=original, v1=identifier, v2=details),
+                        'Context',
+                    )
+            else:
+                if value:
+                    self.compact_current(int(value))
+                elif not self.agent._compact_for_context(force=True):
+                    self.display(self.tr('没有可安全精简的历史；可用 /compact 1 仅保留最近一轮。'), 'Context')
+        except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+
+    def _cmd_api(self, value):
+        try:
+            rows = self.profile_store.list()
+            if value == 'models' or value.startswith('models '):
+                self.show_models(value[6:].strip() or self.config.api_profile)
+            elif value == 'model' or value.startswith('model '):
+                choice = value[5:].strip()
+                switched = self.select_model(choice) if choice else False
+                self.display({'api': self.config.api_profile, 'model': self.config.model,
+                              'switched': switched, 'session': self.session_id}, 'Models')
+            elif not value or value == "list":
+                self.display({"current": self.config.api_profile, "default": self.profile_store.get_default(),
+                              "profiles": [{"number": i, **row} for i, row in enumerate(rows, 1)]})
+            elif value.startswith("add "):
+                parts = shlex.split(value[4:])
+                flags = [part for part in parts if part.startswith("--")]
+                positional = [part for part in parts if not part.startswith("--")]
+                if not 3 <= len(positional) <= 5:
+                    raise ValueError(self.tr('Use /api add NAME URL MODEL [KEY_ENV] [local|cloud]'))
+                name, base_url, model = positional[:3]
+                extra = positional[3:]
+                key_env = ""
+                kind = "auto"
+                if extra:
+                    if extra[0] in ("local", "cloud"):
+                        kind = extra[0]
+                    else:
+                        key_env = extra[0]
+                if len(extra) == 2:
+                    kind = extra[1]
+                stream = True
+                timeout = None
+                user_agent = None
+                for flag in flags:
+                    if flag == "--no-stream":
+                        stream = False
+                    elif flag.startswith("--timeout="):
+                        timeout = float(flag.partition("=")[2])
+                    elif flag.startswith("--user-agent="):
+                        user_agent = flag.partition("=")[2]
+                    else:
+                        raise ValueError(self.tr('Unknown API option: {v0}', v0=flag))
+                path = self.profile_store.add(name, base_url, model, key_env, kind,
+                                              stream, timeout, user_agent)
+                self.display({"added": name, "path": str(path), "switch": f"/api {name}"})
+            elif value.startswith("show "):
+                name = value[5:].strip()
+                matches = [row for row in rows if row["name"] == name]
+                if name == "default":
+                    self.display(Config.load(self.config_path, name).public_dict())
+                elif matches:
+                    self.display(matches[0])
+                else:
+                    raise ValueError(self.tr('Unknown API profile: {v0}', v0=name))
+            elif value.startswith("remove "):
+                name = value[7:].strip()
+                if name == self.config.api_profile:
+                    raise ValueError(self.tr('Switch to another API before removing the active profile'))
+                backup = self.profile_store.remove(name)
+                self.display({"removed": name, "backup": str(backup)})
+            else:
+                persist = value.startswith("default ")
+                names = [row["name"] for row in rows]
+                name = value[8:].strip() if persist else value.removeprefix("switch ").strip()
+                if name in ("next", "prev"):
+                    if not names:
+                        raise ValueError(self.tr('No named API profiles configured'))
+                    index = names.index(self.config.api_profile) if self.config.api_profile in names else (
+                        -1 if name == "next" else 0)
+                    name = names[(index + (1 if name == "next" else -1)) % len(names)]
+                elif name.isdigit():
+                    number = int(name)
+                    if not 1 <= number <= len(names):
+                        raise ValueError(self.tr('API number is not in /api list'))
+                    name = names[number - 1]
+                switched = self.switch_api(name, persist)
+                self.display({"api": name, "switched": switched,
+                              "default": self.profile_store.get_default()})
+        except (ValueError, OSError, sqlite3.Error, ClientError) as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+
+    def _cmd_agent(self, value):
+        if not value:
+            self.display({"agent_file": self.instruction_path, "chars": len(self.instructions)})
+            return
+        try:
+            next_file, next_disabled = self.session_file, self.disabled
+            if value == "off":
+                next_disabled = True
+            elif value == "directory":
+                next_file, next_disabled = None, False
+            elif value != "reload":
+                next_file, next_disabled = value, False
+            text, source = load_instructions(self.directory, next_file, next_disabled)
+            self.start_new_session(self.config, text)
+            self.instructions, self.instruction_path = text, source
+            self.session_file, self.disabled = next_file, next_disabled
+            self.display({"agent_file": source, "chars": len(text), "new_conversation": True})
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+
+    def _cmd_skill(self, prompt):
+        try:
+            parts = prompt.split(maxsplit=2)
+            action = parts[1] if len(parts) > 1 else "list"
+            name = parts[2] if len(parts) > 2 else ""
+            if action == "list":
+                active = self.agent.get_active_skills()
+                self.display([{"name": skill.name, "active": skill.name in active,
+                               "description": skill.description} for skill in self.registry.list_skills()])
+            elif action == "info" and name:
+                skill = self.registry.find(name)
+                self.display({"name": skill.name, "description": skill.description, "path": str(skill.path),
+                              "active": name in self.agent.active_skills})
+            elif action == "load" and name:
+                skill, body = self.registry.load(name)
+                previous = self.agent.get_active_skills()
+                self.agent.load_skill(skill.name, body)
+                try:
+                    self.save_current(force=True)
+                except Exception:
+                    self.agent.clear_skills()
+                    for active_name, content in previous.items():
+                        self.agent.load_skill(active_name, content)
+                    raise
+                self.display(self.tr('Loaded {v0} into this session.', v0=skill.name))
+            elif action in ("unload", "clear"):
+                if action == "unload" and not name:
+                    raise ValueError(self.tr('Use /skill unload NAME'))
+                previous = self.agent.get_active_skills()
+                if action == "clear":
+                    self.agent.clear_skills()
+                else:
+                    self.agent.unload_skill(name)
+                try:
+                    self.save_current(force=True)
+                except Exception:
+                    self.agent.clear_skills()
+                    for active_name, content in previous.items():
+                        self.agent.load_skill(active_name, content)
+                    raise
+                self.display(self.tr('Active skills cleared.') if action == "clear"
+                             else self.tr('Unloaded {v0}.', v0=name))
+            else:
+                self.display(self.tr('Use /skill list|info NAME|load NAME|unload NAME|clear'))
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+
+    def _cmd_session(self, prompt):
+        if not self.store:
+            self.display(self.tr('Persistence disabled by --no-session.'))
+            return
+        command, _, value = prompt[8:].strip().partition(" ")
+        try:
+            if not command:
+                self.display({"id": self.session_id, "title": self.current_title(), "saved": bool(self.revision)})
+            elif command in ("new", "fork"):
+                if self.history_mode():
+                    raise ValueError(self.tr('历史查看模式保留原快照；请用 /api NAME 新建可用会话。'))
+                if command == "new":
+                    self.start_new_session(self.config, self.instructions)
+                else:
+                    self.save_current()
+                    self.reset_session_tracking({'kind': 'active', 'source_session_id': self.session_id})
+                self.save_current(force=True)
+                if value:
+                    self.store.rename(self.session_id, value)
+                self.display({"id": self.session_id, "title": self.current_title()})
+            elif command == "load":
+                self.resume_session(value)
+            elif command == 'archives':
+                identifier = self.resolve_session_target(value) if value.strip() else self.session_id
+                self.display(self.store.archives(identifier), 'Archive')
+            elif command == 'archive':
+                archive = self.store.load_archive(value.strip())
+                self.display({k: archive[k] for k in ('id', 'session_id', 'title', 'revision')}, 'Archive')
+                for message in archive['payload']['messages'][1:][-20:]:
+                    role, rendered = history_entry(message, self.config.silent_writes)
+                    self.display(rendered, role, stamp='--:--')
+            elif command == "rename":
+                self.rename_current(value)
+            elif command == "rename-id":
+                target, _, title = value.partition(' ')
+                title = validate_title(title)
+                if target == self.session_id:
+                    self.rename_current(title)
+                else:
+                    self.store.rename(target, title)
+                    self.display(f"{target} · {title}", 'Session')
+            elif command == "save":
+                self.save_current(force=True)
+                self.display(self.tr('历史已保存；查看模式不重写原快照。') if self.history_mode()
+                             else {"id": self.session_id, "saved": True})
+            elif command == "delete":
+                self.delete_session(value)
+            else:
+                self.display(self.tr('Use /session new|fork|load ID|N|rename NAME|rename-id ID NAME|delete ID|save'))
+        except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+
+    def _cmd_copy(self, prompt):
+        try:
+            text = prompt[5:].lstrip()
+            if not text:
+                text = next((m.get("content") for m in reversed(self.agent.messages)
+                             if m.get("role") == "assistant" and m.get("content")), "")
+            command = shutil.which("termux-clipboard-set")
+            if not command:
+                raise RuntimeError("termux-clipboard-set is unavailable; install Termux:API")
+            result = subprocess.run([command], input=text, text=True, capture_output=True, timeout=10,
+                                    env=child_environment())
+            if result.returncode:
+                raise RuntimeError(result.stderr.strip() or "clipboard write failed")
+            self.display(self.tr('Copied to Android clipboard.') if text else self.tr('Nothing to copy.'))
+        except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+
+    def _cmd_paste(self):
+        command = shutil.which("termux-clipboard-get")
+        if not command:
+            self.display(self.tr('termux-clipboard-get is unavailable; install Termux:API'))
+            return
+        try:
+            result = subprocess.run([command], text=True, capture_output=True, timeout=10, check=True,
+                                    env=child_environment())
+            if len(result.stdout) > self.config.max_output_chars:
+                self.display(result.stdout[:self.config.max_output_chars] + self.tr('\n[TRUNCATED]'))
+            else:
+                self.display(result.stdout)
+        except (OSError, subprocess.SubprocessError) as exc:
+            self.display(self.tr('Clipboard read failed: {v0}', v0=exc))
+
+    def _cmd_shell(self, command):
+        if not command:
+            return
+        if self.agent._approved("shell", {"command": command}):
+            from .tools import execute
+            self.agent._direct_shell_count += 1
+            result = execute("shell", {"command": command, "cwd": str(self.directory)}, self.config.max_output_chars)
+            self.display(result, "Shell")
+            try:
+                self.save_current()
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                self.display(self.tr('Session save failed: {v0}', v0=exc))
+        else:
+            self.display(self.tr('Shell command denied or approval unavailable.'))
+
+    def _dispatch_prompt(self, prompt):
+        """Process one non-empty REPL line; return True only to exit loop."""
+        bare_command = BARE_COMMANDS.get(prompt.lower())
+        if bare_command and not (bare_command in ('/continue', '/resume') and self.agent._resumable()):
+            self.display(self.tr(BARE_COMMAND_HINT, v0=prompt.lower(), v1=bare_command), 'Input')
+            return False
+        if self.history_mode() and prompt.split(maxsplit=1)[0] not in self._HISTORY_ALLOWED_COMMANDS:
+            self.display(self.tr('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。'), 'History')
+            return False
+        try:
+            local_path = path_value(prompt, self.cli_commands)
+        except ValueError as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+            return False
+        if local_path is not None:
+            self.submit_input(prompt)
+            return False
+        if prompt == "/exit":
+            try:
+                self.save_current()
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                self.display(self.tr('Save failed: {v0}', v0=exc))
+                return False
+            return True
+        if prompt == "/help":
+            self.display(help_text(HELP, self.language))
+        elif prompt == "/clear":
+            try:
+                self.start_new_session(self.config, self.instructions)
+                self.display(self.tr('New session; previous conversation remains saved.'))
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == "/stats":
+            self.display(self.agent.stats())
+        elif prompt == '/status':
+            self.display(self.agent.stats()['stop'])
+        elif prompt == '/continue' or prompt.startswith('/continue '):
+            try:
+                value = prompt[9:].strip()
+                answer = self.agent.continue_task(int(value) if value else None)
+                self.show_answer(answer)
+                self.save_current()
+            except KeyboardInterrupt as exc:
+                self.show_interruption(exc)
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == '/compact' or prompt.startswith('/compact '):
+            self._cmd_compact(prompt[8:].strip())
+        elif prompt == '/recall' or prompt.startswith('/recall '):
+            try:
+                if not self.store:
+                    raise ValueError(self.tr('/recall 需要会话持久化'))
+                self.save_current()
+                rows = self.store.recall(prompt[7:].strip(), silent_writes=self.config.silent_writes)
+                self.display(rows if rows else self.tr('未找到匹配会话。'), 'Recall')
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == '/export' or prompt.startswith('/export '):
+            try:
+                if not self.store:
+                    raise ValueError(self.tr('/export 需要会话持久化'))
+                args = shlex.split(prompt)[1:]
+                target = self.session_id
+                if args and args[0] not in ('markdown', 'json'):
+                    target = args.pop(0)
+                if len(args) > 2:
+                    raise ValueError(self.tr('Use /export [ID] [markdown|json] [PATH]'))
+                if target == self.session_id:
+                    self.save_current(force=True)
+                path = self.store.export(target, args[0] if args else 'markdown', args[1] if len(args) > 1 else None)
+                self.display(self.tr('已导出：{v0}（本地明文，权限 0600）', v0=path), 'Export')
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == "/config":
+            self.display({**self.config.public_dict(), "directory": str(self.directory), "agent_file": self.instruction_path})
+        elif prompt == "/debug":
+            self.debug = not self.debug
+            self.display(self.tr('Debug {v0}', v0='on' if self.debug else 'off'))
+        elif prompt == "/debug-context":
+            self.display(self.agent.debug_context())
+        elif prompt == "/silent" or prompt.startswith("/silent "):
+            value = prompt[7:].strip()
+            if value not in ("", "on", "off"):
+                self.display(self.tr('Use /silent on or /silent off'))
+            else:
+                if value:
+                    self.config.silent_writes = value == "on"
+                self.display({"silent_writes": self.config.silent_writes})
+        elif prompt == "/auto" or prompt.startswith("/auto "):
+            value = prompt[5:].strip()
+            try:
+                if value in ("on", "off"):
+                    self.config.auto_continue = value == "on"
+                elif value.startswith("steps "):
+                    count = int(value[6:].strip())
+                    if not 1 <= count <= 256:
+                        raise ValueError(self.tr('Automatic request limit must be 1–256'))
+                    self.config.max_steps = count
+                elif value:
+                    raise ValueError(self.tr('Use /auto on|off|steps N'))
+                self.display({
+                    "auto_continue": self.config.auto_continue,
+                    "max_steps": self.config.max_steps,
+                    "max_continuations": self.config.max_continuations,
+                    "auto_resume": self.config.auto_resume_max if self.config.auto_continue and self.config.auto_resume else 0,
+                })
+            except ValueError as exc:
+                self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == "/run" or prompt.startswith("/run "):
+            task = prompt[4:].strip()
+            if task:
+                self.submit_input(task, automatic=True)
+            else:
+                self.display(self.tr('Use /run TASK or /run ~/task-instructions.txt'))
+        elif prompt == "/api" or prompt.startswith("/api "):
+            self._cmd_api(prompt[4:].strip())
+        elif prompt == "/agent" or prompt.startswith("/agent "):
+            self._cmd_agent(prompt[6:].strip())
+        elif prompt == "/skill" or prompt.startswith("/skill "):
+            self._cmd_skill(prompt)
+        elif prompt.startswith("/copy"):
+            self._cmd_copy(prompt)
+        elif prompt == "/paste":
+            self._cmd_paste()
+        elif prompt == "/sub" or prompt.startswith("/sub "):
+            task = prompt[4:].strip()
+            if not task:
+                self.display({"max_subagents": self.config.max_subagents,
+                              "subagent_max_steps": min(self.config.subagent_max_steps, self.config.max_steps),
+                              "api": self.config.api_profile, "execution": "synchronous; no nested delegation"}, "Sub")
+                return False
+            self.read_grant = False
+            try:
+                result = self.agent.delegate(task)
+                self.display(f"{result.get('id', 'sub')} · {self.agent.last_run['status']}", "Sub")
+                self.display(result.get("summary", result.get("error", "")), "Sub")
+                self.save_current()
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                self.display(self.tr('Sub-agent failed: {v0}', v0=exc), "Sub")
+        elif prompt.startswith("!"):
+            self._cmd_shell(prompt[1:].strip())
+        elif prompt == "/title" or prompt.startswith("/title "):
+            if not self.store:
+                self.display(self.tr('Persistence disabled by --no-session.'))
+                return False
+            try:
+                value = prompt[6:].strip()
+                if value:
+                    self.rename_current(value)
+                else:
+                    self.display(f"{self.session_id} · {self.current_title()}", "Session")
+            except (ValueError, OSError, sqlite3.Error) as exc:
+                self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == "/sessions" or prompt.startswith("/sessions "):
+            try:
+                value = prompt[9:].strip()
+                query = None
+                all_rows = value == 'all' or value.startswith('all ')
+                if all_rows:
+                    value = value[3:].strip()
+                if value == "find" or value.startswith("find "):
+                    if not value[4:].strip():
+                        raise ValueError(self.tr('Use /sessions find TEXT'))
+                    query = validate_title(value[4:].strip())
+                    limit = 50
+                else:
+                    limit = int(value or 50)
+                if not 1 <= limit <= 500:
+                    raise ValueError(self.tr('Session count must be 1–500'))
+                if not self.store:
+                    self.display(self.tr('Persistence disabled by --no-session.'))
+                    return False
+                self.show_session_listing(limit, query, all_rows=all_rows)
+            except (ValueError, sqlite3.Error) as exc:
+                self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == "/resume" or prompt.startswith("/resume "):
+            try:
+                if not self.store:
+                    self.display(self.tr('Persistence disabled by --no-session.'))
+                    return False
+                value = prompt[7:].strip()
+                if value:
+                    self.resume_session(value)
+                else:
+                    rows = self.show_session_listing(50, empty_text="没有已保存会话。")
+                    if rows:
+                        self.resume_picker()
+            except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
+                self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == "/history" or prompt.startswith("/history "):
+            try:
+                parts = prompt[8:].split()
+                count, skip = int(parts[0]) if parts else 20, int(parts[1]) if len(parts) > 1 else 0
+                if not 1 <= count <= 100 or skip < 0 or len(parts) > 2:
+                    raise ValueError(self.tr('Use /history [1–100] [non-negative skip]'))
+                history = self.agent.messages[1:]
+                end = max(0, len(history) - skip)
+                start = max(0, end - count)
+                self.display(
+                    self.tr('History {v0}–{v1} / {v2} · --:-- = time not recorded',
+                            v0=start + 1 if start < end else 0, v1=end, v2=len(history)),
+                )
+                for message in history[start:end]:
+                    role, rendered = history_entry(message, self.config.silent_writes)
+                    self.display(rendered, role, stamp="--:--")
+            except ValueError as exc:
+                self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == "/session" or prompt.startswith("/session "):
+            self._cmd_session(prompt)
+        elif prompt.startswith("/"):
+            self.display(self.tr('Unknown command; use /help.'))
+        else:
+            self.submit_input(prompt)
+        return False
+
+    def run(self):
+        try:
+            if self.options.session:
+                self.load_session(self.options.session)
+            if self.options.prompt is not None:
+                if not self.submit_input(self.options.prompt):
+                    raise SystemExit(1)
+                return
+            self._print_startup_banner()
+            while True:
+                try:
+                    if self.formatter.enabled and sys.stdin.isatty():
+                        session_label = self.session_id + (" (memory)" if self.store is None else "")
+                        self.display(
+                            self.tr('Session={v0} | Model={v1} | Cwd={v2}\nTitle={v3}',
+                                    v0=session_label, v1=self.config.model,
+                                    v2=self.directory, v3=self.current_title())
+                            + (self.tr(' | Mode=历史查看') if self.history_mode() else '')
+                            + '\n' + format_context_status(self.agent.context_status(), language=self.language),
+                            "Status",
+                        )
+                    prompt = read_prompt(self.formatter.prompt(), self.formatter.continuation()).strip()
+                except (EOFError, KeyboardInterrupt):
+                    print()
+                    break
+                if not prompt:
+                    continue
+                if self._dispatch_prompt(prompt):
+                    break
+        except Exception as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+            raise SystemExit(1) from None
+        finally:
+            self.close()
+
+    def close(self):
+        try:
+            self.save_current()
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            self.display(self.tr('Session save failed: {v0}; this turn was not saved.', v0=exc))
+        if self.agent is not None:
+            getattr(self.agent, 'close', self.agent.client.close)()
+        save_readline_history()
+        if self.store:
+            self.store.close()
+
+
 def main():
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument('--config')
@@ -230,1123 +1457,20 @@ def main():
         os.chdir(directory)
     except (ValueError, OSError, sqlite3.Error) as exc:
         parser.error(str(exc))
-    debug = False
-    registry = SkillRegistry()  # Lazy: no scan/read until /skill is requested.
-    profile_store = ProfileStore(config_path)
-    tool_started = {}
-    stream_wrote = False
-    read_grant = False
-    stream_draft = {}
-    draft_saved_at = 0.0
-    saved_fingerprint = None
-    loaded_row = None
-    source_meta = None
-    active_branch = True
-    source_fingerprint = None
-    branch_state = {'kind': 'active'}
-    formatter = Columns(sys.stdout, enabled=sys.stdout.isatty() and options.prompt is None)
-    last_session_ids = ()
-    model_catalog = None
-    cli_commands = tuple(dict.fromkeys((*COMMANDS, "/resume")))
 
-    def redact(text):
-        return redact_text(text, (config.api_key,))
-
-    def display(value, role="Info", stamp=None):
-        text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
-        # Do not let model/tool text inject terminal control sequences.
-        text = ''.join(c if c in '\n\t' or c.isprintable() else f'\\x{ord(c):02x}' for c in text)
-        formatter.message(role, redact(text), stamp=stamp)
-
-    def model_choices():
-        if model_catalog is None:
-            return ()
-        models = model_catalog[1]
-        return (*models, *(str(i) for i in range(1, len(models) + 1)))
-
-    def approve(name, args):
-        nonlocal read_grant
-        if name == "read_file" and read_grant:
-            return True
-        visible = safe_tool_arguments(name, args) if config.silent_writes else args
-        display({"approval_required": name, "arguments": visible,
-                 "reason": tr(approval_reason(name, args))}, "Approve")
-        if not sys.stdin.isatty():
-            display(tr('Denied: approval requires an interactive terminal.'))
-            return False
-        try:
-            prompt = tr("Allow this tool call? [y/N/a=all reads this task] "
-                      if name == "read_file" else "Allow this tool call? [y/N] ")
-            choice = input(prompt).strip().lower()
-            if name == "read_file" and choice in ("a", "all"):
-                read_grant = True
-                return True
-            return choice in {"y", "yes"}
-        except (EOFError, KeyboardInterrupt):
-            return False
-
-    def event(kind, payload):
-        nonlocal stream_draft, draft_saved_at
-        if kind == 'request_start':
-            stream_draft, draft_saved_at = {}, 0.0
-            return
-        if kind == 'context_warning':
-            display(tr('上下文字符预算已用 {v0:.0%}；可用 /compact 缩短上下文（字符预算不等于模型 token 窗口）。', v0=payload['chars'] / payload['limit']), 'Context')
-            return
-        if kind == 'step_start':
-            if debug:
-                display({"step": payload.get("step"), "segment": payload.get("segment"),
-                         "task_logical_calls": payload.get("task_logical_calls"),
-                         "max_task_logical_calls": payload.get("max_task_logical_calls")}, "Progress")
-            return
-        if kind == 'segment_extension':
-            if debug:
-                display({"segment_extension": payload}, "Progress")
-            return
-        if kind == 'auto_resume':
-            wait = payload.get('wait_seconds') or 0
-            display(tr('自动续跑 {v0}/{v1}：{v2}', v0=payload['count'], v1=payload['max'], v2=payload['reason']) +
-                    (tr('；等待 {v0:g} 秒后继续', v0=wait) if wait else ''), 'Resume')
-            return
-        if kind == 'resume_routed':
-            display(tr('按 /continue 续跑原任务，不新建任务：{v0}', v0=payload.get('goal', '')), 'Resume')
-            return
-        if kind == 'task_compacted':
-            display(tr('已压缩上下文 {v0:,} → {v1:,} 字符；完整历史：{v2}', v0=payload['before_chars'], v1=payload['after_chars'], v2=payload['archive']) +
-                    ('' if payload['persistent'] else tr('（仅内存；退出后丢失）')), 'Context')
-            return
-        if kind in ("subagent_start", "subagent_end"):
-            detail = (f"model={payload['model']} · steps≤{payload['max_steps']}"
-                      if kind == "subagent_start" else payload["status"])
-            display(f"{payload['id']} · {detail}", "Sub")
-            return
-        if kind == "subagent_retry":
-            retry_output(payload, payload["id"])
-            return
-        if kind == "continuation":
-            display({"automatic_continuation": payload})
-            return
-        name = payload.get("name")
-        writing = name in WRITE_TOOLS
-        if debug or kind == "tool_start" or (writing and kind == "tool_result"):
-            visible = hide_write_payloads(payload) if config.silent_writes else payload
-            display({kind: visible}, "SubTool" if payload.get("subagent") else "Tool")
-        if kind == "tool_start":
-            tool_started[payload.get("name")] = time.monotonic()
-        elif kind == "tool_result":
-            elapsed = time.monotonic() - tool_started.pop(payload.get("name"), time.monotonic())
-            if elapsed >= 10 and shutil.which("termux-vibrate"):
-                try:
-                    subprocess.Popen(["termux-vibrate", "-d", "100"], stdin=subprocess.DEVNULL,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_environment())
-                except OSError:
-                    pass
-
-    def stream_output(kind, value):
-        nonlocal stream_wrote, draft_saved_at
-        safe = "".join(c if c in "\n\t" or c.isprintable() else f"\\x{ord(c):02x}" for c in value)
-        formatter.feed("Think" if kind == "reasoning" else "Agent", redact(safe))
-        stream_wrote = True
-        if store and revision and active_branch:
-            field = 'reasoning_content' if kind == 'reasoning' else 'content'
-            combined = stream_draft.get(field, '') + redact(value)
-            if len(combined) > 64000:
-                stream_draft['truncated'] = True
-            stream_draft[field] = combined[-64000:]
-            now = time.monotonic()
-            if not draft_saved_at or now - draft_saved_at >= 2:
-                store.save_draft(session_id, revision, stream_draft)
-                draft_saved_at = now
-
-    def show_answer(value):
-        nonlocal stream_wrote
-        streamed = getattr(agent.client, "streamed", False)
-        if stream_wrote:
-            formatter.finish()
-        stopped = getattr(agent, 'last_run', {}).get("status") in (
-            "limit", "incomplete", "context_limit", "blocked", "stalled", "error", "empty_response")
-        failure = stopped or value.startswith(("LLM 请求失败", "LLM 请求已中断", "已达到最大模型请求",
-                                                "同一任务的硬预算", "自动任务", "任务因审批", "工具执行已中断"))
-        if value and (not streamed or not getattr(agent.client, "streamed_text", False) or failure):
-            display(value, "Agent")
-        stream_wrote = False
-
-    def retry_output(info, label="API"):
-        cause = f"HTTP {info['status']}" if info.get("status") else info["cause"]
-        display(tr('{v0} retry {v1}/{v2} · {v3} · wait {v4:g}s', v0=label, v1=info['attempt'], v2=info['max_attempts'], v3=cause, v4=info['wait_seconds']), "Retry")
-
-    def build_agent(next_config, text, base_system=None, client=None):
-        kwargs = {"approve": approve, "event": event}
-        if text:
-            kwargs["instructions"] = text
-        if base_system is not None:
-            kwargs["base_system"] = base_system
-        if client is not None:
-            kwargs['client'] = client
-        built = Agent(next_config, **kwargs)
-        built.client.on_stream = stream_output
-        built.client.on_retry = retry_output
-        built.checkpoint = lambda: save_current(checkpoint=True)
-        if not options.no_session:
-            built.archive_after_compact = lambda *args: save_compaction(*args)
-        return built
-
-    try:
-        agent = None if options.session else build_agent(config, instructions)
-    except (ValueError, OSError) as exc:
-        parser.error(str(exc))
-    try:
-        store = None if options.no_session else SessionStore()
-    except (OSError, sqlite3.Error) as exc:
-        if agent is not None:
-            getattr(agent, 'close', agent.client.close)()
-        parser.error(tr('Session store unavailable: {v0}', v0=exc))
-    session_id, revision = new_id(), 0
-
-    if _readline:
-        completer = Completer(
-            _readline,
-            profiles=lambda: [row["name"] for row in profile_store.list()],
-            skills=lambda: [skill.name for skill in registry.list_skills()],
-            active_skills=lambda: list(agent.active_skills),
-            session_ids=lambda: store.ids() if store else [],
-            directory=lambda: directory,
-            session_choices=lambda: [str(i) for i in range(1, len(last_session_ids) + 1)],
-            model_choices=model_choices,
-        )
-        _readline.set_completer_delims(" \t\n")
-        _readline.set_completer(completer)
-        if "libedit" in (_readline.__doc__ or ""):
-            _readline.parse_and_bind("bind ^I rl_complete")
-        else:
-            _readline.parse_and_bind("set show-all-if-ambiguous off")
-            _readline.parse_and_bind("tab: menu-complete")
-
-    def history_mode(current=None):
-        return getattr(agent if current is None else current, 'history_only', False) is True
-
-    def current_scope():
-        return {"directory": str(directory), "config_path": config_path,
-                "session_file": session_file, "disabled": disabled,
-                "instructions": instructions, "instruction_path": instruction_path}
-
-    def payload_fingerprint(value):
-        # The marker describes how a snapshot was written, not changed task data.
-        # A finish checkpoint must deduplicate the following ordinary save too.
-        data = {k: v for k, v in value.items() if k != 'checkpoint'}
-        encoded = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-        return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
-
-    def current_branch(archive_id=None):
-        value = dict(branch_state)
-        if not active_branch:
-            value.setdefault('source_session_id', session_id)
-            for name in ('title', 'updated', 'revision'):
-                value.setdefault('source_' + name, (source_meta or {}).get(name))
-        value['kind'] = 'active'
-        if archive_id:
-            value['archive_session_id'] = archive_id
-        return value
-
-    def create_active_branch(value, title, archive_id=None, draft=None):
-        nonlocal session_id, revision, saved_fingerprint, active_branch
-        nonlocal loaded_row, source_fingerprint, branch_state, source_meta
-        identifier = new_id()
-        branch = current_branch(archive_id)
-        value['branch'] = branch
-        store.save(identifier, 0, value, title=title)
-        if draft:
-            store.save_draft(identifier, 1, draft)
-        session_id, revision = identifier, 1
-        active_branch = True
-        loaded_row = None
-        source_fingerprint = None
-        branch_state = branch
-        source_meta = {'title': branch.get('source_title'), 'updated': branch.get('source_updated'),
-                       'revision': branch.get('source_revision')}
-        saved_fingerprint = payload_fingerprint(value)
-        if agent is not None:
-            agent.archive_id = identifier
-        return identifier
-
-    def save_current(force=False, checkpoint=False):
-        nonlocal revision, saved_fingerprint, active_branch, loaded_row, branch_state
-        if agent is not None and history_mode():
-            return
-        if store and agent is not None and (force or revision or len(agent.messages) > 1):
-            branch = current_branch()
-            value = snapshot(agent, current_scope(), checkpoint=checkpoint, branch=branch)
-            fingerprint = payload_fingerprint(value)
-            if not force and not checkpoint:
-                if fingerprint == saved_fingerprint:
-                    return
-                if not active_branch:
-                    plain = {k: v for k, v in value.items() if k != 'branch'}
-                    if payload_fingerprint(plain) == source_fingerprint:
-                        return
-            clear_draft = checkpoint and getattr(agent, 'last_run', {}).get('status') not in ('error', 'interrupted')
-            if not active_branch:
-                revision = store.save(session_id, revision, value, clear_draft=clear_draft)
-                active_branch, loaded_row = True, None
-                branch_state = branch
-            else:
-                revision = store.save(session_id, revision, value, clear_draft=clear_draft)
-            saved_fingerprint = fingerprint
-            # Fresh sessions need a real persisted archive ID before their first
-            # automatic compaction; in-memory IDs are invalid SQLite session IDs.
-            agent.archive_id = session_id
-
-    def save_compaction(archive_id, source, messages):
-        nonlocal revision, saved_fingerprint, active_branch, loaded_row, source_fingerprint, branch_state
-        scope = current_scope()
-        branch = current_branch()
-        original = snapshot(agent, scope, branch=branch, messages=source)
-        reduced = snapshot(agent, scope, checkpoint=True, branch=branch, messages=messages)
-        # Include the transition counters in the same commit as the new context.
-        reduced['counters']['_task_compactions'] += 1
-        if reduced['task_state'] is not None:
-            reduced['task_state']['compactions'] += 1
-        fingerprint = payload_fingerprint(reduced)
-        revision = store.compact(session_id, revision, archive_id, original, reduced)
-        saved_fingerprint = fingerprint
-        active_branch, loaded_row, source_fingerprint = True, None, None
-        branch_state = branch
-        agent.archive_id = session_id
-
-    def show_interruption(exc):
-        nonlocal stream_wrote
-        if stream_wrote:
-            formatter.finish()
-            stream_wrote = False
-        display(tr('Interrupted.'))
-        for note in getattr(exc, '__notes__', ()):
-            if note.startswith('Interruption checkpoint failed: '):
-                display(tr('中断检查点保存失败（{v0}）；请核实最新状态。',
-                           v0=note.removeprefix('Interruption checkpoint failed: ')), 'Recovery')
-
-    def submit_input(value, automatic=None):
-        nonlocal stream_wrote, read_grant
-        if history_mode():
-            display(tr('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。'), 'History')
-            return False
-        read_grant = False
-        try:
-            submission = load_text_submission(value, COMMANDS, config.max_input_file_chars)
-            if submission is not None:
-                display({"file": str(submission.path), "chars": len(submission.text),
-                         "api": config.api_profile})
-                value = submission.text
-            answer = agent.run(value) if automatic is None else agent.run(value, auto_continue=automatic)
-            show_answer(answer)
-            save_current()
-            return True
-        except KeyboardInterrupt as exc:
-            show_interruption(exc)
-        except Exception as exc:
-            if stream_wrote:
-                formatter.finish()
-                stream_wrote = False
-            display(tr('Error: {v0}', v0=exc))
-        return False
-
-    def current_title():
-        try:
-            title = store.title(session_id) if store and revision else None
-        except sqlite3.Error:
-            return '[unavailable]'
-        return ' '.join(str(title).split()) if title else 'New session'
-
-    def rename_current(value):
-        title = validate_title(value)
-        save_current(force=True)
-        store.rename(session_id, title, revision)
-        display(f"{session_id} · {title}", "Session")
-
-    def reset_session_io():
-        nonlocal stream_draft, draft_saved_at, read_grant, model_catalog
-        stream_draft, draft_saved_at, read_grant = {}, 0.0, False
-        model_catalog = None
-        tool_started.clear()
-
-    def reset_session_tracking(branch=None):
-        nonlocal session_id, revision, saved_fingerprint, active_branch
-        nonlocal loaded_row, source_fingerprint, branch_state, source_meta
-        session_id, revision = new_id(), 0
-        active_branch, loaded_row, source_fingerprint = True, None, None
-        branch_state, saved_fingerprint = branch or {'kind': 'active'}, None
-        source_meta = None
-        agent.archive_id = None
-        reset_session_io()
-
-    def start_new_session(next_config, next_instructions):
-        """Publish a fully built replacement only after saving the current session."""
-        nonlocal config, agent, language, instructions, registry
-        replacement = build_agent(next_config, next_instructions)
-        try:
-            save_current()
-            getattr(agent, 'close', agent.client.close)()
-        except BaseException as primary:
-            try:
-                getattr(replacement, 'close', replacement.client.close)()
-            except BaseException as cleanup:
-                primary.add_note('Replacement cleanup failed: ' + type(cleanup).__name__)
-            raise
-        config, agent = next_config, replacement
-        language, instructions = config.ui_language, next_instructions
-        registry = SkillRegistry()
-        reset_session_tracking()
-
-    def switch_api(name, persist=False):
-        nonlocal model_catalog
-        candidate = Config.load(config_path, name)
-        model_catalog = None
-        if (catalog_identity(candidate) == catalog_identity(config) and candidate.model == config.model
-                and not config.profile_model and not history_mode()):
-            if persist:
-                profile_store.set_default(name)
-            return False
-        if persist:
-            profile_store.set_default(name)
-        start_new_session(candidate, instructions)
-        return True
-
-    def catalog_identity(candidate):
-        return (candidate.api_profile, candidate.base_url.rstrip('/'), candidate.wire_api, candidate.api_key)
-
-    def fetch_models(candidate):
-        query = Client(candidate)
-        try:
-            return tuple(query.list_models())
-        finally:
-            query.close()
-
-    def show_models(name):
-        nonlocal model_catalog
-        model_catalog = None
-        candidate = Config.load(config_path, name)
-        models = fetch_models(candidate)
-        model_catalog = (candidate, models)
-        selected = config.model if name == config.api_profile else candidate.model
-        lines = [tr('API={v0} · 可用模型 {v1} 个', v0=name, v1=len(models)),
-                 candidate.base_url.rstrip('/') + '/models']
-        lines.extend(f'{i:>3} {"*" if model == selected else " "} {model}' for i, model in enumerate(models, 1))
-        if selected not in models:
-            lines.append(tr('配置中的模型 {v0} 不在当前返回列表中。', v0=selected))
-        lines.append(tr('用 /api model ID或序号 选用模型。'))
-        display('\n'.join(lines), 'Models')
-
-    def select_model(value):
-        nonlocal model_catalog
-        parts = shlex.split(value)
-        if not 1 <= len(parts) <= 2:
-            raise ValueError(tr('Use /api model ID|N [NAME]'))
-        choice = parts[0]
-        catalog = model_catalog
-        name = catalog[0].api_profile if catalog else config.api_profile
-        if len(parts) == 2:
-            name = parts[1]
-        candidate = Config.load(config_path, name)
-        if catalog and catalog_identity(catalog[0]) == catalog_identity(candidate):
-            models = catalog[1]
-        else:
-            if choice.isascii() and choice.isdigit():
-                raise ValueError(tr('先用 /api models [NAME] 查询，再按列表序号选用模型。'))
-            models = fetch_models(candidate)
-            catalog = None
-        if choice in models:
-            selected = choice
-        elif choice.isascii() and choice.isdigit() and 1 <= int(choice) <= len(models):
-            selected = models[int(choice) - 1]
-        else:
-            raise ValueError(tr('模型不在当前列表中；请用 /api models [NAME] 重新查询。'))
-        same_api = catalog_identity(candidate) == catalog_identity(config) and not history_mode()
-        profile_model = candidate.model if selected != candidate.model else ''
-        if same_api and selected == config.model and config.profile_model == profile_model:
-            return False
-        replacement = copy.copy(config) if same_api else candidate
-        replacement.profile_model = profile_model
-        replacement.model = selected
-        replacement.validate()
-        start_new_session(replacement, instructions)
-        model_catalog = catalog
-        return True
-
-    def show_session_listing(limit=50, query=None, empty_text=None, all_rows=False):
-        """Query, render and cache one exact metadata listing without loading rows."""
-        nonlocal last_session_ids
-        empty_text = tr(empty_text or '没有已保存会话。')
-        if not store:
-            display(tr('Persistence disabled by --no-session.'))
-            last_session_ids = ()
-            return ()
-        rows = store.listing(limit, query=query, all_rows=all_rows, active_id=session_id)
-        last_session_ids = tuple(row['id'] for row in rows)
-        if not formatter.enabled:
-            display(rows)
-            if not rows and empty_text:
-                display(empty_text)
-        else:
-            if rows:
-                display(tr('{v0} saved sessions', v0=len(rows)) +
-                        (tr(' · title contains {v0}', v0=query) if query else ''), 'Sessions')
-            else:
-                display(empty_text, 'Sessions')
-            formatter.sessions(rows, session_id, Path.home(), redact, language=language)
-        return last_session_ids
-
-    def resolve_session_target(value):
-        value = value.strip()
-        if not value:
-            raise ValueError(tr('Use /resume ID|N or /session load ID|N'))
-        if len(value) == 12 and all(char in "0123456789abcdef" for char in value):
-            return value
-        if value.isascii() and value.isdigit():
-            if not last_session_ids:
-                raise ValueError(tr('先用 /sessions 或 /resume 查看会话，再按序号选择。'))
-            index = int(value)
-            if not 1 <= index <= len(last_session_ids):
-                raise ValueError(tr('会话序号超出最后一次显示的列表范围。'))
-            return last_session_ids[index - 1]
-        store.check_id(value)
-        return value
-
-    def resume_session(value):
-        identifier = resolve_session_target(value)
-        if identifier != session_id or history_mode():
-            load_session(identifier)
-        display({"id": session_id, "title": current_title(), "api": config.api_profile,
-                 "directory": str(directory)})
-
-    def resume_picker():
-        if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            display(tr('输入 /resume 序号或 ID 恢复；序号只对应上面显示的列表。'))
-            return
-        try:
-            value = input(tr('选择序号或ID（回车取消）')).strip()
-        except (EOFError, KeyboardInterrupt):
-            display(tr('已取消会话选择。'))
-            return
-        if not value:
-            display(tr('已取消会话选择。'))
-            return
-        resume_session(value)
-
-    def delete_session(value):
-        parts = value.split()
-        if not parts:
-            rows = show_session_listing(50, empty_text="没有已保存会话。")
-            if not rows:
-                return
-            if not (sys.stdin.isatty() and sys.stdout.isatty()):
-                display(tr('用 /session delete 序号或ID 删除；非交互执行需显式添加 --yes。'))
-                return
-            try:
-                selection = input(tr('删除序号或ID（回车取消）')).strip()
-            except (EOFError, KeyboardInterrupt):
-                display(tr('已取消删除。'))
-                return
-            if not selection:
-                display(tr('已取消删除。'))
-                return
-            parts = [selection]
-        if len(parts) > 2 or parts[0] == '--yes' or (len(parts) == 2 and parts[1] != '--yes'):
-            raise ValueError(tr('Use /session delete ID|N [--yes]'))
-        target = resolve_session_target(parts[0])
-        if target == session_id:
-            raise ValueError(tr('Switch to another session before deleting the active one'))
-        metadata = store.deletion_target(target)
-        # A title is display data, not a prompt or a control sequence.
-        confirmation = {"delete_session": target, "title": metadata[0]}
-        archives = store.archives(target)
-        if archives:
-            confirmation['delete_archives'] = len(archives)
-        display(confirmation, "Session")
-        confirmed = len(parts) == 2
-        if not confirmed and sys.stdin.isatty():
-            try:
-                confirmed = input(tr('Delete session {v0}? [y/N] ', v0=target)).strip().lower() in ('y', 'yes')
-            except (EOFError, KeyboardInterrupt):
-                confirmed = False
-        if confirmed:
-            store.delete(target, expected=metadata)
-            display(tr('Session deleted.'))
-        else:
-            display(tr('Deletion cancelled; use --yes for explicit noninteractive deletion.'))
-
-    def load_session(identifier, save_existing=True, active=False):
-        nonlocal language
-        nonlocal agent, config, directory, config_path, session_file, disabled
-        nonlocal instructions, instruction_path, session_id, revision
-        nonlocal registry, profile_store, saved_fingerprint, loaded_row
-        nonlocal active_branch, source_fingerprint, branch_state, source_meta
-        loaded_row = store.db.execute(
-            'SELECT title,updated,revision,payload FROM sessions WHERE id=?', (identifier,)).fetchone()
-        next_revision, payload = store.load(identifier)
-        next_config, replacement, scope = restore(payload, build_agent, history_fallback=True)
-        target_directory = Path(scope['directory'])
-        if history_mode(replacement) and not target_directory.is_dir():
-            target_directory = Path.cwd()
-        try:
-            if save_existing:
-                save_current()
-            os.chdir(target_directory)
-        except Exception:
-            getattr(replacement, 'close', replacement.client.close)()
-            raise
-        if agent is not None:
-            getattr(agent, 'close', agent.client.close)()
-        config, agent = next_config, replacement
-        language = config.ui_language
-        directory, config_path = target_directory, scope['config_path']
-        session_file, disabled = scope['session_file'], scope['disabled']
-        instructions, instruction_path = scope['instructions'], scope['instruction_path']
-        session_id, revision = identifier, next_revision
-        active_branch = active
-        branch_state = dict(payload.get('branch') or {'kind': 'active'})
-        current_snap = snapshot(replacement, current_scope(), branch=branch_state)
-        if active_branch:
-            loaded_row = None
-            source_fingerprint = None
-        else:
-            source_meta = {'title': loaded_row[0], 'updated': loaded_row[1], 'revision': loaded_row[2]}
-            source_fingerprint = payload_fingerprint({k: v for k, v in current_snap.items() if k != 'branch'})
-        saved_fingerprint = payload_fingerprint(current_snap)
-        replacement.archive_id = identifier
-        reset_session_io()
-        registry = SkillRegistry()
-        profile_store = ProfileStore(config_path)
-        if history_mode():
-            display(tr('历史查看模式：') + agent.client.reason + tr('可用 /history、/recall、/export 查看；用 /api NAME 新建会话，原历史保持保存。'), 'History')
-        draft = store.draft(identifier)
-        incomplete = agent.incomplete_draft
-        unfinished_checkpoint = payload.get('checkpoint') and agent.last_run.get('status') not in ('complete', 'idle')
-        if unfinished_checkpoint or draft or incomplete or has_unknown_tool_results(agent.messages):
-            display(tr('恢复了未完成任务的检查点；工具状态不明时先核实实际结果。'), 'Recovery')
-        if draft:
-            display(tr('上次流式草稿（未完成，未加入模型上下文；/export 可完整导出）：\n') +
-                    (draft.get('content') or draft.get('reasoning_content') or '')[:4000], 'Draft')
-        if incomplete:
-            text = incomplete.get('content') or incomplete.get('reasoning_content') or ''
-            display(tr('恢复了未完成输出草稿；未完成工具调用只保留在草稿中，未加入模型上下文：\n') +
-                    text[:4000], 'Draft')
-
-    def compact_current(keep):
-        from .context import compact_messages
-        nonlocal session_id, revision
-        if not 1 <= keep <= 100:
-            raise ValueError(tr('Use /compact [1–100 recent user turns]'))
-        original = session_id
-        title = current_title()
-        payload = snapshot(agent, current_scope())
-        messages, omitted = compact_messages(payload['messages'], keep, original)
-        if not omitted:
-            display(tr('消息轮次未超过保留数量，无需精简。'), 'Context')
-            return
-        payload['messages'] = messages
-        identifier = new_id()
-        store.save(identifier, 0, payload)
-        store.rename(identifier, title[:100] + ' · compact')
-        load_session(identifier, save_existing=False, active=True)
-        display(tr('完整历史保留于 {v0}；当前会话 {v1} 已省略 {v2} 条早期消息。', v0=original, v1=identifier, v2=omitted), 'Context')
-
-    try:
-        if options.session:
-            load_session(options.session)
-        if options.prompt is not None:
-            if not submit_input(options.prompt):
-                raise SystemExit(1)
-            return
-        display(tr('Termux Agent — /help for commands'))
-        display({"api": config.api_profile, "directory": str(directory), "agent_file": instruction_path, "session": session_id if store else "in-memory"})
-        # Effective limits of the active profile: a key placed under another [apis.*]
-        # table silently falls back to defaults, and this line makes that visible.
-        display({"auto_continue": config.auto_continue, "max_steps": config.max_steps,
-                 "max_task_calls": config.max_task_calls, "max_task_seconds": config.max_task_seconds,
-                 "auto_resume": config.auto_resume_max if config.auto_continue and config.auto_resume else 0})
-        if formatter.enabled:
-            display(tr('Tab 补全命令和 ~/本地路径；文件路径回车提交文本。'))
-        while True:
-            try:
-                if formatter.enabled and sys.stdin.isatty():
-                    session_label = session_id + (" (memory)" if store is None else "")
-                    display(tr('Session={v0} | Model={v1} | Cwd={v2}\nTitle={v3}', v0=session_label, v1=config.model, v2=directory, v3=current_title()) + (tr(' | Mode=历史查看') if history_mode() else '') +
-                            '\n' + format_context_status(agent.context_status(), language=language), "Status")
-                prompt = read_prompt(formatter.prompt(), formatter.continuation()).strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                break
-            if not prompt:
-                continue
-            bare_command = BARE_COMMANDS.get(prompt.lower())
-            if bare_command and not (bare_command in ('/continue', '/resume') and agent._resumable()):
-                display(tr(BARE_COMMAND_HINT, v0=prompt.lower(), v1=bare_command), 'Input')
-                continue
-            if history_mode() and prompt.split(maxsplit=1)[0] not in (
-                    '/help', '/sessions', '/session', '/resume', '/history', '/stats', '/status', '/config', '/debug',
-                    '/debug-context', '/silent', '/api', '/title', '/recall', '/export', '/copy', '/paste', '/exit'):
-                display(tr('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。'), 'History')
-                continue
-            try:
-                local_path = path_value(prompt, cli_commands)
-            except ValueError as exc:
-                display(tr('Error: {v0}', v0=exc))
-                continue
-            if local_path is not None:
-                submit_input(prompt)
-                continue
-            if prompt == "/exit":
-                try:
-                    save_current()
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(tr('Save failed: {v0}', v0=exc))
-                    continue
-                break
-            if prompt == "/help":
-                display(help_text(HELP, language))
-            elif prompt == "/clear":
-                try:
-                    start_new_session(config, instructions)
-                    display(tr('New session; previous conversation remains saved.'))
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/stats":
-                display(agent.stats())
-            elif prompt == '/status':
-                display(agent.stats()['stop'])
-            elif prompt == '/continue' or prompt.startswith('/continue '):
-                try:
-                    value = prompt[9:].strip()
-                    answer = agent.continue_task(int(value) if value else None)
-                    show_answer(answer); save_current()
-                except KeyboardInterrupt as exc:
-                    show_interruption(exc)
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == '/compact' or prompt.startswith('/compact '):
-                try:
-                    if not store:
-                        raise ValueError(tr('/compact 需要会话持久化，请去掉 --no-session'))
-                    value = prompt[8:].strip()
-                    if value == 'task' or value.startswith('task '):
-                        from .context import compact_task_messages
-                        keep = int(value[4:].strip() or 2)
-                        original = session_id; title = current_title()
-                        payload = snapshot(agent, current_scope())
-                        messages, details = compact_task_messages(payload['messages'], keep, original)
-                        if not details['omitted_groups'] and not details['reduced_calls']:
-                            display(tr('当前任务没有可压缩的完整工具组；用 /compact 精简更早的历史，或 /compact 1 仅保留最近一轮。'), 'Context')
-                        else:
-                            payload['messages'] = messages
-                            identifier = create_active_branch(
-                                payload, title[:95] + ' · compact task', archive_id=original,
-                                draft=store.draft(original))
-                            load_session(identifier, save_existing=False, active=True)
-                            display(tr('完整任务历史保留于 {v0}；当前会话 {v1}：{v2}', v0=original, v1=identifier, v2=details), 'Context')
-                    else:
-                        if value:
-                            compact_current(int(value))
-                        elif not agent._compact_for_context(force=True):
-                            display(tr('没有可安全精简的历史；可用 /compact 1 仅保留最近一轮。'), 'Context')
-                except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == '/recall' or prompt.startswith('/recall '):
-                try:
-                    if not store:
-                        raise ValueError(tr('/recall 需要会话持久化'))
-                    save_current()
-                    rows = store.recall(prompt[7:].strip(), silent_writes=config.silent_writes)
-                    display(rows if rows else tr('未找到匹配会话。'), 'Recall')
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == '/export' or prompt.startswith('/export '):
-                try:
-                    if not store:
-                        raise ValueError(tr('/export 需要会话持久化'))
-                    args = shlex.split(prompt)[1:]
-                    target = session_id
-                    if args and args[0] not in ('markdown', 'json'):
-                        target = args.pop(0)
-                    if len(args) > 2:
-                        raise ValueError(tr('Use /export [ID] [markdown|json] [PATH]'))
-                    if target == session_id:
-                        save_current(force=True)
-                    path = store.export(target, args[0] if args else 'markdown', args[1] if len(args) > 1 else None)
-                    display(tr('已导出：{v0}（本地明文，权限 0600）', v0=path), 'Export')
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/config":
-                display({**config.public_dict(), "directory": str(directory), "agent_file": instruction_path})
-            elif prompt == "/debug":
-                debug = not debug
-                display(tr('Debug {v0}', v0='on' if debug else 'off'))
-            elif prompt == "/debug-context":
-                display(agent.debug_context())
-            elif prompt == "/silent" or prompt.startswith("/silent "):
-                value = prompt[7:].strip()
-                if value not in ("", "on", "off"):
-                    display(tr('Use /silent on or /silent off'))
-                else:
-                    if value:
-                        config.silent_writes = value == "on"
-                    display({"silent_writes": config.silent_writes})
-            elif prompt == "/auto" or prompt.startswith("/auto "):
-                value = prompt[5:].strip()
-                try:
-                    if value in ("on", "off"):
-                        config.auto_continue = value == "on"
-                    elif value.startswith("steps "):
-                        count = int(value[6:].strip())
-                        if not 1 <= count <= 256:
-                            raise ValueError(tr('Automatic request limit must be 1–256'))
-                        config.max_steps = count
-                    elif value:
-                        raise ValueError(tr('Use /auto on|off|steps N'))
-                    display({"auto_continue": config.auto_continue, "max_steps": config.max_steps,
-                             "max_continuations": config.max_continuations,
-                             "auto_resume": config.auto_resume_max if config.auto_continue and config.auto_resume else 0})
-                except ValueError as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/run" or prompt.startswith("/run "):
-                task = prompt[4:].strip()
-                if task:
-                    submit_input(task, automatic=True)
-                else:
-                    display(tr('Use /run TASK or /run ~/task-instructions.txt'))
-            elif prompt == "/api" or prompt.startswith("/api "):
-                value = prompt[4:].strip()
-                try:
-                    rows = profile_store.list()
-                    if value == 'models' or value.startswith('models '):
-                        show_models(value[6:].strip() or config.api_profile)
-                    elif value == 'model' or value.startswith('model '):
-                        choice = value[5:].strip()
-                        switched = select_model(choice) if choice else False
-                        display({'api': config.api_profile, 'model': config.model,
-                                 'switched': switched, 'session': session_id}, 'Models')
-                    elif not value or value == "list":
-                        display({"current": config.api_profile, "default": profile_store.get_default(),
-                                 "profiles": [{"number": i, **row} for i, row in enumerate(rows, 1)]})
-                    elif value.startswith("add "):
-                        parts = shlex.split(value[4:])
-                        flags = [part for part in parts if part.startswith("--")]
-                        positional = [part for part in parts if not part.startswith("--")]
-                        if not 3 <= len(positional) <= 5:
-                            raise ValueError(tr('Use /api add NAME URL MODEL [KEY_ENV] [local|cloud]'))
-                        name, base_url, model = positional[:3]
-                        extra = positional[3:]
-                        key_env = ""
-                        kind = "auto"
-                        if extra:
-                            if extra[0] in ("local", "cloud"):
-                                kind = extra[0]
-                            else:
-                                key_env = extra[0]
-                        if len(extra) == 2:
-                            kind = extra[1]
-                        stream = True
-                        timeout = None
-                        user_agent = None
-                        for flag in flags:
-                            if flag == "--no-stream":
-                                stream = False
-                            elif flag.startswith("--timeout="):
-                                timeout = float(flag.partition("=")[2])
-                            elif flag.startswith("--user-agent="):
-                                user_agent = flag.partition("=")[2]
-                            else:
-                                raise ValueError(tr('Unknown API option: {v0}', v0=flag))
-                        path = profile_store.add(name, base_url, model, key_env, kind,
-                                                 stream, timeout, user_agent)
-                        display({"added": name, "path": str(path), "switch": f"/api {name}"})
-                    elif value.startswith("show "):
-                        name = value[5:].strip()
-                        matches = [row for row in rows if row["name"] == name]
-                        if name == "default":
-                            display(Config.load(config_path, name).public_dict())
-                        elif matches:
-                            display(matches[0])
-                        else:
-                            raise ValueError(tr('Unknown API profile: {v0}', v0=name))
-                    elif value.startswith("remove "):
-                        name = value[7:].strip()
-                        if name == config.api_profile:
-                            raise ValueError(tr('Switch to another API before removing the active profile'))
-                        backup = profile_store.remove(name)
-                        display({"removed": name, "backup": str(backup)})
-                    else:
-                        persist = value.startswith("default ")
-                        names = [row["name"] for row in rows]
-                        name = value[8:].strip() if persist else value.removeprefix("switch ").strip()
-                        if name in ("next", "prev"):
-                            if not names:
-                                raise ValueError(tr('No named API profiles configured'))
-                            index = names.index(config.api_profile) if config.api_profile in names else (
-                                -1 if name == "next" else 0)
-                            name = names[(index + (1 if name == "next" else -1)) % len(names)]
-                        elif name.isdigit():
-                            number = int(name)
-                            if not 1 <= number <= len(names):
-                                raise ValueError(tr('API number is not in /api list'))
-                            name = names[number - 1]
-                        switched = switch_api(name, persist)
-                        display({"api": name, "switched": switched,
-                                 "default": profile_store.get_default()})
-                except (ValueError, OSError, sqlite3.Error, ClientError) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/agent" or prompt.startswith("/agent "):
-                value = prompt[6:].strip()
-                if not value:
-                    display({"agent_file": instruction_path, "chars": len(instructions)})
-                    continue
-                try:
-                    next_file, next_disabled = session_file, disabled
-                    if value == "off":
-                        next_disabled = True
-                    elif value == "directory":
-                        next_file, next_disabled = None, False
-                    elif value != "reload":
-                        next_file, next_disabled = value, False
-                    text, source = load_instructions(directory, next_file, next_disabled)
-                    start_new_session(config, text)
-                    instructions, instruction_path = text, source
-                    session_file, disabled = next_file, next_disabled
-                    display({"agent_file": source, "chars": len(text), "new_conversation": True})
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/skill" or prompt.startswith("/skill "):
-                try:
-                    parts = prompt.split(maxsplit=2)
-                    action = parts[1] if len(parts) > 1 else "list"
-                    name = parts[2] if len(parts) > 2 else ""
-                    if action == "list":
-                        active = agent.get_active_skills()
-                        display([{"name": skill.name, "active": skill.name in active,
-                                  "description": skill.description} for skill in registry.list_skills()])
-                    elif action == "info" and name:
-                        skill = registry.find(name)
-                        display({"name": skill.name, "description": skill.description, "path": str(skill.path),
-                                 "active": name in agent.active_skills})
-                    elif action == "load" and name:
-                        skill, body = registry.load(name)
-                        previous = agent.get_active_skills()
-                        agent.load_skill(skill.name, body)
-                        try:
-                            save_current(force=True)
-                        except Exception:
-                            agent.clear_skills()
-                            for active_name, content in previous.items():
-                                agent.load_skill(active_name, content)
-                            raise
-                        display(tr('Loaded {v0} into this session.', v0=skill.name))
-                    elif action in ("unload", "clear"):
-                        if action == "unload" and not name:
-                            raise ValueError(tr('Use /skill unload NAME'))
-                        previous = agent.get_active_skills()
-                        if action == "clear":
-                            agent.clear_skills()
-                        else:
-                            agent.unload_skill(name)
-                        try:
-                            save_current(force=True)
-                        except Exception:
-                            agent.clear_skills()
-                            for active_name, content in previous.items():
-                                agent.load_skill(active_name, content)
-                            raise
-                        display(tr('Active skills cleared.') if action == "clear" else tr('Unloaded {v0}.', v0=name))
-                    else:
-                        display(tr('Use /skill list|info NAME|load NAME|unload NAME|clear'))
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt.startswith("/copy"):
-                try:
-                    text = prompt[5:].lstrip()
-                    if not text:
-                        text = next((m.get("content") for m in reversed(agent.messages)
-                                     if m.get("role") == "assistant" and m.get("content")), "")
-                    command = shutil.which("termux-clipboard-set")
-                    if not command:
-                        raise RuntimeError("termux-clipboard-set is unavailable; install Termux:API")
-                    result = subprocess.run([command], input=text, text=True, capture_output=True, timeout=10,
-                                            env=child_environment())
-                    if result.returncode:
-                        raise RuntimeError(result.stderr.strip() or "clipboard write failed")
-                    display(tr('Copied to Android clipboard.') if text else tr('Nothing to copy.'))
-                except (OSError, subprocess.SubprocessError, RuntimeError) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/paste":
-                command = shutil.which("termux-clipboard-get")
-                if not command:
-                    display(tr('termux-clipboard-get is unavailable; install Termux:API'))
-                    continue
-                try:
-                    result = subprocess.run([command], text=True, capture_output=True, timeout=10, check=True,
-                                            env=child_environment())
-                    if len(result.stdout) > config.max_output_chars:
-                        display(result.stdout[:config.max_output_chars] + tr('\n[TRUNCATED]'))
-                    else:
-                        display(result.stdout)
-                except (OSError, subprocess.SubprocessError) as exc:
-                    display(tr('Clipboard read failed: {v0}', v0=exc))
-            elif prompt == "/sub" or prompt.startswith("/sub "):
-                task = prompt[4:].strip()
-                if not task:
-                    display({"max_subagents": config.max_subagents,
-                             "subagent_max_steps": min(config.subagent_max_steps, config.max_steps),
-                             "api": config.api_profile, "execution": "synchronous; no nested delegation"}, "Sub")
-                    continue
-                read_grant = False
-                try:
-                    result = agent.delegate(task)
-                    display(f"{result.get('id', 'sub')} · {agent.last_run['status']}", "Sub")
-                    display(result.get("summary", result.get("error", "")), "Sub")
-                    save_current()
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(tr('Sub-agent failed: {v0}', v0=exc), "Sub")
-            elif prompt.startswith("!"):
-                command = prompt[1:].strip()
-                if command:
-                    if agent._approved("shell", {"command": command}):
-                        from .tools import execute
-                        agent._direct_shell_count += 1
-                        result = execute("shell", {"command": command, "cwd": str(directory)}, config.max_output_chars)
-                        display(result, "Shell")
-                        try:
-                            save_current()
-                        except (ValueError, OSError, sqlite3.Error) as exc:
-                            display(tr('Session save failed: {v0}', v0=exc))
-                    else:
-                        display(tr('Shell command denied or approval unavailable.'))
-            elif prompt == "/title" or prompt.startswith("/title "):
-                if not store:
-                    display(tr('Persistence disabled by --no-session.'))
-                    continue
-                try:
-                    value = prompt[6:].strip()
-                    if value:
-                        rename_current(value)
-                    else:
-                        display(f"{session_id} · {current_title()}", "Session")
-                except (ValueError, OSError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/sessions" or prompt.startswith("/sessions "):
-                try:
-                    value = prompt[9:].strip()
-                    query = None
-                    all_rows = value == 'all' or value.startswith('all ')
-                    if all_rows:
-                        value = value[3:].strip()
-                    if value == "find" or value.startswith("find "):
-                        if not value[4:].strip():
-                            raise ValueError(tr('Use /sessions find TEXT'))
-                        query = validate_title(value[4:].strip())
-                        limit = 50
-                    else:
-                        limit = int(value or 50)
-                    if not 1 <= limit <= 500:
-                        raise ValueError(tr('Session count must be 1–500'))
-                    if not store:
-                        display(tr('Persistence disabled by --no-session.'))
-                        continue
-                    show_session_listing(limit, query, all_rows=all_rows)
-                except (ValueError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/resume" or prompt.startswith("/resume "):
-                try:
-                    if not store:
-                        display(tr('Persistence disabled by --no-session.'))
-                        continue
-                    value = prompt[7:].strip()
-                    if value:
-                        resume_session(value)
-                    else:
-                        rows = show_session_listing(50, empty_text="没有已保存会话。")
-                        if rows:
-                            resume_picker()
-                except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/history" or prompt.startswith("/history "):
-                try:
-                    parts = prompt[8:].split()
-                    count, skip = int(parts[0]) if parts else 20, int(parts[1]) if len(parts) > 1 else 0
-                    if not 1 <= count <= 100 or skip < 0 or len(parts) > 2:
-                        raise ValueError(tr('Use /history [1–100] [non-negative skip]'))
-                    history = agent.messages[1:]
-                    end = max(0, len(history) - skip)
-                    start = max(0, end-count)
-                    display(tr('History {v0}–{v1} / {v2} · --:-- = time not recorded', v0=start + 1 if start < end else 0, v1=end, v2=len(history)))
-                    for message in history[start:end]:
-                        role, rendered = history_entry(message, config.silent_writes)
-                        display(rendered, role, stamp="--:--")
-                except ValueError as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt == "/session" or prompt.startswith("/session "):
-                if not store:
-                    display(tr('Persistence disabled by --no-session.'))
-                    continue
-                command, _, value = prompt[8:].strip().partition(" ")
-                try:
-                    if not command:
-                        display({"id": session_id, "title": current_title(), "saved": bool(revision)})
-                    elif command in ("new", "fork"):
-                        if history_mode():
-                            raise ValueError(tr('历史查看模式保留原快照；请用 /api NAME 新建可用会话。'))
-                        if command == "new":
-                            start_new_session(config, instructions)
-                        else:
-                            save_current()
-                            reset_session_tracking({'kind': 'active', 'source_session_id': session_id})
-                        save_current(force=True)
-                        if value:
-                            store.rename(session_id, value)
-                        display({"id": session_id, "title": current_title()})
-                    elif command == "load":
-                        resume_session(value)
-                    elif command == 'archives':
-                        identifier = resolve_session_target(value) if value.strip() else session_id
-                        display(store.archives(identifier), 'Archive')
-                    elif command == 'archive':
-                        archive = store.load_archive(value.strip())
-                        display({k: archive[k] for k in ('id', 'session_id', 'title', 'revision')}, 'Archive')
-                        for message in archive['payload']['messages'][1:][-20:]:
-                            role, rendered = history_entry(message, config.silent_writes)
-                            display(rendered, role, stamp='--:--')
-                    elif command == "rename":
-                        rename_current(value)
-                    elif command == "rename-id":
-                        target, _, title = value.partition(' ')
-                        title = validate_title(title)
-                        if target == session_id:
-                            rename_current(title)
-                        else:
-                            store.rename(target, title)
-                            display(f"{target} · {title}", 'Session')
-                    elif command == "save":
-                        save_current(force=True)
-                        display(tr('历史已保存；查看模式不重写原快照。') if history_mode() else {"id": session_id, "saved": True})
-                    elif command == "delete":
-                        delete_session(value)
-                    else:
-                        display(tr('Use /session new|fork|load ID|N|rename NAME|rename-id ID NAME|delete ID|save'))
-                except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
-                    display(tr('Error: {v0}', v0=exc))
-            elif prompt.startswith("/"):
-                display(tr('Unknown command; use /help.'))
-            else:
-                submit_input(prompt)
-    except Exception as exc:
-        display(tr('Error: {v0}', v0=exc))
-        raise SystemExit(1) from None
-    finally:
-        try:
-            save_current()
-        except (ValueError, OSError, sqlite3.Error) as exc:
-            display(tr('Session save failed: {v0}; this turn was not saved.', v0=exc))
-        if agent is not None:
-            getattr(agent, 'close', agent.client.close)()
-        save_readline_history()
-        if store:
-            store.close()
+    controller = ReplController(
+        options,
+        language=language,
+        config_path=config_path,
+        directory=directory,
+        session_file=session_file,
+        disabled=disabled,
+        instructions=instructions,
+        instruction_path=instruction_path,
+        config=config,
+        parser=parser,
+    )
+    controller.run()
 
 
 if __name__ == "__main__":

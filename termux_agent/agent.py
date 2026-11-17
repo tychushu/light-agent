@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 import re
 import time
 import math
@@ -36,6 +36,80 @@ OUTPUT_COMPRESSION_COUNTERS = (
     "incomplete_capture", "raw_artifacts", "artifact_bytes", "before_bytes",
     "after_bytes", "before_chars", "after_chars",
 )
+
+
+@dataclass
+class AgentCounters:
+    """Unified runtime and RTK statistics counters for an Agent instance."""
+
+    total_calls: int = 0
+    tool_calls_total: int = 0
+    usage_history: list[dict[str, Any] | None] = field(default_factory=list)
+    request_history_chars: list[int] = field(default_factory=list)
+    conversation_count: int = 0
+    direct_shell_count: int = 0
+    subagent_calls_total: int = 0
+    subagent_api_calls_total: int = 0
+    subagent_tool_calls_total: int = 0
+    tool_calls_executed: int = 0
+    tool_calls_denied: int = 0
+    tool_calls_not_run: int = 0
+    tool_calls_approval_denied: int = 0
+    tool_calls_hard_limit_not_run: int = 0
+    tool_write_unknown: int = 0
+    http_attempts_total: int = 0
+    http_retries_total: int = 0
+    context_recoveries: int = 0
+    task_compactions: int = 0
+    rtk_shell_results: int = 0
+    rtk_filter_attempts: int = 0
+    rtk_compressed_results: int = 0
+    rtk_filter_failures: int = 0
+    rtk_incomplete_capture: int = 0
+    rtk_raw_artifacts: int = 0
+    rtk_artifact_bytes: int = 0
+    rtk_before_bytes: int = 0
+    rtk_after_bytes: int = 0
+    rtk_before_chars: int = 0
+    rtk_after_chars: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "_" + name: (list(value) if isinstance(value, list) else value)
+            for name, value in vars(self).items()
+        }
+
+    def load_dict(self, data: dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        for field_name in self.__dataclass_fields__:
+            key = "_" + field_name
+            if key in data:
+                value = data[key]
+            elif field_name in data:
+                value = data[field_name]
+            else:
+                continue
+            default = getattr(self, field_name)
+            if isinstance(default, list):
+                setattr(self, field_name, list(value) if isinstance(value, list) else [])
+            elif isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                setattr(self, field_name, value)
+
+
+class _CounterProperty:
+    """Data descriptor forwarding Agent._* counter attributes to Agent.counters."""
+
+    def __init__(self, field_name: str):
+        self.field_name = field_name
+
+    def __get__(self, instance: Any, owner: Any = None) -> Any:
+        if instance is None:
+            return self
+        return getattr(instance.counters, self.field_name)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        setattr(instance.counters, self.field_name, value)
 
 
 class TaskBudgetExhausted(RuntimeError):
@@ -73,40 +147,11 @@ class Agent:
             delegate_tool['function']['parameters']['properties']['max_steps']['maximum'] = min(
                 config.subagent_max_steps, config.max_steps, config.max_task_calls)
             self.tools.append(delegate_tool)
-        self._subagent_calls_total = 0
-        self._subagent_api_calls_total = 0
-        self._subagent_tool_calls_total = 0
+        self.counters = AgentCounters()
         self.active_skills: dict[str, str] = {}
         self.system = self.base_system
-        self._direct_shell_count = 0
         self.messages: list[dict[str, Any]] = [{"role": "system", "content": self.system}]
         self._tool_projection_cache = {}
-        self._total_calls = 0
-        self._tool_calls_total = 0
-        self._tool_calls_executed = 0
-        self._tool_calls_denied = 0
-        self._tool_calls_not_run = 0
-        self._tool_calls_approval_denied = 0
-        self._tool_calls_hard_limit_not_run = 0
-        self._tool_write_unknown = 0
-        self._http_attempts_total = 0
-        self._http_retries_total = 0
-        self._context_recoveries = 0
-        self._task_compactions = 0
-        self._rtk_shell_results = 0
-        self._rtk_filter_attempts = 0
-        self._rtk_compressed_results = 0
-        self._rtk_filter_failures = 0
-        self._rtk_incomplete_capture = 0
-        self._rtk_raw_artifacts = 0
-        self._rtk_artifact_bytes = 0
-        self._rtk_before_bytes = 0
-        self._rtk_after_bytes = 0
-        self._rtk_before_chars = 0
-        self._rtk_after_chars = 0
-        self._usage_history: list[dict[str, Any] | None] = []
-        self._request_history_chars: list[int] = []
-        self._conversation_count = 0
         self._approval_denied = False
         self._last_auto_prompt_chars = 0
         self.task_state = None
@@ -1544,3 +1589,7 @@ class Agent:
             return value
         result = redact(request) if secrets else deepcopy(request)
         return hide_write_payloads(result) if self.config.silent_writes else result
+
+
+for _counter_field in AgentCounters.__dataclass_fields__:
+    setattr(Agent, "_" + _counter_field, _CounterProperty(_counter_field))

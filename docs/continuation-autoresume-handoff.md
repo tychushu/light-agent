@@ -256,3 +256,31 @@ env -i HOME="$HOME/ta-resume-pJZ6Au/home" TMPDIR="$HOME/ta-resume-pJZ6Au/tmp" PA
   - 独立复核边界探测 `review_probes.py`：**12 / 12 全部通过**（涵盖 `chat_completions` / `responses` 嵌套修改新鲜序列化、短显式密钥会话与调试脱敏、LAN/Magpie 网关放行、`git --config-env ... reset --hard` / `push --force` 审批）；
   - 完整单元测试套件 `python -m unittest discover -s tests`：**597 项全部通过（`OK`，耗时 38.825 秒，0 失败、0 跳过）**。
 - 所有网络请求均为本地 `httpx.MockTransport` 或模拟客户端，未运行 `live_smoke.py` 或连接真实 Termux 设备；正式部署前请在目标设备环境同步核验。
+
+## 8. P3 架构演进与交接（2026-11-17）
+
+在完成 P0–P2 及全部复核修复的基础上，本阶段完成 P3 架构演进的两项结构重构，进一步消除长会话存储写放大并提升 CLI/Agent 可维护性。
+
+### 变更清单
+
+- **P3.1 `SessionStore` 追加式消息表（v5 Schema，自动兼容 v1–v4）**（[sessions.py](file:///Volumes/MX5002T/data/light-agent/termux_agent/sessions.py)、[cli.py](file:///Volumes/MX5002T/data/light-agent/termux_agent/cli.py)）：
+  - `snapshot()` 输出 `version: 5`，`restore()` 兼容读取 `version in (1, 2, 3, 4, 5)`；
+  - 移除一切 SQL 字符串正则改写、`sessions_v5_view` 与 `_SessionConnection`，`self.db` 恢复为原生 `sqlite3.connect(path, timeout=5)`，100% 原生兼容 `SELECT 'FROM sessions'`、`sessions.payload`、`main.sessions`、`"sessions"` 与 CTE `WITH q AS (...)` 等所有合法 SQL 查询；
+  - 保留 `sessions(id, title, updated, revision, payload)` 为真实表并写入完整序列化 JSON，同时维护 `session_messages(session_id, seq, message)` 追加式消息表：
+    - 写入侧通过表级 `AFTER INSERT`、`单一 AFTER UPDATE OF id, payload`（`sessions_sync_update_v2`，避免两个 `AFTER UPDATE` 触发器在同时改写 `id` 与缩短 `payload` 时因 LIFO 执行顺序残留旧尾部消息）及 `AFTER DELETE` 触发器（`_SESSIONS_SYNC_TRIGGERS_SQL`）增量比对同步 `session_messages`，仅删除缩容尾部并仅对新增或变更的尾部消息执行 `INSERT OR REPLACE`，未变更前缀行及其 `rowid` 保持不变；
+    - 为确保已打开的旧版 v1–v4 `SessionStore` 与直接执行 `SELECT payload FROM sessions` 的原生 SQLite 读取器同样读到完整历史，兼容契约决定在 `sessions.payload` 列继续保留完整 `messages` 数组（不置空为 `[]`）；
+  - 打开遗留 v1–v4 数据库时，`_init_schema()` / `_backfill_legacy_messages()` 在不修改或不删除 `sessions` 表的前提下将尚未拆分的历史消息回填到 `session_messages`；
+  - 新增 `_read_snapshot()` WAL 事务上下文管理器包裹 `load()`、`listing()`、`recall()`、`export()` 及 `cli.py:ReplController.load_session()` 的跨表读取，确保元数据与消息来自同一已提交 WAL 读快照，不被并发写入切裂。
+- **P3.2 `Agent` 计数器 Dataclass 与 `cli.py:main()` 控制器重构**（[agent.py](file:///Volumes/MX5002T/data/light-agent/termux_agent/agent.py)、[cli.py](file:///Volumes/MX5002T/data/light-agent/termux_agent/cli.py)）：
+  - 在 [agent.py](file:///Volumes/MX5002T/data/light-agent/termux_agent/agent.py) 中新增 `@dataclass class AgentCounters`（统一管理全部 30 项运行及 RTK 统计计数器，提供 `to_dict()` / `load_dict()`），并通过 `_CounterProperty` 数据描述符保持 `agent._total_calls` 等属性与 `agent.counters` 单一数据源双向同步；
+  - 在 [cli.py](file:///Volumes/MX5002T/data/light-agent/termux_agent/cli.py) 中将原 `main()` 内嵌闭包状态与命令分发重构为 `ReplController` 类（拆分 `_cmd_compact`、`_cmd_api`、`_cmd_agent`、`_cmd_skill`、`_cmd_session`、`_cmd_copy`、`_cmd_paste`、`_cmd_shell` 与 `_dispatch_prompt` / `run` / `close`），保持对模块级全局符号（`Agent`、`Client`、`SessionStore`、`snapshot`、`restore`、`_readline`、`sys`）的动态引用，兼容全部测试 Monkeypatch。
+
+### 验证记录
+
+- 新增 6 项 P3 专项测试（[tests/test_review_optimizations.py](file:///Volumes/MX5002T/data/light-agent/tests/test_review_optimizations.py)）：验证 `session_messages` 前缀 `rowid` 保留、同时修改 `id` 与缩短 `payload` 无旧尾部残留、WAL 并发写交错下 `load()` 单快照一致性、打开 v4 数据库回填且已打开的旧版 v4 连接可继续检查点与读取完整历史、原生 `sqlite3.connect` 与 6 类 SQL 语法/字面量兼容、`AgentCounters` 双向同步及 `ReplController` 命令分发；
+- P3 触发器更新探测 `trigger_update_probe.py`（针对当前工作区）：`payload_only: true`、`id_only: true`、`id_and_payload: true`，**3 / 3 全部通过**；
+- P3 SQL 兼容性复核探测 `sql_compatibility_probes.py`（针对当前工作区）：**10 / 10 全部通过**；
+- P3 持久化一致性探测 `persistence_probes.py`（针对当前工作区）：`load_returns_one_committed_snapshot: true`、`already_open_v4_writer_can_keep_checkpointing: true`，**2 / 2 全部通过**；
+- 在非 TTY 与独立真实路径 `TMPDIR` + 真实 `httpx 0.28.1` 环境下运行完整测试套件：`python -m unittest discover -s tests` **603 项全部通过（`OK`，耗时 28.745 秒，0 失败、0 跳过）**；
+- `tests.test_review_optimizations` **22 项全部通过**，`separator_probe.py` **通过**。
+- 注：macOS 默认系统 `TMPDIR=/var/folders/...` 含 `/var -> /private/var` 符号链接，运行涉及工作目录严格比对与 RTK 归档防符号链接校验的测试时需在无符号链接的真实临时目录（如 `/private/tmp` 或项目下独立临时目录）执行；网络请求均基于本地模拟传输层，未在 Termux 实机或真实外部提供商上运行。
