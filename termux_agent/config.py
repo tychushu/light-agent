@@ -2,12 +2,91 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import math
+import socket
 import tomllib
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
+
+
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+_LAN_HOST_SUFFIXES = (".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain")
+
+
+def _parse_numeric_ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    try:
+        resolved = socket.getaddrinfo(host, 0, flags=socket.AI_NUMERICHOST)
+    except OSError:
+        return None
+    for row in resolved:
+        addr = row[4][0].split("%", 1)[0]
+        try:
+            return ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+    return None
+
+
+def is_lan_or_local_url(url: str) -> bool:
+    """True for loopback, private/CGNAT IPs, localhost, and explicit LAN suffixes."""
+    host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    if not host:
+        return False
+    ip = _parse_numeric_ip(host.split("%", 1)[0])
+    if ip is not None:
+        return bool(
+            (ip.is_private or ip.is_loopback or ip.is_link_local
+             or (ip.version == 4 and ip in _CGNAT_NETWORK))
+            and not ip.is_global
+        )
+    if ":" in host:
+        return False
+    return host == "localhost" or host.endswith(_LAN_HOST_SUFFIXES)
+
+
+PROFILE_OVERRIDABLE_KEYS = frozenset({
+    "base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars",
+    "max_context_chars", "approval_policy", "timeout", "retry_thinking_400",
+    "retry_wait_budget", "retry_max_attempts", "retry_total_timeout",
+    "max_response_bytes", "max_subagents", "subagent_max_steps",
+    "web_fetch_enabled", "lightpanda_binary", "rtk_enabled", "rtk_binary",
+    "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations",
+    "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens",
+    "auto_extend_segments", "auto_resume", "auto_resume_max", "auto_resume_max_wait",
+    "auto_compact", "auto_compact_keep_turns", "auto_compact_task",
+    "auto_compact_keep_groups", "auto_compact_threshold", "tool_history_keep_groups",
+    "context_recovery", "no_progress_detection", "no_progress_threshold",
+    "context_window_tokens", "output_reserve_tokens", "max_output_tokens",
+    "chat_include_usage", "chat_max_tokens_field", "token_count_mode",
+    "token_cache_ttl", "token_metadata_base_url", "reasoning_effort",
+    "api_key_env",
+})
+TOP_LEVEL_VALID_KEYS = PROFILE_OVERRIDABLE_KEYS | frozenset({"default_api", "ui_language", "apis"})
+# ui_language stays ignored inside [apis.*] to preserve global-preference semantics.
+PROFILE_VALID_KEYS = PROFILE_OVERRIDABLE_KEYS | frozenset({"kind", "ui_language"})
+
+
+def validate_profile_keys(name: str, entry: dict[str, Any]) -> None:
+    """Reject unknown keys or plaintext api_key inside an API profile table."""
+    unknown = set(entry) - PROFILE_VALID_KEYS
+    if unknown:
+        if "api_key" in unknown:
+            raise ValueError(
+                f"API profile {name} must not store api_key in TOML; "
+                "set api_key_env and export the key in environment"
+            )
+        raise ValueError(
+            f"unknown configuration key(s) in API profile {name}: "
+            + ", ".join(sorted(unknown))
+        )
 
 
 @dataclass
@@ -86,15 +165,23 @@ class Config:
             raise ValueError(f"cannot read config {config_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ValueError("config must be a TOML table")
-        valid = {"base_url", "model", "max_steps", "max_output_chars", "max_input_file_chars", "max_context_chars", "approval_policy", "timeout", "retry_thinking_400", "retry_wait_budget", "retry_max_attempts", "max_subagents", "subagent_max_steps", "web_fetch_enabled", "lightpanda_binary", "rtk_enabled", "rtk_binary", "user_agent", "stream", "silent_writes", "auto_continue", "max_continuations", "wire_api", "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments", "auto_resume", "auto_resume_max", "auto_resume_max_wait", "auto_compact", "auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold", "tool_history_keep_groups", "context_recovery", "no_progress_detection", "no_progress_threshold", "context_window_tokens", "output_reserve_tokens", "max_output_tokens", "chat_include_usage", "chat_max_tokens_field", "token_count_mode", "token_cache_ttl", "token_metadata_base_url", "reasoning_effort"}
-        for key in valid & raw.keys():
+        unknown_top = set(raw) - TOP_LEVEL_VALID_KEYS
+        if unknown_top:
+            if "api_key" in unknown_top:
+                raise ValueError(
+                    "do not store api_key in TOML; set api_key_env and export the key in environment"
+                )
+            raise ValueError("unknown configuration key(s): " + ", ".join(sorted(unknown_top)))
+        for key in (PROFILE_OVERRIDABLE_KEYS - {"api_key_env"}) & raw.keys():
             setattr(config, key, raw[key])
         config.ui_language = raw.get('ui_language', 'zh')
-        config.retry_total_timeout = raw.get('retry_total_timeout', 0.0)
-        config.max_response_bytes = raw.get('max_response_bytes', config.max_response_bytes)
         from .api_profiles import ProfileStore
         store = ProfileStore(config_path)
         profiles = store.entries(raw)
+        for profile_name, profile_entry in profiles.items():
+            if not isinstance(profile_entry, dict):
+                raise ValueError(f"invalid API profile: {profile_name}")
+            validate_profile_keys(profile_name, profile_entry)
         selected = profile if profile is not None else store.get_default(raw, profiles)
         if not isinstance(selected, str):
             raise ValueError("default_api must be a profile name")
@@ -105,18 +192,7 @@ class Config:
             for required in ("base_url", "model"):
                 if required not in entry:
                     raise ValueError(f"API profile requires {required}")
-            profile_keys = ("base_url", "model", "timeout", "retry_wait_budget", "retry_max_attempts", "retry_total_timeout", "max_response_bytes",
-                            "user_agent", "stream", "max_context_chars", "wire_api", "max_steps",
-                            "max_task_calls", "max_task_seconds", "max_task_tokens", "auto_extend_segments",
-                            "auto_resume", "auto_resume_max", "auto_resume_max_wait",
-                            "auto_compact","auto_compact_keep_turns", "auto_compact_task", "auto_compact_keep_groups", "auto_compact_threshold",
-                            "tool_history_keep_groups",
-                            "context_recovery", "no_progress_detection", "no_progress_threshold",
-                            "context_window_tokens", "output_reserve_tokens", "max_output_tokens",
-                            "chat_include_usage", "chat_max_tokens_field", "token_count_mode",
-                            "token_cache_ttl", "token_metadata_base_url", "reasoning_effort",
-                            "rtk_enabled", "rtk_binary")
-            for key in profile_keys:
+            for key in PROFILE_OVERRIDABLE_KEYS - {"retry_thinking_400", "api_key_env"}:
                 if key in entry:
                     setattr(config, key, entry[key])
             # Retrying the known thinking-format error is opt-in per API profile.
@@ -209,6 +285,10 @@ class Config:
             raise ValueError("user_agent must be a single-line ASCII string")
         if not isinstance(self.base_url, str) or not self.base_url.startswith(("http://", "https://")):
             raise ValueError("base_url must be an http(s) URL")
+        if (self.api_kind == "cloud" and self.api_key
+                and self.base_url.lower().startswith("http://")
+                and not is_lan_or_local_url(self.base_url)):
+            raise ValueError("cloud API with an active api_key requires https://")
         if not isinstance(self.model, str) or not self.model.strip():
             raise ValueError("model must be a non-empty string")
         if not isinstance(self.profile_model, str):

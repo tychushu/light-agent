@@ -70,6 +70,8 @@ def _segment_reason(words, depth, cwd=None):
             paths = [arg]
             if arg.startswith('-') and '=' in arg:
                 paths.append(arg.split('=', 1)[1])
+            elif arg.startswith('-') and not arg.startswith('--') and len(arg) > 2:
+                paths.append(arg[2:])
             if any(_config_path(path, cwd) for path in paths):
                 return 'command accesses protected configuration or data'
     if name in ('sudo', 'su'):
@@ -84,7 +86,7 @@ def _segment_reason(words, depth, cwd=None):
         return 'shell script execution'
     if name in _SYSTEM_COMMANDS or name.startswith('mkfs'):
         return 'system, process, device, or filesystem operation'
-    if name == 'shred' or name == 'crontab' and any(arg.startswith('-') and 'r' in arg[1:] for arg in args):
+    if name in ('shred', 'unlink') or name == 'crontab' and any(arg.startswith('-') and 'r' in arg[1:] for arg in args):
         return 'destructive file or scheduled-task operation'
     if name == 'pm' and any(arg in ('uninstall', 'install', 'clear', 'disable', 'disable-user') for arg in args):
         return 'Android package operation'
@@ -95,14 +97,25 @@ def _segment_reason(words, depth, cwd=None):
         return 'recursive or broad deletion'
     if name == 'find' and any(arg in ('-delete', '-exec', '-execdir', '-ok', '-okdir') for arg in args):
         return 'find deletion or command execution'
-    if name == 'git' and (
-            'clean' in args and any(arg.startswith('-') and ('f' in arg or 'd' in arg) for arg in args) or
-            'reset' in args and '--hard' in args):
-        return 'destructive git operation'
-    if name == 'git' and 'push' in args and any(
-            arg.startswith(('--force', '+')) or arg.startswith('-') and not arg.startswith('--') and 'f' in arg[1:]
-            for arg in args):
-        return 'force push to a remote repository'
+    if name == 'git':
+        if (
+            ('clean' in args and any(arg.startswith('-') and ('f' in arg or 'd' in arg) for arg in args))
+            or ('reset' in args and '--hard' in args)
+            or ('checkout' in args and (
+                '--' in args[args.index('checkout') + 1:]
+                or any(arg in ('-f', '--force') for arg in args)))
+            or ('restore' in args and (
+                any(arg in ('-W', '--worktree') for arg in args)
+                or not any(arg in ('-S', '--staged') for arg in args)))
+            or ('stash' in args and any(arg in ('drop', 'clear') for arg in args))
+            or ('branch' in args and (
+                '-D' in args or ('--delete' in args and any(arg in ('-f', '--force') for arg in args))))
+        ):
+            return 'destructive git operation'
+        if 'push' in args and any(
+                arg.startswith(('--force', '+')) or arg.startswith('-') and not arg.startswith('--') and 'f' in arg[1:]
+                for arg in args):
+            return 'force push to a remote repository'
     if name == 'rsync' and any(arg.startswith('--delete') for arg in args):
         return 'synchronization with destination deletion'
     if (name in ('pkg', 'apt', 'apt-get', 'npm', 'pnpm', 'yarn', 'cargo', 'gem') or

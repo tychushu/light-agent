@@ -514,12 +514,18 @@ class Agent:
                     yield compact_context_messages(source, keep, archive_id,
                         keep_turns=self.config.auto_compact_keep_turns, reduce_answers=answers)
         source_chars = context_chars(source)
+        is_local_llama = str(token.get('source', '')).startswith('llama_cpp') and not self.history_only
+        seen_candidates: list[tuple[int, list[dict[str, Any]]]] = []
         for result, details in candidates():
-            if context_chars(result) >= source_chars:
+            result_chars = context_chars(result)
+            if result_chars >= source_chars:
                 continue
+            if any(prev_chars == result_chars and prev_result == result for prev_chars, prev_result in seen_candidates):
+                continue
+            seen_candidates.append((result_chars, result))
             after_chars, after_token, _ = self._context_budget(
                 self._request_messages(rules, messages=result),
-                allow_network=str(token.get('source', '')).startswith('llama_cpp'))
+                allow_network=is_local_llama)
             # Compare candidates with the same tokenizer when one was available.
             after_token['context_window_tokens'] = token.get('context_window_tokens')
             candidate_ratio = self._context_ratio(after_chars, after_token)
@@ -1522,18 +1528,19 @@ class Agent:
                                    'unit': 'characters fallback plus labeled token estimate/server count'}}
 
     def debug_context(self) -> dict[str, Any]:
+        from .security import active_secret_values, redact_text
         request = getattr(self.client, "last_request", None)
         if not isinstance(request, dict):
             request = {"messages": self.messages, "tools": self.tools}
         # A user might paste the configured key into a prompt; scrub it from debug.
-        key = getattr(self.config, "api_key", "")
+        secrets = active_secret_values((getattr(self.config, "api_key", ""),))
         def redact(value: Any) -> Any:
-            if isinstance(value, str) and key:
-                return value.replace(key, "[REDACTED]")
+            if isinstance(value, str):
+                return redact_text(value, secrets=secrets)
             if isinstance(value, dict):
                 return {k: redact(v) for k, v in value.items()}
             if isinstance(value, list):
                 return [redact(v) for v in value]
             return value
-        result = redact(request)
+        result = redact(request) if secrets else deepcopy(request)
         return hide_write_payloads(result) if self.config.silent_writes else result

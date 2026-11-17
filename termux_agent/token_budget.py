@@ -14,12 +14,24 @@ import httpx
 
 
 _WORD = re.compile(r"[A-Za-z0-9_]+|[^\s]", re.UNICODE)
+_ESTIMATE_CACHE: dict[str | tuple[int, bytes], int] = {}
+_ESTIMATE_CACHE_MAX = 512
+
+
+def _estimate_cache_key(text: str) -> str | tuple[int, bytes]:
+    if len(text) <= 4096:
+        return text
+    return (len(text), hashlib.sha256(text.encode("utf-8", "surrogatepass")).digest())
 
 
 def estimate_text_tokens(text: str) -> int:
     """Conservative, labeled heuristic; it never equates characters with tokens."""
     if not isinstance(text, str) or not text:
         return 0
+    key = _estimate_cache_key(text)
+    cached = _ESTIMATE_CACHE.get(key)
+    if cached is not None:
+        return cached
     total = 0
     for token in _WORD.findall(text):
         if token.isascii() and all(char.isalnum() or char == "_" for char in token):
@@ -28,7 +40,11 @@ def estimate_text_tokens(text: str) -> int:
             total += sum(1 if "\u3400" <= char <= "\u9fff" else 2 for char in token)
         else:
             total += 2
-    return math.ceil(total * 1.25) + 2
+    result = math.ceil(total * 1.25) + 2
+    if len(_ESTIMATE_CACHE) >= _ESTIMATE_CACHE_MAX:
+        _ESTIMATE_CACHE.pop(next(iter(_ESTIMATE_CACHE)))
+    _ESTIMATE_CACHE[key] = result
+    return result
 
 
 def _canonical(value: Any) -> bytes:
@@ -46,6 +62,7 @@ class TokenCounter:
         self.clock = clock
         self.cache_path = Path(cache_path) if cache_path else Path.home() / ".cache/termux-agent/token-metadata.json"
         self._memory: dict[str, Any] = {}
+        self._tool_token_cache: dict[tuple[str, bytes], int] = {}
 
     @property
     def _key(self) -> str:
@@ -102,6 +119,7 @@ class TokenCounter:
 
     def invalidate(self):
         self._memory.pop(self._key, None)
+        self._tool_token_cache.clear()
         try:
             data = json.loads(self.cache_path.read_text(encoding="utf-8"))
             data.get("entries", {}).pop(self._key, None)
@@ -186,12 +204,21 @@ class TokenCounter:
             count = len(tokens)
             tool_tokens = 0
             if tools:
-                tool_response = self._request("POST", "/tokenize",
-                                              json={"content": _canonical(tools).decode("utf-8"), "add_special": False})
-                values = tool_response.get("tokens") if isinstance(tool_response, dict) else None
-                if not isinstance(values, list):
-                    raise ValueError("local tokenizer returned no tool token array")
-                tool_tokens = len(values)
+                canonical_tools = _canonical(tools)
+                tool_cache_key = (self._key, canonical_tools)
+                cached_tool_tokens = self._tool_token_cache.get(tool_cache_key)
+                if cached_tool_tokens is not None:
+                    tool_tokens = cached_tool_tokens
+                else:
+                    tool_response = self._request("POST", "/tokenize",
+                                                  json={"content": canonical_tools.decode("utf-8"), "add_special": False})
+                    values = tool_response.get("tokens") if isinstance(tool_response, dict) else None
+                    if not isinstance(values, list):
+                        raise ValueError("local tokenizer returned no tool token array")
+                    tool_tokens = len(values)
+                    if len(self._tool_token_cache) >= 64:
+                        self._tool_token_cache.clear()
+                    self._tool_token_cache[tool_cache_key] = tool_tokens
         except (httpx.HTTPError, ValueError, TypeError, OSError) as exc:
             self._cache_write({**self._cache_read(), "metadata_checked": True,
                                "template_supported": template_supported, "tokenize_supported": False,

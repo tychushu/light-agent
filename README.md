@@ -32,7 +32,9 @@ ta --prompt 'Inspect the current directory'
 ## Configure APIs
 
 Create `~/.config/termux-agent/config.toml`. Global settings go **before** any
-`[apis.*]` table; profile settings override supported global options.
+`[apis.*]` table; profile settings override supported global options. Unknown or
+misplaced keys, `api_key` stored in TOML, and `cloud` profiles with an active
+credential over plaintext `http://` are rejected on load.
 
 ```toml
 default_api = "local"
@@ -239,7 +241,7 @@ and its draft, not project files.
 
 The four core tools are `shell`, `read_file`, `write_file`, and `edit_file`.
 Shell captures bounded output with process-group cleanup. File reads support
-one-based inclusive line ranges or byte windows. Writes create parent directories,
+one-based inclusive line ranges or byte windows and report an `eof` flag. Writes create parent directories,
 replace atomically, and verify on-disk hashes. `silent_writes = true` hides write
 bodies in tool displays while retaining the real protocol data and approvals.
 

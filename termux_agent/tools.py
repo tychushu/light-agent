@@ -685,8 +685,9 @@ def _read_file(args: dict, cap: int) -> dict:
             value = head.decode("utf-8", "replace") + "\n[TRUNCATED]\n" + tail.decode("utf-8", "replace")
             bytes_read = len(head) + len(tail)
     next_offset = selected_end if not truncated else offset + len(head)
+    eof = bool(not truncated and selected_end >= file_size)
     return {"content": value, "offset": offset, "bytes_read": bytes_read,
-            "truncated": truncated, "next_offset": next_offset}
+            "truncated": truncated, "next_offset": next_offset, "eof": eof}
 
 
 def _read_lines(path: Path, args: dict, cap: int) -> dict:
@@ -696,7 +697,7 @@ def _read_lines(path: Path, args: dict, cap: int) -> dict:
     end = int(args.get("end_line", start + 49))
     if start < 1 or end < start or end - start >= 5000:
         raise ValueError("line range must be ordered and no wider than 5000 lines")
-    out, used, line_no, last_line, truncated = [], 0, 0, 0, False
+    out, used, line_no, last_line, truncated, eof = [], 0, 0, 0, False, False
     with path.open("r", encoding="utf-8", errors="replace") as f:
         while line_no < start - 1:
             chunk = f.readline(8192)
@@ -707,6 +708,7 @@ def _read_lines(path: Path, args: dict, cap: int) -> dict:
         while line_no < end:
             chunk = f.readline(cap + 1)
             if not chunk:
+                eof = True
                 break
             line_no += 1
             too_long = len(chunk) > cap
@@ -731,11 +733,13 @@ def _read_lines(path: Path, args: dict, cap: int) -> dict:
             out.append(row)
             used += len(row)
             last_line = line_no
+        if not truncated and not eof:
+            eof = f.read(1) == ""
     value = "".join(out)
     if truncated and len(value) + len("[TRUNCATED]") <= cap:
         value += "[TRUNCATED]"
     return {"content": value, "start_line": start, "end_line": last_line or None,
-            "truncated": truncated, "next_line": last_line + 1 if last_line else start}
+            "truncated": truncated, "next_line": last_line + 1 if last_line else start, "eof": eof}
 
 
 def _write_file(args: dict) -> dict:

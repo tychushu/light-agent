@@ -164,12 +164,15 @@ def validate_archives(value):
 
 
 def scrub_keys(value, extra=()):
-    keys = {v for k, v in os.environ.items() if k.endswith('_API_KEY') and v}
-    keys.update(v for v in extra if v)
+    from .security import active_secret_values
+    keys = active_secret_values(extra)
+    if not keys:
+        return copy.deepcopy(value)
     def scrub(obj):
         if isinstance(obj, str):
             for key in keys:
-                obj = obj.replace(key, '[REDACTED]')
+                if key in obj:
+                    obj = obj.replace(key, '[REDACTED]')
             return obj
         if isinstance(obj, dict):
             return {k: scrub(v) for k, v in obj.items()}

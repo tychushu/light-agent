@@ -12,6 +12,41 @@ _KEY_NAMES = {'TERMUX_AGENT_API_KEY'}
 _FILES = set()
 _DIRECTORIES = set()
 MIN_ALIAS_SECRET_LENGTH = 16
+MIN_REDACT_SECRET_LENGTH = 4
+
+
+def is_secret_env_name(name: str) -> bool:
+    if not isinstance(name, str) or not name:
+        return False
+    if name in _KEY_NAMES:
+        return True
+    upper = name.upper()
+    return (upper in {'API_KEY', 'API_TOKEN', 'SECRET'}
+            or 'API_KEY' in upper or 'API_TOKEN' in upper
+            or upper.endswith('_SECRET') or '_SECRET' in upper)
+
+
+def active_secret_values(extra=(), *, min_env_length=MIN_REDACT_SECRET_LENGTH):
+    """Return non-empty secret values ordered longest-first for redaction."""
+    values = {
+        value for name, value in os.environ.items()
+        if is_secret_env_name(name) and isinstance(value, str) and len(value) >= min_env_length
+    }
+    values.update(
+        value for value in extra
+        if isinstance(value, str) and value
+    )
+    return tuple(sorted(values, key=lambda item: (-len(item), item)))
+
+
+def redact_text(text: str, extra=(), *, secrets=None) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    keys = active_secret_values(extra) if secrets is None else secrets
+    for key in keys:
+        if key in text:
+            text = text.replace(key, '[REDACTED]')
+    return text
 
 
 def register_key_names(names):

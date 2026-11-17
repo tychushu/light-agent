@@ -25,7 +25,7 @@ from .display_privacy import WRITE_TOOLS, hide_write_payloads, safe_tool_argumen
 from .approval import reason as approval_reason
 from .history import history_entry
 from .i18n import text as ui_text, help_text
-from .security import child_environment
+from .security import active_secret_values, child_environment, redact_text
 
 HELP = """/help           显示命令帮助（Show commands）
 Tab             补全命令、API 配置、会话 ID 和技能名称
@@ -139,15 +139,12 @@ def configure_readline(history_file=None):
 def save_readline_history():
     if not _readline or not _history_file:
         return
-    keys = {v for k, v in os.environ.items()
-            if any(part in k.upper() for part in ("API_KEY", "API_TOKEN", "_SECRET")) and len(v) >= 4}
+    secrets = active_secret_values()
     values = []
     for i in range(1, _readline.get_current_history_length() + 1):
         item = _readline.get_history_item(i)
         if item and _history_input(item):
-            for key in keys:
-                item = item.replace(key, "[REDACTED]")
-            values.append(item)
+            values.append(redact_text(item, secrets=secrets))
     temp = _history_file.with_name(_history_file.name + ".tmp")
     try:
         temp.touch(mode=0o600, exist_ok=True)
@@ -253,7 +250,7 @@ def main():
     cli_commands = tuple(dict.fromkeys((*COMMANDS, "/resume")))
 
     def redact(text):
-        return text.replace(config.api_key, "[REDACTED]") if config.api_key else text
+        return redact_text(text, (config.api_key,))
 
     def display(value, role="Info", stamp=None):
         text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
@@ -806,13 +803,14 @@ def main():
         session_id, revision = identifier, next_revision
         active_branch = active
         branch_state = dict(payload.get('branch') or {'kind': 'active'})
+        current_snap = snapshot(replacement, current_scope(), branch=branch_state)
         if active_branch:
             loaded_row = None
             source_fingerprint = None
         else:
             source_meta = {'title': loaded_row[0], 'updated': loaded_row[1], 'revision': loaded_row[2]}
-            source_fingerprint = payload_fingerprint(snapshot(replacement, current_scope()))
-        saved_fingerprint = payload_fingerprint(snapshot(replacement, current_scope(), branch=branch_state))
+            source_fingerprint = payload_fingerprint({k: v for k, v in current_snap.items() if k != 'branch'})
+        saved_fingerprint = payload_fingerprint(current_snap)
         replacement.archive_id = identifier
         reset_session_io()
         registry = SkillRegistry()

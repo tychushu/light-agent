@@ -51,6 +51,11 @@ class ProfileStore:
         if not isinstance(original, dict):
             raise ValueError("apis must be a TOML table")
         merged = dict(original)
+        for name, entry in merged.items():
+            if not isinstance(entry, dict):
+                raise ValueError(f"invalid API profile: {name}")
+            from .config import validate_profile_keys
+            validate_profile_keys(name, entry)
         if self.folder.is_dir():
             for file in sorted(self.folder.glob("*.toml")):
                 if file.is_symlink():
@@ -65,6 +70,8 @@ class ProfileStore:
                     raise ValueError(f"cannot read API profile {name}: {exc}") from exc
                 if not isinstance(value, dict):
                     raise ValueError(f"invalid API profile: {name}")
+                from .config import validate_profile_keys
+                validate_profile_keys(name, value)
                 merged[name] = value
         return merged
 
@@ -116,6 +123,11 @@ class ProfileStore:
             kind = self.kind_for(base_url)
         if kind not in ("local", "cloud") or not isinstance(stream, bool):
             raise ValueError("kind must be local/cloud and stream must be boolean")
+        from .config import is_lan_or_local_url
+        if (kind == "cloud" and api_key_env
+                and base_url.lower().startswith("http://")
+                and not is_lan_or_local_url(base_url)):
+            raise ValueError("cloud API with an active api_key_env requires https://")
         if timeout is not None and (not isinstance(timeout, (int, float)) or
                                     isinstance(timeout, bool) or not 0 < timeout <= 3600):
             raise ValueError("timeout must be between 0 and 3600 seconds")
