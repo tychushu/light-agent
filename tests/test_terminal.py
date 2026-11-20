@@ -150,6 +150,69 @@ class TerminalTests(unittest.TestCase):
         self.assertEqual(result['memory'], expected)
         self.assertEqual(result['saved'], expected)
 
+    def test_new_management_inputs_stay_out_of_persisted_history(self):
+        from pathlib import Path
+
+        def setup(home):
+            (Path(home) / 'config.toml').write_text(
+                'base_url="http://127.0.0.1:9/v1"\nmodel="fixture"\napi_key_env=""\ntoken_count_mode="off"\n',
+                encoding='utf-8',
+            )
+
+        code_main = dedent('''
+            import json, pathlib, readline, sys
+            from termux_agent.cli import main
+
+            home = pathlib.Path.home()
+            sys.argv = ["ta", "--no-session", "--no-agent", "--config", str(home / "config.toml"), "--directory", str(home)]
+            main()
+            memory = [readline.get_history_item(i) for i in range(1, readline.get_current_history_length() + 1)]
+            p = home / ".local/share/termux-agent/repl_history"
+            raw = p.read_bytes()
+            readline.clear_history()
+            try:
+                readline.read_history_file(str(p))
+                saved = [readline.get_history_item(i) for i in range(1, readline.get_current_history_length() + 1)]
+            except OSError:
+                # macOS libedit raises OSError/PermissionError when loading a 0-entry history file.
+                saved = None
+            print("RESULT=" + json.dumps({"memory": memory, "saved": saved, "raw_hex": raw.hex()}))
+        ''')
+        prompt = "You     │ ".encode()
+        text = self.exchange(code_main, [(prompt, b'/\n'), (prompt, b'/resum\n'), (prompt, b'/exit\n')], setup=setup)
+        res = json.loads(re.search(r'RESULT=({.*})', text).group(1))
+        self.assertEqual(res['memory'], [])
+        if res['saved'] is not None:
+            self.assertEqual(res['saved'], [])
+        raw_bytes = bytes.fromhex(res['raw_hex'])
+        self.assertIn(raw_bytes, (b'', b'_HiStOrY_V2_\n'))
+
+        code_mixed = dedent('''
+            import json, pathlib, readline
+            from termux_agent.cli import configure_readline, read_prompt, save_readline_history
+
+            p = pathlib.Path.home() / ".local/share/termux-agent/repl_history"
+            p.parent.mkdir(parents=True)
+            for value in ["/", "/resum", "old task"]:
+                readline.add_history(value)
+            readline.write_history_file(str(p))
+            readline.clear_history()
+            assert configure_readline(p)
+            read_prompt("p1> ")
+            read_prompt("p2> ")
+            read_prompt("p3> ")
+            save_readline_history()
+            memory = [readline.get_history_item(i) for i in range(1, readline.get_current_history_length() + 1)]
+            readline.clear_history()
+            readline.read_history_file(str(p))
+            saved = [readline.get_history_item(i) for i in range(1, readline.get_current_history_length() + 1)]
+            print("MIXED=" + json.dumps({"memory": memory, "saved": saved}))
+        ''')
+        mixed_text = self.exchange(code_mixed, [(b'p1> ', b'/\n'), (b'p2> ', b'/resum\n'), (b'p3> ', b'new task\n')])
+        mixed = json.loads(re.search(r'MIXED=({.*})', mixed_text).group(1))
+        self.assertEqual(mixed['memory'], ['old task', 'new task'])
+        self.assertEqual(mixed['saved'], ['old task', 'new task'])
+
     def test_triple_quote_and_backslash_multiline_input(self):
         code = ('from termux_agent.cli import configure_readline,read_prompt; import json; '
                 'assert configure_readline(); print("RESULT="+json.dumps(read_prompt("ta> "))); '

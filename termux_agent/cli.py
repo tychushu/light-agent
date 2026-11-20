@@ -1,6 +1,7 @@
 """Plain terminal REPL; no terminal UI framework."""
 import argparse
 import copy
+import difflib
 import hashlib
 import json
 import sys
@@ -27,42 +28,31 @@ from .history import history_entry
 from .i18n import text as ui_text, help_text
 from .security import active_secret_values, child_environment, redact_text
 
-HELP = """/help           显示命令帮助（Show commands）
+HELP = """[常用对话与任务]
+/               显示极简高频速查卡（按需展开）
+/help [TOPIC|CMD]  显示命令帮助（Show commands；按 TOPIC 或命令过滤）
 Tab             补全命令、API 配置、会话 ID 和技能名称
 ~/path 或 /path  补全本地路径；回车将 UTF-8 文本文件内容提交给模型
+/continue [N]   从检查点继续同一任务，开始一个新的受控模型调用段
+continue/resume  未完成任务的简短续跑输入；不新建任务，引号内文字按原文发送
+/run TASK       连续执行已授权任务，直到完成、阻塞或达到上限
+/sub TASK       直接委派一个子任务；/sub 查看执行上限
 /clear          新建空白会话，保留原会话历史
 /compact [N]    自动精简跨轮次历史，保留用户指令；指定 N 则只保留最近 N 轮
 /compact task [N]  压缩当前单任务工具链；保留最近 N 个完整工具组，不调用模型
-/continue [N]   从检查点继续同一任务，开始一个新的受控模型调用段
-continue/resume  未完成任务的简短续跑输入；不新建任务，引号内文字按原文发送
 /status         查看上次停止原因和继续方式
-/recall TEXT    在已保存会话正文和工具参数中检索，最多显示 20 个会话
-/export [ID] [markdown|json] [PATH]  导出会话；默认当前会话、Markdown、新文件
-/stats          查看模型调用、RTK 应用后 UTF-8 字节/字符节省（非 token）、服务端 token 用量和上下文大小
-/config         查看当前生效配置，不显示密钥
-/debug          开关请求用量和工具结果的调试显示
-/debug-context  查看上次请求的消息和工具，密钥会脱敏
-/silent [on|off]  开关写入、编辑和委派参数的静默显示
-/auto [on|off|steps N]  开关自动连续执行，或设置模型调用上限
-/run TASK       连续执行已授权任务，直到完成、阻塞或达到上限
-/api [name|number|next]  列出或切换 API 配置；切换后新建会话
-/api models [NAME]  动态查询指定 API 的可用模型；默认当前 API
-/api model [ID|N] [NAME]  选用模型并新建会话；序号使用最近一次模型列表
-/api add NAME URL MODEL [KEY_ENV] [local|cloud]  添加 API 配置
-/api default NAME   设置以后启动时默认使用的 API 配置
-/api show NAME      查看指定 API 配置，不显示密钥
-/api remove NAME    删除通过 /api add 添加的 API 配置
-/agent [path|off|directory|reload]  选择或重载目录/会话 agent.md；新建会话
-/skill list|info|load|unload|clear   列出、查看、手动加载、卸载或清空技能
-/copy [text]    复制指定文字或最后一次回答到 Android 剪贴板
-/paste          显示 Android 剪贴板文字
-!command        直接运行 Shell，不调用模型；审批规则仍生效
+/exit           保存当前会话并退出
+
+[会话管理]
 /sessions [N]   列出会话及 API / 模型，折叠旧压缩链；默认 50，最多 500
 /sessions all [N]  展开旧版压缩分支
 /sessions find TEXT  按标题关键词查找已保存会话
 /resume [ID|N]  恢复会话；N 使用最后一次会话列表中的序号
 /resume         列出最近 50 个会话，TTY 中可直接选择序号或 ID
 /title [NAME]   查看或修改当前会话标题，无需调用模型
+/history [N] [skip]  查看最近 N 条消息，skip 可向前翻页
+/recall TEXT    在已保存会话正文和工具参数中检索，最多显示 20 个会话
+/export [ID] [markdown|json] [PATH]  导出会话；默认当前会话、Markdown、新文件
 /session        查看当前会话 ID、标题和保存状态
 /session new [NAME]  新建空白会话，可指定标题
 /session load ID|N   恢复会话；N 使用最后一次列表序号，原 API 失效时进入历史查看模式
@@ -73,11 +63,63 @@ continue/resume  未完成任务的简短续跑输入；不新建任务，引号
 /session archives [ID|N]  列出会话的压缩归档
 /session archive ARCHIVE_ID  查看压缩前快照的最近消息；完整内容可用 /export 导出
 /session delete [ID|N]  按列表序号或 ID 删除；不带参数进入选择，需确认
-/history [N] [skip]  查看最近 N 条消息，skip 可向前翻页
-/sub TASK       直接委派一个子任务；/sub 查看执行上限
-/exit           保存当前会话并退出
+
+[API 与模型]
+/api [name|number|next]  列出或切换 API 配置（TTY 支持序号选择）；切换后新建会话
+/model [ID|N] [NAME]  查询并一步选择可用模型（合并 /api models 与 /api model）
+/api models [NAME]  动态查询指定 API 的可用模型；默认当前 API
+/api model [ID|N] [NAME]  选用模型并新建会话；序号使用最近一次模型列表
+/api add NAME URL MODEL [KEY_ENV] [local|cloud]  添加 API 配置
+/api default NAME   设置以后启动时默认使用的 API 配置
+/api show NAME      查看指定 API 配置，不显示密钥
+/api remove NAME    删除通过 /api add 添加的 API 配置
+
+[开关、技能与工具]
+/set [auto|steps|silent|debug]  查看或交互调整 auto/steps/silent/debug 运行开关
+/auto [on|off|steps N]  开关自动连续执行，或设置模型调用上限
+/silent [on|off]  开关写入、编辑和委派参数的静默显示
+/debug          开关请求用量和工具结果的调试显示
+/skill          TTY 编号列表并一键切换技能加载/卸载
+/skill list|info|load|unload|clear   列出、查看、手动加载、卸载或清空技能（支持序号）
+/agent [path|off|directory|reload]  选择或重载目录/会话 agent.md；新建会话
+/stats          查看模型调用、RTK 应用后 UTF-8 字节/字符节省（非 token）、服务端 token 用量和上下文大小
+/config         查看当前生效配置，不显示密钥
+/debug-context  查看上次请求的消息和工具，密钥会脱敏
+/copy [text]    复制指定文字或最后一次回答到 Android 剪贴板
+/paste          显示 Android 剪贴板文字
+!command        直接运行 Shell，不调用模型；审批规则仍生效
 KEY_ENV 是密钥环境变量名；NAME / ID / TEXT 等是需要替换的参数。
 """
+
+QUICK_MENU = (
+    '常用命令速查（/help 查看全部，/help TOPIC 按组查看）：\n'
+    '  任务与对话: /continue [N] · /compact [N|task] · /clear · /status · /exit\n'
+    '  会话管理  : /sessions · /resume [N|ID] · /title [NAME] · /recall TEXT · /export\n'
+    '  模型与 API: /api [N|NAME] · /model [N|ID] · /agent [path|off|reload]\n'
+    '  开关与技能: /set [auto|steps|silent|debug] · /skill [N] · /stats · /config\n'
+    '  本地交互  : !shell · ~/path (提交文本) · Tab 补全'
+)
+
+HELP_SECTIONS = {
+    'task': '[常用对话与任务]',
+    'chat': '[常用对话与任务]',
+    '任务': '[常用对话与任务]',
+    '对话': '[常用对话与任务]',
+    'session': '[会话管理]',
+    'sessions': '[会话管理]',
+    '会话': '[会话管理]',
+    'api': '[API 与模型]',
+    'model': '[API 与模型]',
+    'models': '[API 与模型]',
+    '模型': '[API 与模型]',
+    'set': '[开关、技能与工具]',
+    'skill': '[开关、技能与工具]',
+    'skills': '[开关、技能与工具]',
+    'tools': '[开关、技能与工具]',
+    '开关': '[开关、技能与工具]',
+    '技能': '[开关、技能与工具]',
+    '工具': '[开关、技能与工具]',
+}
 
 
 _readline = None
@@ -90,10 +132,28 @@ BARE_COMMANDS = {name: '/' + name for name in (
 )}
 
 
+def _is_unknown_slash_command(value, commands=COMMANDS):
+    value = value.strip()
+    if not value or value == '/':
+        return False
+    first_token = value.split(maxsplit=1)[0]
+    if (not value.startswith('/')
+            or first_token in commands
+            or '/' in first_token[1:]
+            or '.' in first_token):
+        return False
+    try:
+        return not Path(first_token).exists()
+    except OSError:
+        return True
+
+
 def _history_input(value):
     value = value.strip()
     return bool(value) and not (
-        value.split(maxsplit=1)[0] in COMMANDS
+        value == '/'
+        or value.split(maxsplit=1)[0] in COMMANDS
+        or _is_unknown_slash_command(value, COMMANDS)
         or value.lower() in BARE_COMMANDS
         or value.startswith('!')
     )
@@ -191,8 +251,8 @@ class ReplController:
 
     _HISTORY_ALLOWED_COMMANDS = (
         '/help', '/sessions', '/session', '/resume', '/history', '/stats', '/status',
-        '/config', '/debug', '/debug-context', '/silent', '/api', '/title',
-        '/recall', '/export', '/copy', '/paste', '/exit',
+        '/config', '/debug', '/debug-context', '/silent', '/api', '/model', '/set',
+        '/title', '/recall', '/export', '/copy', '/paste', '/exit',
     )
 
     def __init__(self, options, *, language, config_path, directory, session_file, disabled,
@@ -223,6 +283,7 @@ class ReplController:
         self.branch_state = {'kind': 'active'}
         self.formatter = Columns(sys.stdout, enabled=sys.stdout.isatty() and options.prompt is None)
         self.last_session_ids = ()
+        self.last_skill_names = ()
         self.model_catalog = None
         self.cli_commands = tuple(dict.fromkeys((*COMMANDS, "/resume")))
         self.session_id = new_id()
@@ -560,6 +621,7 @@ class ReplController:
     def reset_session_io(self):
         self.stream_draft, self.draft_saved_at, self.read_grant = {}, 0.0, False
         self.model_catalog = None
+        self.last_skill_names = ()
         self.tool_started.clear()
 
     def reset_session_tracking(self, branch=None):
@@ -904,6 +966,193 @@ class ReplController:
         except (ValueError, OSError, KeyError, sqlite3.Error) as exc:
             self.display(self.tr('Error: {v0}', v0=exc))
 
+    def _interactive_tty(self):
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+
+    def _cmd_quick_menu(self):
+        self.display(self.tr(QUICK_MENU))
+
+    def _cmd_help(self, value):
+        full = help_text(HELP, self.language)
+        topic = value.strip()
+        if not topic or topic.lower() in ('all', '全部'):
+            self.display(full)
+            return
+        section_key = HELP_SECTIONS.get(topic.lower())
+        if section_key and not topic.startswith('/'):
+            target_header = help_text(section_key, self.language).strip()
+            lines = full.splitlines()
+            selected = []
+            collecting = False
+            for line in lines:
+                if line == target_header:
+                    collecting = True
+                    selected.append(line)
+                elif collecting:
+                    if line.startswith('[') or line.startswith('KEY_ENV '):
+                        break
+                    selected.append(line)
+            if selected:
+                self.display('\n'.join(selected).strip() + '\n')
+                return
+        cmd_prefix = '/' + topic.lstrip('/').lower()
+        matched = [
+            line for line in full.splitlines()
+            if line.strip() and line.strip().split(maxsplit=1)[0].lower().startswith(cmd_prefix)
+        ]
+        if matched:
+            self.display('\n'.join(matched) + '\n')
+            return
+        self.display(self.tr('未找到匹配的帮助主题或命令：{v0}（可用：task、session、api、model、skill、set、tools）', v0=topic))
+
+    def _report_unknown_command(self, first_token):
+        suggestions = difflib.get_close_matches(first_token, self.cli_commands, n=3, cutoff=0.55)
+        if suggestions:
+            self.display(
+                self.tr('未知命令 {v0}；你是不是想输入：{v1}（输入 / 或 /help 查看命令）',
+                        v0=first_token, v1=', '.join(suggestions)),
+                'Input',
+            )
+        else:
+            self.display(self.tr('未知命令 {v0}；输入 / 或 /help 查看命令。', v0=first_token), 'Input')
+
+    def _switch_api_selection(self, target_expr, rows):
+        persist = target_expr.startswith("default ")
+        names = [row["name"] for row in rows]
+        name = target_expr[8:].strip() if persist else target_expr.removeprefix("switch ").strip()
+        if name in ("next", "prev"):
+            if not names:
+                raise ValueError(self.tr('No named API profiles configured'))
+            index = names.index(self.config.api_profile) if self.config.api_profile in names else (
+                -1 if name == "next" else 0)
+            name = names[(index + (1 if name == "next" else -1)) % len(names)]
+        elif name.isdigit():
+            number = int(name)
+            if not 1 <= number <= len(names):
+                raise ValueError(self.tr('API number is not in /api list'))
+            name = names[number - 1]
+        switched = self.switch_api(name, persist)
+        self.display({"api": name, "switched": switched, "default": self.profile_store.get_default()})
+
+    def _cmd_model(self, value):
+        try:
+            arg = value.strip()
+            if not arg or arg == 'list' or arg.startswith('list '):
+                api_name = arg[4:].strip() if arg.startswith('list') else ''
+                target = api_name or self.config.api_profile
+                self.show_models(target)
+                if not self._interactive_tty() or not (self.model_catalog and self.model_catalog[1]):
+                    return
+                try:
+                    choice = input(self.tr('选择模型序号或 ID（回车取消）：')).strip()
+                except (EOFError, KeyboardInterrupt):
+                    self.display(self.tr('已取消模型选择。'))
+                    return
+                if not choice:
+                    self.display(self.tr('已取消模型选择。'))
+                    return
+                switched = self.select_model(choice)
+                self.display({'api': self.config.api_profile, 'model': self.config.model,
+                              'switched': switched, 'session': self.session_id}, 'Models')
+                return
+            switched = self.select_model(arg)
+            self.display({'api': self.config.api_profile, 'model': self.config.model,
+                          'switched': switched, 'session': self.session_id}, 'Models')
+        except (ValueError, OSError, sqlite3.Error, ClientError) as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+
+    def _set_summary(self):
+        return {
+            "auto": self.config.auto_continue,
+            "steps": self.config.max_steps,
+            "silent": self.config.silent_writes,
+            "debug": self.debug,
+        }
+
+    def _apply_setting(self, expr):
+        parts = expr.split()
+        if not parts:
+            return False
+        key = parts[0].lower()
+        arg = parts[1].lower() if len(parts) == 2 else None
+        if len(parts) > 2:
+            raise ValueError(self.tr('Use /set [auto|steps N|silent|debug] [on|off]'))
+        if key in ('1', 'auto'):
+            if arg is None:
+                self.config.auto_continue = not self.config.auto_continue
+            elif arg in ('on', 'off'):
+                self.config.auto_continue = arg == 'on'
+            else:
+                raise ValueError(self.tr('Use /set [auto|steps N|silent|debug] [on|off]'))
+        elif key in ('2', 'steps'):
+            if arg is None:
+                if key == '2' and self._interactive_tty():
+                    try:
+                        entered = input(self.tr('输入 max_steps（1–256，回车取消）：')).strip()
+                    except (EOFError, KeyboardInterrupt):
+                        return False
+                    if not entered:
+                        return False
+                    arg = entered
+                else:
+                    raise ValueError(self.tr('Use /set [auto|steps N|silent|debug] [on|off]'))
+            count = int(arg)
+            if not 1 <= count <= 256:
+                raise ValueError(self.tr('Automatic request limit must be 1–256'))
+            self.config.max_steps = count
+        elif key in ('3', 'silent'):
+            if arg is None:
+                self.config.silent_writes = not self.config.silent_writes
+            elif arg in ('on', 'off'):
+                self.config.silent_writes = arg == 'on'
+            else:
+                raise ValueError(self.tr('Use /set [auto|steps N|silent|debug] [on|off]'))
+        elif key in ('4', 'debug'):
+            if arg is None:
+                self.debug = not self.debug
+            elif arg in ('on', 'off'):
+                self.debug = arg == 'on'
+            else:
+                raise ValueError(self.tr('Use /set [auto|steps N|silent|debug] [on|off]'))
+        else:
+            raise ValueError(self.tr('Use /set [auto|steps N|silent|debug] [on|off]'))
+        return True
+
+    def _cmd_set(self, value):
+        try:
+            arg = value.strip()
+            if not arg:
+                if not self._interactive_tty():
+                    self.display(self._set_summary(), 'Settings')
+                    return
+                on_text = self.tr('开启')
+                off_text = self.tr('关闭')
+                lines = [
+                    self.tr('当前运行开关（1=auto, 2=steps, 3=silent, 4=debug）：'),
+                    f'  1 auto   : {on_text if self.config.auto_continue else off_text}',
+                    f'  2 steps  : {self.config.max_steps}',
+                    f'  3 silent : {on_text if self.config.silent_writes else off_text}',
+                    f'  4 debug  : {on_text if self.debug else off_text}',
+                ]
+                self.display('\n'.join(lines), 'Settings')
+                try:
+                    choice = input(self.tr('输入序号切换，或输入 steps N / 键 值（回车取消）：')).strip()
+                except (EOFError, KeyboardInterrupt):
+                    self.display(self.tr('已取消设置调整。'))
+                    return
+                if not choice:
+                    self.display(self.tr('已取消设置调整。'))
+                    return
+                if not self._apply_setting(choice):
+                    self.display(self.tr('已取消设置调整。'))
+                    return
+                self.display(self._set_summary(), 'Settings')
+                return
+            self._apply_setting(arg)
+            self.display(self._set_summary(), 'Settings')
+        except ValueError as exc:
+            self.display(self.tr('Error: {v0}', v0=exc))
+
     def _cmd_api(self, value):
         try:
             rows = self.profile_store.list()
@@ -914,9 +1163,28 @@ class ReplController:
                 switched = self.select_model(choice) if choice else False
                 self.display({'api': self.config.api_profile, 'model': self.config.model,
                               'switched': switched, 'session': self.session_id}, 'Models')
-            elif not value or value == "list":
+            elif value == "list" or (not value and not self._interactive_tty()):
                 self.display({"current": self.config.api_profile, "default": self.profile_store.get_default(),
                               "profiles": [{"number": i, **row} for i, row in enumerate(rows, 1)]})
+            elif not value:
+                default_name = self.profile_store.get_default() or self.config.api_profile
+                lines = [self.tr('可用 API 配置（默认：{v0}）：', v0=default_name)]
+                for i, row in enumerate(rows, 1):
+                    mark = '*' if row["name"] == self.config.api_profile else ' '
+                    suffix = ' [default]' if row["name"] == default_name else ''
+                    lines.append(f'  {i:>2} {mark} {row["name"]} ({row["kind"]}) · {row["model"]}{suffix}')
+                self.display('\n'.join(lines), 'API')
+                if not rows:
+                    return
+                try:
+                    choice = input(self.tr('选择 API 序号或名称（输入 default X 设默认，回车取消）：')).strip()
+                except (EOFError, KeyboardInterrupt):
+                    self.display(self.tr('已取消 API 选择。'))
+                    return
+                if not choice:
+                    self.display(self.tr('已取消 API 选择。'))
+                    return
+                self._switch_api_selection(choice, rows)
             elif value.startswith("add "):
                 parts = shlex.split(value[4:])
                 flags = [part for part in parts if part.startswith("--")]
@@ -965,23 +1233,7 @@ class ReplController:
                 backup = self.profile_store.remove(name)
                 self.display({"removed": name, "backup": str(backup)})
             else:
-                persist = value.startswith("default ")
-                names = [row["name"] for row in rows]
-                name = value[8:].strip() if persist else value.removeprefix("switch ").strip()
-                if name in ("next", "prev"):
-                    if not names:
-                        raise ValueError(self.tr('No named API profiles configured'))
-                    index = names.index(self.config.api_profile) if self.config.api_profile in names else (
-                        -1 if name == "next" else 0)
-                    name = names[(index + (1 if name == "next" else -1)) % len(names)]
-                elif name.isdigit():
-                    number = int(name)
-                    if not 1 <= number <= len(names):
-                        raise ValueError(self.tr('API number is not in /api list'))
-                    name = names[number - 1]
-                switched = self.switch_api(name, persist)
-                self.display({"api": name, "switched": switched,
-                              "default": self.profile_store.get_default()})
+                self._switch_api_selection(value, rows)
         except (ValueError, OSError, sqlite3.Error, ClientError) as exc:
             self.display(self.tr('Error: {v0}', v0=exc))
 
@@ -1005,48 +1257,109 @@ class ReplController:
         except (ValueError, OSError, sqlite3.Error) as exc:
             self.display(self.tr('Error: {v0}', v0=exc))
 
+    def _resolve_skill_name(self, token):
+        target = token.strip()
+        if not target:
+            return ''
+        if target in self.agent.active_skills:
+            return target
+        if target.isascii() and target.isdigit():
+            skills = self.registry.list_skills()
+            if any(skill.name == target for skill in skills):
+                return target
+            names = self.last_skill_names or tuple(skill.name for skill in skills)
+            if not names:
+                raise ValueError(self.tr('未发现可用技能。'))
+            if not self.last_skill_names:
+                self.last_skill_names = names
+            index = int(target)
+            if not 1 <= index <= len(names):
+                raise ValueError(self.tr('技能序号超出列表范围。'))
+            return names[index - 1]
+        return target
+
+    def _apply_skill_change(self, mutator):
+        previous = self.agent.get_active_skills()
+        mutator()
+        try:
+            self.save_current(force=True)
+        except Exception:
+            self.agent.clear_skills()
+            for active_name, content in previous.items():
+                self.agent.load_skill(active_name, content)
+            raise
+
+    def _toggle_skill(self, target):
+        resolved = self._resolve_skill_name(target)
+        active = self.agent.get_active_skills()
+        if resolved in active:
+            self._apply_skill_change(lambda: self.agent.unload_skill(resolved))
+            self.display(self.tr('Unloaded {v0}.', v0=resolved))
+        else:
+            skill, body = self.registry.load(resolved)
+            self._apply_skill_change(lambda: self.agent.load_skill(skill.name, body))
+            self.display(self.tr('Loaded {v0} into this session.', v0=skill.name))
+
     def _cmd_skill(self, prompt):
         try:
             parts = prompt.split(maxsplit=2)
-            action = parts[1] if len(parts) > 1 else "list"
+            if len(parts) == 1:
+                skills = self.registry.list_skills()
+                self.last_skill_names = tuple(skill.name for skill in skills)
+                active = self.agent.get_active_skills()
+                if not self._interactive_tty():
+                    self.display([{"name": skill.name, "active": skill.name in active,
+                                   "description": skill.description} for skill in skills])
+                    return
+                if not skills:
+                    self.display(self.tr('未发现可用技能。'))
+                    return
+                lines = [self.tr('可用技能（[x] 已激活）：')]
+                for idx, skill in enumerate(skills, 1):
+                    mark = 'x' if skill.name in active else ' '
+                    desc = f' · {skill.description}' if skill.description else ''
+                    lines.append(f'  {idx:>2} [{mark}] {skill.name}{desc}')
+                self.display('\n'.join(lines), 'Skills')
+                try:
+                    choice = input(self.tr('输入技能序号或名称切换加载/卸载（回车取消）：')).strip()
+                except (EOFError, KeyboardInterrupt):
+                    self.display(self.tr('已取消技能操作。'))
+                    return
+                if not choice:
+                    self.display(self.tr('已取消技能操作。'))
+                    return
+                self._toggle_skill(choice)
+                return
+            action = parts[1]
             name = parts[2] if len(parts) > 2 else ""
-            if action == "list":
+            if len(parts) == 2 and action.isascii() and action.isdigit():
+                self._toggle_skill(action)
+            elif action == "list":
+                skills = self.registry.list_skills()
+                self.last_skill_names = tuple(skill.name for skill in skills)
                 active = self.agent.get_active_skills()
                 self.display([{"name": skill.name, "active": skill.name in active,
-                               "description": skill.description} for skill in self.registry.list_skills()])
+                               "description": skill.description} for skill in skills])
             elif action == "info" and name:
-                skill = self.registry.find(name)
+                target = self._resolve_skill_name(name)
+                skill = self.registry.find(target)
                 self.display({"name": skill.name, "description": skill.description, "path": str(skill.path),
-                              "active": name in self.agent.active_skills})
+                              "active": target in self.agent.active_skills})
             elif action == "load" and name:
-                skill, body = self.registry.load(name)
-                previous = self.agent.get_active_skills()
-                self.agent.load_skill(skill.name, body)
-                try:
-                    self.save_current(force=True)
-                except Exception:
-                    self.agent.clear_skills()
-                    for active_name, content in previous.items():
-                        self.agent.load_skill(active_name, content)
-                    raise
+                target = self._resolve_skill_name(name)
+                skill, body = self.registry.load(target)
+                self._apply_skill_change(lambda: self.agent.load_skill(skill.name, body))
                 self.display(self.tr('Loaded {v0} into this session.', v0=skill.name))
             elif action in ("unload", "clear"):
                 if action == "unload" and not name:
                     raise ValueError(self.tr('Use /skill unload NAME'))
-                previous = self.agent.get_active_skills()
                 if action == "clear":
-                    self.agent.clear_skills()
+                    self._apply_skill_change(self.agent.clear_skills)
+                    self.display(self.tr('Active skills cleared.'))
                 else:
-                    self.agent.unload_skill(name)
-                try:
-                    self.save_current(force=True)
-                except Exception:
-                    self.agent.clear_skills()
-                    for active_name, content in previous.items():
-                        self.agent.load_skill(active_name, content)
-                    raise
-                self.display(self.tr('Active skills cleared.') if action == "clear"
-                             else self.tr('Unloaded {v0}.', v0=name))
+                    target = self._resolve_skill_name(name)
+                    self._apply_skill_change(lambda: self.agent.unload_skill(target))
+                    self.display(self.tr('Unloaded {v0}.', v0=target))
             else:
                 self.display(self.tr('Use /skill list|info NAME|load NAME|unload NAME|clear'))
         except (ValueError, OSError, sqlite3.Error) as exc:
@@ -1153,11 +1466,18 @@ class ReplController:
 
     def _dispatch_prompt(self, prompt):
         """Process one non-empty REPL line; return True only to exit loop."""
+        if prompt == "/":
+            self._cmd_quick_menu()
+            return False
         bare_command = BARE_COMMANDS.get(prompt.lower())
         if bare_command and not (bare_command in ('/continue', '/resume') and self.agent._resumable()):
             self.display(self.tr(BARE_COMMAND_HINT, v0=prompt.lower(), v1=bare_command), 'Input')
             return False
-        if self.history_mode() and prompt.split(maxsplit=1)[0] not in self._HISTORY_ALLOWED_COMMANDS:
+        first_token = prompt.split(maxsplit=1)[0]
+        if _is_unknown_slash_command(prompt, self.cli_commands):
+            self._report_unknown_command(first_token)
+            return False
+        if self.history_mode() and first_token not in self._HISTORY_ALLOWED_COMMANDS:
             self.display(self.tr('当前为历史查看模式；请用 /api NAME 选择可用 API 并新建会话。'), 'History')
             return False
         try:
@@ -1175,8 +1495,8 @@ class ReplController:
                 self.display(self.tr('Save failed: {v0}', v0=exc))
                 return False
             return True
-        if prompt == "/help":
-            self.display(help_text(HELP, self.language))
+        if prompt == "/help" or prompt.startswith("/help "):
+            self._cmd_help(prompt[5:].strip())
         elif prompt == "/clear":
             try:
                 self.start_new_session(self.config, self.instructions)
@@ -1226,8 +1546,15 @@ class ReplController:
                 self.display(self.tr('Error: {v0}', v0=exc))
         elif prompt == "/config":
             self.display({**self.config.public_dict(), "directory": str(self.directory), "agent_file": self.instruction_path})
-        elif prompt == "/debug":
-            self.debug = not self.debug
+        elif prompt == "/debug" or prompt.startswith("/debug "):
+            value = prompt[6:].strip().lower()
+            if not value:
+                self.debug = not self.debug
+            elif value in ("on", "off"):
+                self.debug = value == "on"
+            else:
+                self.display(self.tr('Use /debug [on|off]'))
+                return False
             self.display(self.tr('Debug {v0}', v0='on' if self.debug else 'off'))
         elif prompt == "/debug-context":
             self.display(self.agent.debug_context())
@@ -1244,8 +1571,9 @@ class ReplController:
             try:
                 if value in ("on", "off"):
                     self.config.auto_continue = value == "on"
-                elif value.startswith("steps "):
-                    count = int(value[6:].strip())
+                elif value.startswith("steps ") or (value.isascii() and value.isdigit()):
+                    raw_count = value[6:].strip() if value.startswith("steps ") else value
+                    count = int(raw_count)
                     if not 1 <= count <= 256:
                         raise ValueError(self.tr('Automatic request limit must be 1–256'))
                     self.config.max_steps = count
@@ -1259,6 +1587,8 @@ class ReplController:
                 })
             except ValueError as exc:
                 self.display(self.tr('Error: {v0}', v0=exc))
+        elif prompt == "/set" or prompt.startswith("/set "):
+            self._cmd_set(prompt[4:].strip())
         elif prompt == "/run" or prompt.startswith("/run "):
             task = prompt[4:].strip()
             if task:
@@ -1267,11 +1597,13 @@ class ReplController:
                 self.display(self.tr('Use /run TASK or /run ~/task-instructions.txt'))
         elif prompt == "/api" or prompt.startswith("/api "):
             self._cmd_api(prompt[4:].strip())
+        elif prompt == "/model" or prompt.startswith("/model "):
+            self._cmd_model(prompt[6:].strip())
         elif prompt == "/agent" or prompt.startswith("/agent "):
             self._cmd_agent(prompt[6:].strip())
         elif prompt == "/skill" or prompt.startswith("/skill "):
             self._cmd_skill(prompt)
-        elif prompt.startswith("/copy"):
+        elif prompt == "/copy" or prompt.startswith("/copy "):
             self._cmd_copy(prompt)
         elif prompt == "/paste":
             self._cmd_paste()

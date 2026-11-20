@@ -108,6 +108,42 @@ EN = {
     '未计数': 'not counted', '未知窗口': 'unknown window', '关闭': 'off', '预留': 'reserve',
     '缺少有效的调用 ID': 'Missing a valid call ID', '调用 ID 重复': 'Duplicate call ID',
     '调用结构无效': 'Invalid call structure', '缺少工具名称': 'Missing tool name',
+    '常用命令速查（/help 查看全部，/help TOPIC 按组查看）：\n'
+    '  任务与对话: /continue [N] · /compact [N|task] · /clear · /status · /exit\n'
+    '  会话管理  : /sessions · /resume [N|ID] · /title [NAME] · /recall TEXT · /export\n'
+    '  模型与 API: /api [N|NAME] · /model [N|ID] · /agent [path|off|reload]\n'
+    '  开关与技能: /set [auto|steps|silent|debug] · /skill [N] · /stats · /config\n'
+    '  本地交互  : !shell · ~/path (提交文本) · Tab 补全':
+        'Quick commands (/help for all, /help TOPIC by group):\n'
+        '  Tasks     : /continue [N] · /compact [N|task] · /clear · /status · /exit\n'
+        '  Sessions  : /sessions · /resume [N|ID] · /title [NAME] · /recall TEXT · /export\n'
+        '  API/Model : /api [N|NAME] · /model [N|ID] · /agent [path|off|reload]\n'
+        '  Set/Skills: /set [auto|steps|silent|debug] · /skill [N] · /stats · /config\n'
+        '  Local     : !shell · ~/path (submit text) · Tab completion',
+    '未找到匹配的帮助主题或命令：{v0}（可用：task、session、api、model、skill、set、tools）':
+        'No matching help topic or command: {v0} (topics: task, session, api, model, skill, set, tools)',
+    '未知命令 {v0}；你是不是想输入：{v1}（输入 / 或 /help 查看命令）':
+        'Unknown command {v0}; did you mean: {v1} (type / or /help for commands)',
+    '未知命令 {v0}；输入 / 或 /help 查看命令。': 'Unknown command {v0}; type / or /help for commands.',
+    '选择模型序号或 ID（回车取消）：': 'Model number or ID (Enter cancels): ',
+    '已取消模型选择。': 'Model selection cancelled.',
+    '可用 API 配置（默认：{v0}）：': 'API profiles (default: {v0}):',
+    '选择 API 序号或名称（输入 default X 设默认，回车取消）：':
+        'API number or name ("default X" saves default, Enter cancels): ',
+    '已取消 API 选择。': 'API selection cancelled.',
+    '未发现可用技能。': 'No available Skills found.',
+    '可用技能（[x] 已激活）：': 'Available Skills ([x] = active):',
+    '输入技能序号或名称切换加载/卸载（回车取消）：': 'Skill number or name to toggle (Enter cancels): ',
+    '已取消技能操作。': 'Skill action cancelled.',
+    '先用 /skill 查看技能列表，再按序号选择。': 'List Skills with /skill before selecting by number.',
+    '技能序号超出列表范围。': 'Skill number is outside the listed range.',
+    '当前运行开关（1=auto, 2=steps, 3=silent, 4=debug）：':
+        'Runtime settings (1=auto, 2=steps, 3=silent, 4=debug):',
+    '输入序号切换，或输入 steps N / 键 值（回车取消）：':
+        'Enter number to toggle, or "steps N" / "key value" (Enter cancels): ',
+    '输入 max_steps（1–256，回车取消）：': 'Enter max_steps (1-256, Enter cancels): ',
+    '已取消设置调整。': 'Settings unchanged.',
+    '开启': 'on',
 }
 
 ZH = {
@@ -213,6 +249,17 @@ def help_text(source, language='zh'):
 
 
 HELP_EN = {
+    '[常用对话与任务]': '[Chat & Tasks]',
+    '[会话管理]': '[Sessions]',
+    '[API 与模型]': '[API & Models]',
+    '[开关、技能与工具]': '[Settings, Skills & Tools]',
+    '显示极简高频速查卡（按需展开）': 'Show compact quick-reference menu',
+    '显示命令帮助（Show commands；按 TOPIC 或命令过滤）': 'Show command help (filter by TOPIC or command)',
+    '列出或切换 API 配置（TTY 支持序号选择）；切换后新建会话': 'List or switch API profiles (numbered picker in TTY); starts a fresh session',
+    '查询并一步选择可用模型（合并 /api models 与 /api model）': 'List and select an available model in one step',
+    '查看或交互调整 auto/steps/silent/debug 运行开关': 'Show or toggle auto/steps/silent/debug runtime settings',
+    'TTY 编号列表并一键切换技能加载/卸载': 'Show numbered Skills and toggle load/unload in TTY',
+    '列出、查看、手动加载、卸载或清空技能（支持序号）': 'List, inspect, load, unload or clear Skills (supports numbers)',
     '选用模型并新建会话；序号使用最近一次模型列表': 'Select a model in a new session; numbers refer to the last model list',
     '动态查询指定 API 的可用模型；默认当前 API': 'Fetch available models from an API; defaults to the current API',
     '显示命令帮助（Show commands）': 'Show command help',

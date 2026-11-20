@@ -11,18 +11,22 @@ from .i18n import text as ui_text
 
 COMMANDS = (
     "/help", "/clear", "/compact", "/continue", "/status", "/recall", "/export", "/stats", "/config", "/debug", "/debug-context",
-    "/api", "/agent", "/skill", "/copy", "/paste", "/sessions", "/session", "/resume", "/title",
+    "/api", "/model", "/agent", "/skill", "/set", "/copy", "/paste", "/sessions", "/session", "/resume", "/title",
     "/history", "/silent", "/auto", "/run", "/sub", "/exit",
 )
 SUBCOMMANDS = {
+    "/help": ("task", "session", "api", "model", "skill", "set", "tools", "all"),
     "/api": ("list", "models", "model", "add", "switch", "show", "default", "remove", "next", "prev"),
+    "/model": ("list",),
     "/agent": ("directory", "reload", "off"),
     "/skill": ("list", "info", "load", "unload", "clear"),
+    "/set": ("auto", "steps", "silent", "debug"),
     "/session": ("new", "fork", "load", "rename", "rename-id", "delete", "save", "archives", "archive"),
     "/sessions": ("find", "all"),
     "/export": ("markdown", "json"),
     "/silent": ("on", "off"),
     "/auto": ("on", "off", "steps"),
+    "/debug": ("on", "off"),
     "/compact": ("task",),
 }
 
@@ -344,6 +348,11 @@ class Completer:
             if selecting_session:
                 choices = self.session_choices() if self.session_choices else ()
                 options = (*choices, *self.session_ids())
+            elif root == '/model' and len(words) == 1:
+                choices = self.model_choices() if self.model_choices else ()
+                matches = [name for name in ('list',) if name.startswith(prefix)]
+                matches.extend(shlex.quote(name) for name in choices if name.startswith(prefix))
+                return sorted(set(matches))
             elif len(words) == 1:
                 options = SUBCOMMANDS.get(root, ())
                 if root == "/api":
@@ -352,6 +361,10 @@ class Completer:
                     options = (*options, *self._agent_files(prefix))
                 elif root == '/export':
                     options = (*options, *self.session_ids())
+                elif root == '/help':
+                    options = (*options, *(name.lstrip('/') for name in COMMANDS))
+            elif root == '/model' and len(words) == 2:
+                options = self.profiles()
             elif root == "/api" and words[1] in ("models", "show", "default", "remove", "switch"):
                 options = self.profiles()
             elif root == '/api' and words[1] == 'model':
@@ -359,6 +372,8 @@ class Completer:
                     choices = self.model_choices() if self.model_choices else ()
                     return sorted({shlex.quote(name) for name in choices if name.startswith(prefix)})
                 options = self.profiles() if len(words) == 3 else ()
+            elif root == '/set' and len(words) == 2 and words[1] in ('auto', 'silent', 'debug'):
+                options = ('on', 'off')
             elif root == "/session" and words[1] == "rename-id" and len(words) == 2:
                 options = self.session_ids()
             elif root == '/export' and len(words) == 2:
